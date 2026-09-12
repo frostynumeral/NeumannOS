@@ -5,9 +5,10 @@ this repository (see the top-level `README.md` for the original C
 codebase's history). It is a **starting skeleton**, not a finished port: a
 real microkernel, its servers (`pm`, `fs`, `rs`, ...), and its drivers are a
 multi-month undertaking on their own. What's here boots in QEMU, sets up
-exception handling, schedules kernel tasks with real hardware-timer-driven
-quantum accounting, and exercises blocking message-passing IPC between
-them — enough to build the rest of the system on top of.
+exception handling, schedules kernel tasks with real, asynchronously
+preemptive hardware-timer-driven quantum accounting, and exercises
+blocking message-passing IPC between them — enough to build the rest of
+the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -36,10 +37,15 @@ external contract.
   queues, `enqueue`/`dequeue`/`sched`/`pick_proc`, and the rendezvous IPC
   algorithm (`mini_send`/`mini_receive`/`mini_notify`) that `ipc.rs` calls
   into. Also has no C equivalent of its own: the low-level `switch_to`
-  (save/restore callee-saved registers and the stack pointer) and the
-  `trampoline` a freshly spawned task's stack is primed to land in on its
-  first run, standing in for the register save/restore and initial-frame
-  setup that `kernel/mpx386.s` and `kernel/main.c` handle in C MINIX.
+  (save/restore callee-saved registers, `RFLAGS`, and the stack pointer)
+  and the `trampoline` a freshly spawned task's stack is primed to land in
+  on its first run, standing in for the register save/restore and
+  initial-frame setup that `kernel/mpx386.s` and `kernel/main.c` handle in
+  C MINIX. `reschedule()` -- called after every IPC operation and, crucially,
+  from inside the timer interrupt handler -- is what makes preemption
+  genuinely asynchronous rather than just cooperative; see its doc comment
+  and `switch_to`'s for how saving `RFLAGS` per task is what makes calling
+  the same switch code from both places sound.
 - `src/gdt.rs` — Global Descriptor Table and Task State Segment, ported from
   the segment/TSS setup in `kernel/protect.c`. Its only real job right now
   is giving the double-fault handler a dedicated stack (via the TSS's
@@ -62,31 +68,26 @@ external contract.
   `proc::clock_tick` on every tick -- standing in for the
   `hwint00`/`clock_handler` pair in `kernel/mpx386.s`/`kernel/clock.c`.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
-  crate): loads the GDT/IDT, runs a breakpoint self-test, programs the
-  PIC/PIT and enables interrupts, prints the boot image table over COM1,
-  spawns the kernel tasks, and hands off to the scheduler. Spawns `IDLE`
-  and `CLOCK` as real kernel tasks (same as the boot image), plus
-  temporary stand-in bodies in the `pm`/`fs` process table slots that
-  ping-pong three blocking messages back and forth, to exercise the
-  scheduler and rendezvous IPC end to end before the real servers exist.
+  crate): loads the GDT/IDT, runs a breakpoint self-test, spawns the kernel
+  tasks, programs the PIC/PIT and enables interrupts, and hands off to the
+  scheduler. Spawns `IDLE` and `CLOCK` as real kernel tasks (same as the
+  boot image), plus temporary stand-in bodies in the `pm`/`fs`/`rs`/`memory`
+  process table slots: `pm`/`fs` ping-pong three blocking messages back and
+  forth (exercising the rendezvous IPC), and `rs`/`memory` each spin in a
+  tight, CPU-bound loop with no `yield_now()`/IPC call anywhere in it
+  (proving the timer interrupt truly preempts a task asynchronously,
+  mid-loop, rather than only ever switching at cooperative checkpoints).
 
 ### Known simplifications in the scheduler/IPC/timer port
 
-- **Quantum accounting is real; asynchronous preemption isn't, yet.** The
-  timer interrupt (`proc::clock_tick`) genuinely decrements the running
-  task's `ticks_left` and reorders the ready queues on real hardware
-  ticks, same as `kernel/clock.c`'s `clock_handler`. But real MINIX's
-  `restart()` (`kernel/mpx386.s`) unconditionally switches to whichever
-  process `pick_proc` picked on *every* trap/interrupt return, so a
-  higher-priority process preempts immediately. This port's timer handler
-  doesn't force a switch, because resuming a task interrupted mid-
-  execution needs a full trap-frame `iretq`, not the plain `ret` that
-  `switch_to` uses for a task that's voluntarily blocked mid-function-call.
-  So the switch still only happens the next time *some* task calls
-  `reschedule()` (by blocking in IPC or calling `yield_now()`) -- a task
-  that never does either keeps running past a quantum expiry
-  uninterrupted. Closing that gap (extending `switch_to` to also resume
-  via a saved trap frame) is next on the roadmap below.
+- **Preemption latency for a newly-woken task is bounded by one timer
+  tick, not fully instantaneous.** `reschedule()` runs after every IPC
+  operation (so a `send`/`notify` that wakes a higher-priority task
+  preempts immediately) and after every timer tick (so quantum expiry
+  preempts within one tick, currently 1/60s) -- but real MINIX's
+  `restart()` (`kernel/mpx386.s`) checks on *every* trap/interrupt return,
+  which in a system handling real I/O happens far more often than once per
+  tick. This is a latency/precision gap, not a correctness one.
 - **No pending-notification bitmap**: `mini_notify` on a task that isn't
   blocked in `receive` at that exact instant is simply dropped, rather
   than queued in a per-process bitmap for later delivery like
@@ -110,22 +111,22 @@ Roughly in the order the original kernel needs them:
    context switching between kernel tasks.
 3. ~~**A timer interrupt**~~ — done (`src/pic.rs`, `src/pit.rs`). Real
    PIC remap and PIT programming; `clock_tick` genuinely decrements
-   `ticks_left` and reorders the ready queues on hardware ticks. See
-   "known simplifications" above for the gap that's left: it doesn't yet
-   force a switch away from a task that never blocks or yields on its own.
-4. **Asynchronous preemption**: extend `switch_to`/task state so a task
-   interrupted mid-execution by the timer can be resumed later via a full
-   trap-frame `iretq` (not just the plain-`ret` cooperative resume used
-   today), and have `clock_tick` actually perform the switch on quantum
-   expiry instead of only reordering the ready queues.
+   `ticks_left` and reorders the ready queues on hardware ticks.
+4. ~~**Asynchronous preemption**~~ — done. The timer interrupt handler
+   calls `reschedule()` directly, which can and does switch stacks from
+   inside an interrupt handler; the `rs`/`memory` demo tasks in `main.rs`
+   prove a task that never blocks or yields gets preempted mid-loop and
+   later resumes exactly where it left off. See "known simplifications"
+   above for the (latency-only) gap that's left.
 5. **User-mode processes and address-space isolation** — right now
-   everything (including the `pm`/`fs` stand-ins) runs in kernel context.
+   everything (including the `pm`/`fs`/`rs`/`memory` stand-ins) runs in
+   kernel context.
 6. **Kernel calls** (`kernel/system.c`, `kernel/system/do_*.c`) — the
    privileged operations servers need (`sys_vircopy`, `sys_setalarm`, etc.).
 7. **The servers themselves**: `pm` (process manager), `fs` (file system),
    `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
    order, matching `servers/` and `drivers/` in the C tree -- replacing the
-   temporary ping-pong stand-ins in `main.rs`.
+   temporary stand-ins in `main.rs`.
 8. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 
 ## Building
@@ -168,6 +169,8 @@ qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/booti
 and does the same thing). Expected output on COM1: the boot image table,
 `CLOCK` reporting a handful of real PIT ticks it observed while waiting,
 the `pm`/`fs` demo tasks ping-ponging three messages back and forth
-(proving real blocking `send`/`receive` and context switching), and
-finally `IDLE` reporting that it's halting (with the accumulated tick
-count) once everything else has blocked.
+(blocking `send`/`receive`), the `rs`/`memory` demo tasks trading off every
+quantum purely because the timer forces it (asynchronous preemption --
+watch `memory`'s counter resume from exactly where it left off after
+`rs` gets a turn), and finally `IDLE` reporting that it's halting (with
+the accumulated tick count) once everything else has blocked.

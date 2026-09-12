@@ -97,5 +97,16 @@ extern "x86-interrupt" fn double_fault_handler(
 
 extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
     crate::proc::clock_tick();
+    // Send EOI before a possible switch, not after: if the switch parks
+    // this exact call stack for a while (it may not resume again for a
+    // long time, if ever), the PIC still needs to know this IRQ is done so
+    // it can keep delivering the next ones in the meantime.
     pic::end_of_interrupt(0);
+    // This is what makes preemption asynchronous rather than merely
+    // cooperative: control can leave right here, mid-interrupt, and only
+    // come back (possibly much later, on a completely different call
+    // stack having run in between) once something switches back to
+    // whichever task was running when this tick fired. See
+    // `proc::switch_to`'s doc comment for what makes that sound.
+    crate::proc::reschedule();
 }
