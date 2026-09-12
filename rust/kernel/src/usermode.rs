@@ -1,33 +1,34 @@
-//! Entering ring 3 (user mode) as a real, schedulable task.
+//! Entering ring 3 (user mode) as a real, schedulable task with its own
+//! address space.
 //!
-//! This is the second slice of the "user-mode processes and address-space
-//! isolation" roadmap item in `rust/README.md`, building on the first
-//! (proving the CPU mechanism -- GDT user segments, a ring-3-callable
-//! syscall gate, the `iretq` dance -- worked at all, as a one-shot,
-//! not-scheduler-integrated demo). This time, entering ring 3 happens
-//! from inside an ordinary `crate::proc` task body, the task can be
-//! asynchronously preempted by the timer while in ring 3 exactly like any
-//! other task, and its repeated `int 0x80` calls are handled by ordinary,
-//! repeatable trap entry/exit rather than a one-shot save/resume trick.
-//! What made that safe to add is per-task `RSP0`: see `crate::gdt`'s
-//! `set_rsp0` and `crate::proc::reschedule`'s call to it.
+//! This is the third slice of the "user-mode processes and address-space
+//! isolation" roadmap item in `rust/README.md`, building on the first two
+//! (proving the CPU mechanism worked at all, as a one-shot,
+//! not-scheduler-integrated demo; then making it a real, asynchronously-
+//! preemptible task, but still sharing the kernel's own address space).
+//! This time, the demo task's code and stack pages are mapped into a
+//! *separate* page table (`crate::memory::new_address_space`) that the
+//! kernel's own mapper never sees -- real isolation, not just a CPU
+//! privilege level. `crate::proc` switches `CR3` to this task's address
+//! space on every switch to it, the same way it already switches `RSP0`.
 //!
 //! There's still no MINIX C file to port here, for the same reason
 //! `crate::memory` doesn't have one: this is x86_64-specific groundwork
-//! (2005 i386 MINIX used segment-based protection, not ring 3 the way
-//! this does), not a ported feature.
+//! (2005 i386 MINIX used segment-based protection, not paged address
+//! spaces the way this does), not a ported feature.
 
 use crate::gdt;
 use crate::interrupts::SYSCALL_VECTOR;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB};
+use crate::memory;
+use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 /// Arbitrary, fixed addresses for the demo's one code page and one stack
-/// page. No per-process address space exists yet (that's the *next*
-/// increment on top of this one -- see `rust/README.md`), so these just
-/// live in the single shared address space everything else runs in too --
-/// picked far from the heap (`allocator::HEAP_START`) and the kernel's own
-/// mappings to avoid colliding with either.
+/// page. They only need to not collide with whatever the *kernel's*
+/// address space already uses (the heap, its own code/data, the
+/// physical-memory window) -- not with any other task's, since each
+/// gets its own separate page table now. Picked far from
+/// `allocator::HEAP_START` for the same reason as before.
 pub const USER_CODE_ADDR: u64 = 0x_5555_5555_0000;
 pub const USER_STACK_ADDR: u64 = 0x_6666_6666_0000;
 const PAGE_SIZE: u64 = 4096;
@@ -43,16 +44,21 @@ const PAGE_SIZE: u64 = 4096;
 /// counter encoded by hand.
 const USER_CODE: [u8; 4] = [0xCD, SYSCALL_VECTOR, 0xEB, 0xFC];
 
-/// Map the demo's code and stack pages (with `USER_ACCESSIBLE`, without
-/// which the CPU refuses to execute or touch them at CPL 3 at all -- a
-/// `#PF`, not a `#GP`) and write `USER_CODE` into the code page. Called
-/// once from `kernel_main`, before any tasks are spawned, using the same
-/// mapper/frame allocator `kernel_main` sets up for the heap
-/// (`crate::memory`, `crate::allocator`).
-pub fn map_demo_pages(
-    mapper: &mut impl Mapper<Size4KiB>,
+/// Build a new address space (`crate::memory::new_address_space`) for the
+/// demo task and map its code and stack pages into *that* table (with
+/// `USER_ACCESSIBLE`, without which the CPU refuses to execute or touch
+/// them at CPL 3 at all -- a `#PF`, not a `#GP`) -- never into the
+/// kernel's own mapper, which is the whole point of this slice. Returns
+/// the new address space's top-level page table frame, for
+/// `crate::proc::spawn` to record as this task's `CR3`. Called once from
+/// `kernel_main`, before any tasks are spawned, using the same frame
+/// allocator `kernel_main` sets up for the heap (`crate::memory`,
+/// `crate::allocator`).
+pub fn create_address_space(
+    physical_memory_offset: VirtAddr,
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) {
+) -> PhysFrame {
+    let (pml4_frame, mut mapper) = memory::new_address_space(physical_memory_offset, frame_allocator);
     let flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
 
@@ -61,15 +67,19 @@ pub fn map_demo_pages(
         .allocate_frame()
         .expect("out of physical frames for the user-mode demo's code page");
     unsafe {
+        // This address space isn't active yet (its frame isn't loaded
+        // into CR3), so the mapping itself doesn't need a TLB flush
+        // (`.ignore()` rather than `.flush()`); and writing the code
+        // bytes has to go through the physical-memory window rather than
+        // `USER_CODE_ADDR` directly, since that virtual address isn't
+        // mapped in the *currently active* (kernel's) table at all.
         mapper
             .map_to(code_page, code_frame, flags, frame_allocator)
             .expect("failed to map the user-mode demo's code page")
-            .flush();
-        core::ptr::copy_nonoverlapping(
-            USER_CODE.as_ptr(),
-            USER_CODE_ADDR as *mut u8,
-            USER_CODE.len(),
-        );
+            .ignore();
+        let code_via_phys_offset =
+            (physical_memory_offset + code_frame.start_address().as_u64()).as_mut_ptr::<u8>();
+        core::ptr::copy_nonoverlapping(USER_CODE.as_ptr(), code_via_phys_offset, USER_CODE.len());
     }
 
     let stack_page = Page::containing_address(VirtAddr::new(USER_STACK_ADDR));
@@ -80,8 +90,10 @@ pub fn map_demo_pages(
         mapper
             .map_to(stack_page, stack_frame, flags, frame_allocator)
             .expect("failed to map the user-mode demo's stack page")
-            .flush();
+            .ignore();
     }
+
+    pml4_frame
 }
 
 /// A `crate::proc` task body: jump to ring 3 and run `USER_CODE` there.

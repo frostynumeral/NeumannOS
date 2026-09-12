@@ -7,9 +7,9 @@ real microkernel, its servers (`pm`, `fs`, `rs`, ...), and its drivers are a
 multi-month undertaking on their own. What's here boots in QEMU, sets up
 exception handling and a heap, schedules kernel tasks with real,
 asynchronously preemptive hardware-timer-driven quantum accounting
-(including a task that runs in ring 3), and exercises blocking
-message-passing IPC between them — enough to build the rest of the system
-on top of.
+(including a task that runs in ring 3, in its own genuinely isolated
+address space), and exercises blocking message-passing IPC between them —
+enough to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -78,10 +78,16 @@ external contract.
   allocator over the usable regions of the boot-time memory map, and
   `allocator.rs` uses it to map and initialize a 1 MiB heap (via the
   `linked_list_allocator` crate) so `alloc`-crate types (`Box`, `Vec`, ...)
-  work -- exercised by a self-test in `main.rs`. This is the first step
-  toward the next roadmap item below: per-process page tables are where
-  `sys_umap`/`sys_vircopy`'s actual job (translating between address
-  spaces) starts to apply.
+  work -- exercised by a self-test in `main.rs`.
+- `src/memory.rs`'s `new_address_space` clones the currently-active PML4
+  into a freshly allocated frame -- sharing every existing mapping (kernel
+  code/data, the heap, the physical-memory window) by aliasing the same
+  lower-level tables, and only becoming genuinely private wherever
+  something is mapped into a PML4 slot the original table didn't already
+  use. `crate::usermode` is the first thing to use this, to give the
+  ring-3 demo task real isolation instead of just a CPU privilege level --
+  this is where `sys_umap`/`sys_vircopy`'s actual job (translating between
+  address spaces) starts to apply, though neither is ported yet.
 - `src/gdt.rs` also now sets up user-mode (ring 3) code/data segments and
   a TSS `RSP0` (the stack the CPU switches to automatically on *any*
   ring-3-to-ring-0 transition) -- `set_rsp0`, called from `crate::proc` on
@@ -92,35 +98,46 @@ external contract.
   (`SYSCALL_VECTOR`); its handler prints the CPU-captured `CS` selector's
   RPL, which is what actually proves a caller was in ring 3 -- not
   something the kernel side merely asserts.
-- `src/usermode.rs` uses both to run a real, scheduler-integrated ring-3
-  task: map a code and a stack page with `USER_ACCESSIBLE` (without which
-  the CPU refuses to execute or touch them at CPL 3 at all -- a `#PF`, not
-  a `#GP`), then jump to CPL 3 from an ordinary `crate::proc` task body.
-  The ring-3 code loops `int 0x80`, trapping into the kernel and back
-  repeatedly -- ordinary, repeatable trap entry/exit, not a one-shot
-  trick -- and can be asynchronously preempted by the timer while in ring
-  3 exactly like any other task, same as `crate::proc`'s `reschedule` is
-  what makes `gdt::set_rsp0` get called on every switch.
-- `src/proc.rs`'s `reschedule`/`start` call `gdt::set_rsp0` on every
-  switch, pointing the TSS at whichever task just became current's own
-  dedicated kernel stack (the same one `crate::proc::stack_top` already
-  used to build that task's initial `switch_to` frame). This is what
-  makes running ring-3 code as a real task safe: with one shared `RSP0`,
-  two tasks both spending time in ring 3 could clobber each other's saved
-  state the moment either faulted or was preempted.
+- `src/usermode.rs` uses all of the above to run a real,
+  scheduler-integrated ring-3 task with its own address space:
+  `create_address_space` builds a new, private page table (via
+  `memory::new_address_space`) and maps a code and a stack page into *it*
+  (with `USER_ACCESSIBLE`, without which the CPU refuses to execute or
+  touch them at CPL 3 at all -- a `#PF`, not a `#GP`) -- never into the
+  kernel's own mapper. `ring3_task_entry`, an ordinary `crate::proc` task
+  body, then jumps to CPL 3. The ring-3 code loops `int 0x80`, trapping
+  into the kernel and back repeatedly -- ordinary, repeatable trap
+  entry/exit, not a one-shot trick -- and can be asynchronously preempted
+  by the timer while in ring 3 exactly like any other task.
+- `src/proc.rs`'s `reschedule`/`start` call `gdt::set_rsp0` *and* switch
+  `CR3` on every switch, pointing both at whichever task just became
+  current: `RSP0` at that task's own dedicated kernel stack (the same one
+  `crate::proc::stack_top` already used to build its initial `switch_to`
+  frame), `CR3` at its own address space if it has one distinct from the
+  kernel's (`Proc::cr3`), or the kernel's own otherwise. Per-task `RSP0`
+  is what makes running ring-3 code as a real task safe at all (with one
+  shared `RSP0`, two tasks both spending time in ring 3 could clobber each
+  other's saved state the moment either faulted or was preempted);
+  per-task `CR3` is what makes that isolation *real* rather than just a
+  CPU privilege level.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
-  and the heap, maps the ring-3 demo task's pages, spawns the kernel tasks,
-  programs the PIC/PIT and enables interrupts, and hands off to the
-  scheduler. Spawns `IDLE` and `CLOCK` as real kernel tasks (same as the
-  boot image), plus temporary stand-in bodies in the
-  `pm`/`fs`/`rs`/`memory`/`driver` process table slots: `pm`/`fs`
-  ping-pong three blocking messages back and forth (exercising the
-  rendezvous IPC), `rs`/`memory` each spin in a tight, CPU-bound loop with
-  no `yield_now()`/IPC call anywhere in it (proving the timer interrupt
-  truly preempts a task asynchronously, mid-loop, rather than only ever
-  switching at cooperative checkpoints), and `driver` runs the ring-3 demo
-  task described above.
+  and the heap, builds the ring-3 demo task's address space and maps its
+  pages into it, spawns the kernel tasks, programs the PIC/PIT and enables
+  interrupts, and hands off to the scheduler. Spawns `IDLE` and `CLOCK` as
+  real kernel tasks (same as the boot image), plus temporary stand-in
+  bodies in the `pm`/`fs`/`rs`/`memory`/`driver` process table slots:
+  `pm`/`fs` ping-pong three blocking messages back and forth (exercising
+  the rendezvous IPC), `rs`/`memory` each spin in a tight, CPU-bound loop
+  with no `yield_now()`/IPC call anywhere in it (proving the timer
+  interrupt truly preempts a task asynchronously, mid-loop, rather than
+  only ever switching at cooperative checkpoints), and `driver` runs the
+  ring-3 demo task described above -- the only one of these with its own
+  address space rather than sharing the kernel's. Also runs an isolation
+  self-test right after building that address space: translating the
+  ring-3 code page's address through the *kernel's own* page table
+  returns `None`, proving the mapping really is private and not merely
+  inaccessible-by-privilege-level.
 
 ### Known simplifications in the scheduler/IPC/timer port
 
@@ -153,10 +170,23 @@ external contract.
   (`interrupts::SYSCALL_COUNT`) exists purely so `usermode::USER_CODE`'s
   hand-assembly can stay a trivial two-instruction loop instead of needing
   a counter encoded by hand.
-- **Shares the kernel's address space** rather than getting its own page
-  table -- the actual "isolation" part of the next roadmap item. Right
-  now a bug in this task's code could still corrupt kernel memory or any
-  other task's; a page table boundary is what would actually prevent that.
+- **Only one task has its own address space.** `Proc::cr3` supports it
+  per-task, but only the ring-3 demo actually gets one; every other task
+  still shares the kernel's. That's deliberate for now -- kernel tasks
+  (`IDLE`, `CLOCK`) and the `pm`/`fs`/`rs`/`memory` stand-ins all run
+  kernel-trusted code today, so there's nothing to isolate them *from*
+  yet -- but it means there's no isolation between, say, `pm` and `fs`'s
+  demo bodies either. That only starts to matter once real, mutually
+  distrusting user-mode servers exist.
+- **A new address space is a full clone of the kernel's page table**,
+  not a minimal one built from scratch. This is simple and correct (every
+  kernel mapping the task might need -- code, the heap, the
+  physical-memory window -- is guaranteed present), and ring-3 code still
+  can't actually *touch* any of it directly: those entries were never
+  marked `USER_ACCESSIBLE`, so the CPU's own permission check (not
+  anything this port adds) faults on an attempt from CPL 3, same as it
+  would for any other address the task hasn't been given a `USER_ACCESSIBLE`
+  mapping for.
 
 ## What's not implemented yet (roadmap)
 
@@ -188,9 +218,13 @@ Roughly in the order the original kernel needs them:
    `crate::proc` task making repeated `int 0x80` round trips, rather than
    a one-shot excursion. See "known simplifications" above for what's
    still fixed/hardcoded about it.
-8. **Per-process page tables** for real address-space isolation -- right
-   now everything (including the `pm`/`fs`/`rs`/`memory`/`driver`
-   stand-ins) shares one address space.
+8. ~~**Per-process page tables**~~ — done (`memory::new_address_space`,
+   used by `usermode::create_address_space`). The ring-3 demo task now
+   runs in a genuinely separate address space, confirmed by an isolation
+   self-test in `main.rs` (translating its code page through the kernel's
+   own page table returns `None`). See "known simplifications" above for
+   what's still narrow about it: only this one task has its own address
+   space, and it's a full clone of the kernel's rather than a minimal one.
 9. **Kernel calls** (`kernel/system.c`, `kernel/system/do_*.c`) — the
    privileged operations servers need (`sys_vircopy`, `sys_setalarm`, etc.).
 10. **The servers themselves**: `pm` (process manager), `fs` (file system),
@@ -241,14 +275,16 @@ qemu-system-x86_64 -m 256 -drive format=raw,file=target/x86_64-unknown-none/debu
 and does the same thing, though without the explicit `-m 256` -- pass it
 via `QEMU_ARGS` if the default memory size turns out too small for the
 heap plus everything else once more of this grows). Expected output on
-COM1: a heap self-test (`Box`/`Vec` both actually work), the boot image
-table, the `pm`/`fs` demo tasks ping-ponging three messages back and
-forth (blocking `send`/`receive`), five ring-3 round trips
-(`[syscall] iteration N from Ring3 ...`, printed from inside the syscall
-handler using the CPU-captured selector -- not something the kernel side
-merely claims) before that task blocks for good, the `rs`/`memory` demo
-tasks trading off every quantum purely because the timer forces it
-(asynchronous preemption -- watch `memory`'s counter resume from exactly
-where it left off after `rs` gets a turn), and finally `IDLE` reporting
-that it's halting (with the accumulated tick count) once everything else
-has blocked.
+COM1: a heap self-test (`Box`/`Vec` both actually work), an isolation
+self-test (the ring-3 demo's code page translates to `None` through the
+kernel's own page table -- it only exists in that task's private address
+space), the boot image table, the `pm`/`fs` demo tasks ping-ponging three
+messages back and forth (blocking `send`/`receive`), five ring-3 round
+trips (`[syscall] iteration N from Ring3 ...`, printed from inside the
+syscall handler using the CPU-captured selector -- not something the
+kernel side merely claims) before that task blocks for good, the
+`rs`/`memory` demo tasks trading off every quantum purely because the
+timer forces it (asynchronous preemption -- watch `memory`'s counter
+resume from exactly where it left off after `rs` gets a turn), and
+finally `IDLE` reporting that it's halting (with the accumulated tick
+count) once everything else has blocked.

@@ -11,12 +11,13 @@
 //!
 //! This port targets x86_64, which has no non-paged protected mode at all,
 //! so there is no equivalent C file to port here: paging is mandatory
-//! groundwork, not a MINIX feature. What's here is the minimum needed to
-//! start allocating memory dynamically (`crate::allocator`) ahead of the
-//! next roadmap step (`rust/README.md`): per-process page tables for real
-//! address-space isolation, which is where this module's C parallel
-//! (`sys_umap`/`sys_vircopy`'s job of translating between address spaces)
-//! will actually start to apply.
+//! groundwork, not a MINIX feature. Alongside allocating memory
+//! dynamically (`crate::allocator`), this module now also builds new,
+//! separate address spaces (`new_address_space`) -- see `crate::usermode`
+//! for the first thing to actually use one, and `rust/README.md` for how
+//! this relates to the still-unported `sys_umap`/`sys_vircopy` (which
+//! translate between address spaces in the real kernel; the "which
+//! address space" part is what this module adds).
 
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
 use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB};
@@ -45,6 +46,39 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     let virt = physical_memory_offset + phys.as_u64();
     let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
     &mut *page_table_ptr
+}
+
+/// Allocate a fresh top-level (PML4) page table that starts out an exact
+/// copy of the currently-active one -- so it shares every existing
+/// mapping (kernel code/data, the heap, the physical-memory window) by
+/// aliasing the same lower-level tables, the same way a real OS starts a
+/// new address space as a copy of the kernel's. Mapping a *new* page into
+/// it only actually becomes private to this address space if that virtual
+/// address's PML4 slot wasn't already in use in the table it was copied
+/// from (an empty slot gets fresh, unshared lower-level tables on the
+/// first `map_to` into it); mapping into a virtual address whose PML4
+/// slot the original address space already used would instead alias --
+/// and so modify -- that *shared* lower-level table. `crate::usermode`
+/// picks demo addresses far enough apart (each PML4 slot spans 512 GiB)
+/// to guarantee this.
+pub fn new_address_space(
+    physical_memory_offset: VirtAddr,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> (PhysFrame, OffsetPageTable<'static>) {
+    let new_frame = frame_allocator
+        .allocate_frame()
+        .expect("out of physical frames for a new address space's PML4");
+
+    let (active_frame, _) = x86_64::registers::control::Cr3::read();
+    let active_ptr: *const PageTable =
+        (physical_memory_offset + active_frame.start_address().as_u64()).as_ptr();
+    let new_ptr: *mut PageTable =
+        (physical_memory_offset + new_frame.start_address().as_u64()).as_mut_ptr();
+    unsafe {
+        core::ptr::copy_nonoverlapping(active_ptr, new_ptr, 1);
+        let table = &mut *new_ptr;
+        (new_frame, OffsetPageTable::new(table, physical_memory_offset))
+    }
 }
 
 /// Hands out physical frames from the regions the bootloader's memory map

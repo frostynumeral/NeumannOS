@@ -3,17 +3,19 @@
 //! This is the Rust port's `kernel/main.c` equivalent: it boots, sets up
 //! the GDT/IDT so CPU faults are reported instead of triple-faulting
 //! (`crate::gdt`, `crate::interrupts`), sets up paging and a heap
-//! allocator (`crate::memory`, `crate::allocator`), maps the ring-3 demo
-//! task's pages (`crate::usermode`), spawns the kernel tasks
-//! (`crate::proc`) -- including that ring-3 task, which can now be
-//! asynchronously preempted and take repeated traps like any other task,
-//! since each task has its own dedicated `RSP0` (`crate::gdt::set_rsp0`) --
-//! programs the PIC/PIT and enables interrupts so the timer starts driving
-//! real, asynchronously-preemptive scheduling, prints the boot image (the
-//! process table MINIX would load into memory at this point), and hands
-//! off to the scheduler -- just as `kernel/main.c` ends by calling
-//! `restart()`. There is no per-process address-space isolation yet — see
-//! `rust/README.md` for what's implemented versus planned.
+//! allocator (`crate::memory`, `crate::allocator`), builds the ring-3 demo
+//! task's own address space and maps its pages into it
+//! (`crate::usermode`, `crate::memory::new_address_space`), spawns the
+//! kernel tasks (`crate::proc`) -- including that ring-3 task, which now
+//! runs in genuine isolation from the kernel's own address space, and can
+//! still be asynchronously preempted and take repeated traps like any
+//! other task, since each task has its own dedicated `RSP0`
+//! (`crate::gdt::set_rsp0`) -- programs the PIC/PIT and enables interrupts
+//! so the timer starts driving real, asynchronously-preemptive
+//! scheduling, prints the boot image (the process table MINIX would load
+//! into memory at this point), and hands off to the scheduler -- just as
+//! `kernel/main.c` ends by calling `restart()`. See `rust/README.md` for
+//! what's implemented versus planned.
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
@@ -37,6 +39,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use x86_64::structures::paging::PhysFrame;
 use x86_64::VirtAddr;
 
 entry_point!(kernel_main);
@@ -81,10 +84,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     drop(boxed);
     drop(vec);
 
-    // Map the ring-3 demo task's code/stack pages now, while `mapper`/
-    // `frame_allocator` are handy; the task itself (spawned below) does
-    // the actual jump to ring 3 once the scheduler runs it.
-    usermode::map_demo_pages(&mut mapper, &mut frame_allocator);
+    // Build the ring-3 demo task's own address space and map its
+    // code/stack pages into it now, while `frame_allocator` is handy; the
+    // task itself (spawned below) does the actual jump to ring 3 once the
+    // scheduler runs it.
+    let ring3_address_space = usermode::create_address_space(phys_mem_offset, &mut frame_allocator);
+    // Self-test: this is the actual proof of isolation, not just that
+    // things still work. The demo pages were never mapped into *this*
+    // (the kernel's own) page table -- only into `ring3_address_space` --
+    // so translating that address here must fail.
+    use x86_64::structures::paging::Translate;
+    serial_println!(
+        "isolation self-test: ring-3 code page at {:#x} in the kernel's own address space: {:?}",
+        usermode::USER_CODE_ADDR,
+        mapper.translate_addr(VirtAddr::new(usermode::USER_CODE_ADDR)),
+    );
     serial_println!();
 
     serial_println!("boot image:");
@@ -98,7 +112,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // programmed, and its handler calls `reschedule()` unconditionally
     // (see `proc.rs`'s module doc comment) -- with no task enqueued yet,
     // there would be nothing for it to pick.
-    spawn_tasks();
+    spawn_tasks(ring3_address_space);
     serial_println!("tasks spawned");
 
     pic::init();
@@ -112,22 +126,31 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
 /// Spawn the kernel tasks. `IDLE` and `CLOCK` are real kernel tasks, same
 /// as in the boot image; `pm`/`fs`/`rs`/`memory`/`driver` don't exist as
-/// real servers yet (there's no per-process address space to run them in
-/// -- see `rust/README.md`), so their process table slots run small
-/// stand-in bodies instead: `pm`/`fs` exercise blocking `send`/`receive`,
-/// `rs`/`memory` (as `busy_task_a`/`busy_task_b`) exercise asynchronous
-/// preemption, and `driver` (as `usermode::ring3_task_entry`) exercises a
-/// real, scheduler-integrated ring-3 task. Priorities, quantum sizes, and
+/// real servers yet (see `rust/README.md`), so their process table slots
+/// run small stand-in bodies instead: `pm`/`fs` exercise blocking
+/// `send`/`receive`, `rs`/`memory` (as `busy_task_a`/`busy_task_b`)
+/// exercise asynchronous preemption, and `driver` (as
+/// `usermode::ring3_task_entry`) runs in its own address space
+/// (`ring3_address_space`, built in `kernel_main`) -- the only task here
+/// that isn't sharing the kernel's. Priorities, quantum sizes, and
 /// preemptibility match `kernel/table.c`'s image entries
 /// (`IDL_F`/`TSK_F`/`SRV_F` flags).
-fn spawn_tasks() {
-    proc::spawn(com::IDLE, "IDLE", idle_task, proc::IDLE_Q, 8, true);
-    proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false);
-    proc::spawn(com::PM_PROC_NR, "pm (demo)", demo_pm_task, 3, 32, true);
-    proc::spawn(com::FS_PROC_NR, "fs (demo)", demo_fs_task, 4, 32, true);
-    proc::spawn(com::RS_PROC_NR, "rs (demo)", busy_task_a, 6, 16, true);
-    proc::spawn(com::MEM_PROC_NR, "memory (demo)", busy_task_b, 6, 16, true);
-    proc::spawn(com::DRVR_PROC_NR, "driver (ring3 demo)", usermode::ring3_task_entry, 6, 16, true);
+fn spawn_tasks(ring3_address_space: PhysFrame) {
+    proc::spawn(com::IDLE, "IDLE", idle_task, proc::IDLE_Q, 8, true, None);
+    proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false, None);
+    proc::spawn(com::PM_PROC_NR, "pm (demo)", demo_pm_task, 3, 32, true, None);
+    proc::spawn(com::FS_PROC_NR, "fs (demo)", demo_fs_task, 4, 32, true, None);
+    proc::spawn(com::RS_PROC_NR, "rs (demo)", busy_task_a, 6, 16, true, None);
+    proc::spawn(com::MEM_PROC_NR, "memory (demo)", busy_task_b, 6, 16, true, None);
+    proc::spawn(
+        com::DRVR_PROC_NR,
+        "driver (ring3 demo)",
+        usermode::ring3_task_entry,
+        6,
+        16,
+        true,
+        Some(ring3_address_space),
+    );
 }
 
 /// Real MINIX's idle task just halts, waking on the next interrupt; ported
