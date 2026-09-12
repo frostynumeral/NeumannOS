@@ -22,8 +22,12 @@ hand-assembled bytes poked into a fixed page), a real `int 0x80` syscall
 gate with genuine call-number/register dispatch (call number in `rax`,
 arguments in `rdi`/`rsi`, a hand-written trap frame preserving every
 other register) rather than a fixed action performed regardless of what
-the caller asked for, and — the first step
-toward the BeOS/Haiku-flavored desktop-OS direction noted below — real
+the caller asked for — including a ring-3 task genuinely blocking on a
+real kernel call (`SYS_SET_ALARM`/`SYS_WAIT_ALARM`, wrapping the same
+`sys_setalarm`/notification `CLOCK` already uses) and resuming exactly
+where it left off in ring 3 once the alarm actually fires, not just
+one-shot calls that always return immediately — and, the first step
+toward the BeOS/Haiku-flavored desktop-OS direction noted below, real
 VGA graphics (a static, LCARS-style panel of flat-colored rounded-rectangle
 bars and buttons, no text, painted into a real linear framebuffer) and a
 real PS/2 keyboard driver (hardware IRQ1, scancodes read and translated to
@@ -176,11 +180,20 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   CPU didn't already save, calls `dispatch` with the caller's original
   `rax`/`rdi`/`rsi`, writes the `u64` result back into the saved `rax`
   slot, restores everything else unchanged, and `iretq`s. `dispatch`
-  implements three calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  implements five calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
   `dispatch` runs with the *caller's own* address space still active),
+  `SYS_SET_ALARM`/`SYS_WAIT_ALARM` (the first of `crate::calls`' own
+  kernel calls reachable from ring 3: `SYS_SET_ALARM` calls the same
+  `calls::sys_setalarm` `CLOCK` itself uses, and `SYS_WAIT_ALARM` blocks
+  the caller in `ipc::receive` *inside this very trap* until the real
+  `SYN_ALARM` notification arrives, then returns normally -- proving a
+  ring-3 task can genuinely block on a kernel call, with the rest of the
+  system (other tasks, the scheduler, the timer) continuing normally
+  while it's blocked, and later resume ring-3 execution right where it
+  left off, not just make one-shot calls that always return immediately),
   and `SYS_BLOCK_FOREVER` (calls `ipc::receive(ANY)` directly from inside
   the trap, never returning -- the same "nothing sends to this proc
   again" pattern every other demo task in `main.rs` ends with).
@@ -316,11 +329,15 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `yield_now()`/IPC call anywhere in it (proving the timer interrupt truly
   preempts a task asynchronously, mid-loop, rather than only ever
   switching at cooperative checkpoints). `driver` runs the ring-3 demo task
-  described above, and `tty` runs `elf::task_entry` (`elf::load` builds
-  its address space in `kernel_main`, the same way `driver`'s is built) --
-  a real ELF64 binary (`user/hello.elf`) executing its own `incl`/`int
-  0x80` loop in ring 3, its five round trips counted independently of
-  `driver`'s. `CLOCK` now genuinely
+  described above (three real `SYS_GET_UPTIME` syscalls, then
+  `SYS_BLOCK_FOREVER`), and `tty` runs `elf::task_entry` (`elf::load`
+  builds its address space in `kernel_main`, the same way `driver`'s is
+  built) -- a real ELF64 binary (`user/hello.elf`) executing its own
+  counter-increment/`SYS_GET_UPTIME` loop in ring 3 five times, then a real
+  `SYS_SET_ALARM`/`SYS_WAIT_ALARM` (genuinely blocking and later resuming
+  in ring 3), a `SYS_WRITE_LINE`, and finally `SYS_BLOCK_FOREVER` -- see
+  `src/syscall.rs` below for what each of those actually does. `CLOCK` now
+  genuinely
   calls `sys_setalarm` and blocks in `receive` -- exactly real MINIX's
   `while (TRUE) receive(HARDWARE, &m)` -- instead of polling
   `uptime_ticks()`, and also exercises `sys_vircopy` twice: reading the
@@ -412,13 +429,13 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Only three calls exist** (`SYS_GET_UPTIME`, `SYS_WRITE_LINE`,
-  `SYS_BLOCK_FOREVER`), and none of them are `crate::calls`' real kernel
-  calls (`sys_vircopy`/`sys_setalarm`/`sys_fork`) -- those still aren't
-  reachable from ring 3 at all. This is deliberately the minimal set
-  needed to prove the dispatch mechanism itself (a call that returns
-  data, one that takes a pointer argument, one that blocks), not a
-  real syscall surface.
+- **Only five calls exist**, and only `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
+  are `crate::calls`' real kernel calls (`sys_vircopy`/`sys_fork` still
+  aren't reachable from ring 3 at all). This is deliberately the minimal
+  set needed to prove the dispatch mechanism itself (a call that returns
+  data, one that takes a pointer argument, one that genuinely blocks and
+  resumes, one that ends the caller for good), not a real syscall
+  surface.
 - **Two arguments, not a full calling convention.** Only `rdi`/`rsi` are
   read as arguments; a real syscall ABI (or MINIX's own message-based
   one) would want more, plus a real error-reporting convention (`dispatch`
@@ -438,18 +455,22 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   real syscall convention requires (e.g. SysV's syscall-clobbered set) or
   varying by call number. Correct and simple; a hair more work per trap
   than strictly necessary.
+- **`SYS_WAIT_ALARM` doesn't check that a `SYS_SET_ALARM` actually
+  preceded it.** It just calls `ipc::receive(CLOCK)`, the same as
+  `crate::proc::clock_task` does directly -- a caller that waits with no
+  alarm pending simply blocks forever, since nothing will ever notify it.
+  There's also no way for a caller to wait for more than one kind of
+  event at once, or to time out.
 
 ### Known simplifications in the kernel calls
 
-- **Not reachable from ring 3.** `sys_vircopy`/`sys_setalarm`/`sys_fork`
-  are ordinary Rust functions any kernel task calls directly, not entries
-  in a call-number dispatch table reached via a message to `SYSTEM`
+- **Only `sys_setalarm` is reachable from ring 3 so far** (via
+  `crate::syscall`'s `SYS_SET_ALARM`/`SYS_WAIT_ALARM`, a real register-based
+  call-number dispatch -- see "known simplifications in the syscall ABI"
+  above). `sys_vircopy` and `sys_fork` are still only ordinary Rust
+  functions kernel tasks call directly, not entries in a call-number
+  dispatch table reached via a message to `SYSTEM`
   (`kernel/system.c`'s `map(SYS_xxx, do_xxx)`) the way real MINIX's are.
-  There *is* now a real register-based call-number dispatch reachable
-  from ring 3 (`crate::syscall`), but it implements its own small,
-  separate set of calls (`SYS_GET_UPTIME`/`SYS_WRITE_LINE`/
-  `SYS_BLOCK_FOREVER`) rather than exposing these three -- see "known
-  simplifications in the syscall ABI" above.
 - **`sys_fork`'s child starts at a fixed entry point, not "wherever the
   parent was."** Real `fork()` gives the child an exact copy of the
   parent's *entire* address space and resumes both sides from the same
@@ -627,13 +648,12 @@ Roughly in the order the original kernel needs them:
     statically linked ELF64 binary (`user/hello.elf`) and maps its
     `PT_LOAD` segments into a fresh address space at their own specified
     addresses and permissions (not one hand-placed page), zero-filling
-    BSS; a second ring-3 task (`tty`) runs it, its five `int 0x80` round
-    trips counted independently of `driver`'s own demo (see "known
-    simplifications in the ring-3 task" above -- the syscall counter is
-    now per-process), and `CLOCK` reads its `.data` counter back via
-    `sys_vircopy` afterward to confirm the loaded code genuinely executed
-    and wrote through to physical memory, not just that it trapped in the
-    expected number of times. See "known simplifications in the ELF
+    BSS; a second ring-3 task (`tty`) runs it, making real syscalls
+    (`src/syscall.rs`) through the same gate `driver`'s own demo uses, and
+    `CLOCK` reads its `.data` counter back via `sys_vircopy` afterward to
+    confirm the loaded code genuinely executed and wrote through to
+    physical memory, not just that it made the syscalls it logged. See
+    "known simplifications in the ELF
     loader" below for what's missing (no dynamic linking, no `argv`/
     `envp`, the binary is checked in pre-built rather than assembled by
     this build).
@@ -684,17 +704,26 @@ Roughly in the order the original kernel needs them:
     `usermode`'s old fixed-action, count-and-cut-off `int 0x80` handler
     with genuine call-number/register dispatch: a hand-written naked trap
     gate saves every general-purpose register, reads the caller's `rax`
-    (call number) and `rdi`/`rsi` (arguments), dispatches to one of three
-    calls (`SYS_GET_UPTIME`, `SYS_WRITE_LINE` -- a real cross-ring pointer
+    (call number) and `rdi`/`rsi` (arguments), dispatches to one of five
+    calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE` -- a real cross-ring pointer
     argument, read directly since entering a trap gate never switches
-    `CR3` -- and `SYS_BLOCK_FOREVER`), and writes the result back into
-    `rax` before `iretq`. Both ring-3 tasks (`usermode`'s hand-assembled
-    demo and `crate::elf`'s loaded ELF binary) now exercise it for real,
-    each ending on its own terms (`SYS_BLOCK_FOREVER`) instead of being
-    cut off by a kernel-side iteration counter. See "known simplifications
-    in the syscall ABI" above for what's not a real syscall surface yet
-    (only three calls, none of them `crate::calls`' actual kernel calls, a
-    single `u64::MAX` error sentinel instead of real error codes).
+    `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` -- the first of `crate::calls`'
+    own kernel calls reachable from ring 3, and the first syscall here
+    that genuinely blocks the caller and resumes it later rather than
+    always returning immediately; and `SYS_BLOCK_FOREVER`), and writes
+    the result back into `rax` before `iretq`. Both ring-3 tasks
+    (`usermode`'s hand-assembled demo and `crate::elf`'s loaded ELF
+    binary) now exercise real syscalls, each ending on its own terms
+    (`SYS_BLOCK_FOREVER`) instead of being cut off by a kernel-side
+    iteration counter; `tty` (the ELF-loaded one) additionally sets a
+    real 3-tick alarm and blocks waiting for it, verified in QEMU to
+    resume in ring 3 exactly where it left off once the alarm fires,
+    with the rest of the system (`CLOCK`'s own alarm, the dynamically
+    spawned `log` task, `rs`/`memory`'s preemption) continuing normally
+    the whole time it's blocked. See "known simplifications in the
+    syscall ABI" above for what's not a real syscall surface yet (only
+    five calls, `sys_vircopy`/`sys_fork` still not reachable, a single
+    `u64::MAX` error sentinel instead of real error codes).
 
 ## Building
 
@@ -781,11 +810,16 @@ copy doesn't show up in the original), `driver` (the hand-assembled demo)
 and `tty` (a real ELF64 binary loaded by `crate::elf`) each making real,
 register-dispatched syscalls through `crate::syscall` --
 `[syscall] proc P: SYS_GET_UPTIME -> N` a few times each,
-`tty` additionally logging `[syscall] proc 5: SYS_WRITE_LINE: "hello from
-the ELF-loaded ring-3 task!"` (a real cross-ring pointer argument, read
-directly out of `tty`'s own still-active address space) -- before each
-ends itself with `[syscall] proc P: SYS_BLOCK_FOREVER, blocking for
-good`, `CLOCK` waking from a real
+`tty` additionally calling `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
+(`[syscall] proc 5: SYS_SET_ALARM(3 ticks)`, then, after genuinely
+blocking through several other tasks' output in between,
+`[syscall] proc 5: SYS_WAIT_ALARM woken by a real SYN_ALARM notification
+(uptime N)`) and then `SYS_WRITE_LINE` (`[syscall] proc 5: SYS_WRITE_LINE:
+"hello from the ELF-loaded ring-3 task, after waiting for a real alarm!"`,
+a real cross-ring pointer argument, read directly out of `tty`'s own
+still-active address space) -- before each task ends itself with
+`[syscall] proc P: SYS_BLOCK_FOREVER, blocking for
+good`, `CLOCK` waking from its own real
 `sys_setalarm`-driven `SYN_ALARM` notification and then using
 `sys_vircopy` twice: once to read the ring-3 demo task's code bytes back
 out of its own address space (proving a genuine cross-address-space copy,

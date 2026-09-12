@@ -1,11 +1,13 @@
 # A trivial, freestanding ELF64 user-mode demo program, exercising a
 # real syscall ABI (crate::syscall, called through int 0x80): increment
-# a .data counter and call SYS_GET_UPTIME five times, then call
-# SYS_WRITE_LINE with a pointer into this program's own .data (proving
-# a real cross-ring argument -- a pointer -- gets read correctly),
-# then SYS_BLOCK_FOREVER, which never returns. No libc, no _start-time
-# setup: the kernel's elf.rs loader jumps straight to _start with
-# nothing but a stack.
+# a .data counter and call SYS_GET_UPTIME five times, then SYS_SET_ALARM
+# a real alarm and SYS_WAIT_ALARM for it -- blocking this task inside the
+# kernel and, once the alarm genuinely fires, resuming right here in
+# ring 3 -- then call SYS_WRITE_LINE with a pointer into this program's
+# own .data (proving a real cross-ring argument -- a pointer -- gets read
+# correctly), then SYS_BLOCK_FOREVER, which never returns. No libc, no
+# _start-time setup: the kernel's elf.rs loader jumps straight to _start
+# with nothing but a stack.
 #
 # Built into hello.elf (checked in alongside this file, since the kernel
 # build has no cross toolchain wired in yet to assemble this
@@ -33,6 +35,13 @@ _start:
     int $0x80
     loop 1b
 
+    mov $3, %edi        # delay_ticks = 3
+    mov $4, %eax        # SYS_SET_ALARM (crate::syscall::SYS_SET_ALARM)
+    int $0x80
+
+    mov $5, %eax        # SYS_WAIT_ALARM (crate::syscall::SYS_WAIT_ALARM)
+    int $0x80
+
     lea message(%rip), %rdi
     mov $message_len, %esi
     mov $2, %eax        # SYS_WRITE_LINE (crate::syscall::SYS_WRITE_LINE)
@@ -47,5 +56,5 @@ _start:
 counter:
     .long 0
 message:
-    .ascii "hello from the ELF-loaded ring-3 task!"
+    .ascii "hello from the ELF-loaded ring-3 task, after waiting for a real alarm!"
 message_len = . - message

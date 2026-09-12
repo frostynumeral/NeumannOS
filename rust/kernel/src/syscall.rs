@@ -39,12 +39,23 @@
 //! itself. A real `sys_vircopy`-style copy is only needed to reach a
 //! *different* process's memory (see `crate::calls`/`crate::memory`),
 //! not the currently-running one's own.
+//!
+//! `SYS_SET_ALARM`/`SYS_WAIT_ALARM` are the first of `crate::calls`' own
+//! kernel calls reachable from ring 3 through this ABI: `SYS_SET_ALARM`
+//! calls the same `calls::sys_setalarm` `CLOCK` already uses, and
+//! `SYS_WAIT_ALARM` blocks the caller in `ipc::receive` *inside the trap
+//! itself* until the real `SYN_ALARM` notification arrives -- proving a
+//! ring-3 task can genuinely block on a kernel call and later resume
+//! executing ring-3 code afterward (via this same trap's `iretq`), not
+//! just make one-shot, always-returns-immediately calls.
 
-use crate::{proc, serial_println};
+use crate::{calls, com, ipc, proc, serial_println};
 
 pub const SYS_GET_UPTIME: u64 = 1;
 pub const SYS_WRITE_LINE: u64 = 2;
 pub const SYS_BLOCK_FOREVER: u64 = 3;
+pub const SYS_SET_ALARM: u64 = 4;
+pub const SYS_WAIT_ALARM: u64 = 5;
 
 /// Longest string `SYS_WRITE_LINE` will read, purely as a sanity bound on
 /// `arg2` (an untrusted length from ring 3) -- not a real buffer, since
@@ -98,8 +109,44 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64) -> u64 {
             // kernel task calling `ipc::receive` directly -- there's
             // nothing ring-3-specific about blocking itself, only about
             // how we got here.
-            crate::ipc::receive(crate::com::ANY);
+            ipc::receive(com::ANY);
             unreachable!("nothing sends to a process that called SYS_BLOCK_FOREVER");
+        }
+        SYS_SET_ALARM => {
+            // The first of crate::calls' own kernel calls reachable from
+            // ring 3 through this ABI (see the module doc comment's note
+            // that none were, until now): calls the very same
+            // calls::sys_setalarm CLOCK itself uses, operating on
+            // `proc::current_proc_nr()` -- the caller, since dispatch runs
+            // in the trapped task's own context without a task switch.
+            serial_println!("[syscall] proc {}: SYS_SET_ALARM({} ticks)", caller, arg1);
+            calls::sys_setalarm(arg1);
+            0
+        }
+        SYS_WAIT_ALARM => {
+            // Blocks the caller *inside this very trap*, exactly the way
+            // crate::proc's own CLOCK task already blocks in `ipc::receive`
+            // after calling `sys_setalarm` -- there's nothing ring-3-
+            // specific about blocking in kernel context mid-syscall; the
+            // scheduler already handles resuming an arbitrary blocked call
+            // stack, and this one just happens to `iretq` back to ring 3
+            // once it does. Not paired with a check that a SYS_SET_ALARM
+            // actually preceded it: a caller that waits with no alarm
+            // pending simply blocks forever, the same as `ipc::receive`
+            // always would with nothing to wake it.
+            let notif = ipc::receive(com::CLOCK);
+            debug_assert_eq!(
+                notif.m_type,
+                calls::SYN_ALARM,
+                "SYS_WAIT_ALARM woken by something other than a real alarm notification"
+            );
+            let ticks = proc::uptime_ticks();
+            serial_println!(
+                "[syscall] proc {}: SYS_WAIT_ALARM woken by a real SYN_ALARM notification (uptime {})",
+                caller,
+                ticks
+            );
+            ticks
         }
         _ => {
             serial_println!("[syscall] proc {}: unknown call number {}", caller, call_num);
