@@ -46,8 +46,11 @@ pub const INIT_PROC_NR: i32 = 7;
 /// deterministically crashes it, so `rs`'s restart policy has something
 /// real to prove itself against.
 pub const FLAKY_PROC_NR: i32 = 8;
+/// `crate::keyboard`'s real line-discipline consumer (`console_task`):
+/// blocks for a completed line, then writes it to `fs`.
+pub const CONSOLE_PROC_NR: i32 = 9;
 
-pub const NR_BOOT_PROCS: usize = NR_TASKS + FLAKY_PROC_NR as usize + 1;
+pub const NR_BOOT_PROCS: usize = NR_TASKS + CONSOLE_PROC_NR as usize + 1;
 
 /// Map a process number to a dense array index, for the process table
 /// (`crate::proc`) and the IPC mailboxes it used to have on its own

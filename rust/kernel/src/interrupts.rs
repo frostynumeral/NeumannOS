@@ -179,17 +179,26 @@ extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
 /// does.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame) {
     let scancode = crate::keyboard::read_scancode();
+    // Send EOI before `keyboard::on_char` (which can notify -- and so
+    // reschedule to -- `console_task`), not after: same reasoning as
+    // `timer_interrupt_handler`'s own EOI-before-switch ordering. If the
+    // switch parks this exact call stack for a while, the PIC still
+    // needs to know this IRQ is done so it can keep delivering the next
+    // ones in the meantime.
+    pic::end_of_interrupt(1);
     if let Some(ascii) = crate::keyboard::translate(scancode) {
         crate::serial_println!("[kbd] key: {:?} (scancode {:#04x})", ascii as char, scancode);
         // Digits '1'-'4' pick one of the VGA demo panel's buttons and
-        // redraw it highlighted -- the first real input-to-output loop
-        // in this port (crate::keyboard -> crate::vga), not just proof
-        // the hardware event fires.
+        // redraw it highlighted -- a direct function call, not a real
+        // input event delivered to a process.
         if ascii.is_ascii_digit() {
             if let Some(index) = (ascii - b'0').checked_sub(1) {
                 crate::vga::select_button(index as usize);
             }
         }
+        // Every translated character -- not just digits -- feeds
+        // `console_task`'s real line discipline (`crate::keyboard`'s
+        // module doc comment).
+        crate::keyboard::on_char(ascii);
     }
-    pic::end_of_interrupt(1);
 }

@@ -1,14 +1,24 @@
-//! PS/2 keyboard: read raw scancodes off port `0x60` and translate the
-//! common "make" codes (key pressed, not released) to ASCII.
+//! PS/2 keyboard: read raw scancodes off port `0x60`, translate the
+//! common "make" codes (key pressed, not released) to ASCII, and buffer
+//! a line at a time for `console_task` -- a real, scheduled task, not
+//! just a direct function call (`crate::vga::select_button`) from the
+//! interrupt handler.
 //!
 //! No MINIX C equivalent in the kernel itself: 2005-era MINIX handles the
 //! keyboard in a driver (`drivers/tty/keyboard.c`), not the kernel proper,
-//! reached the normal device-driver-protocol way (`rust/README.md`'s
-//! roadmap -- there's no real `tty` server yet for this port to hand
-//! scancodes to). This is the minimal first slice: read a scancode,
-//! translate it, prove it's a real, hardware-driven, asynchronous event
-//! (like `crate::pit`'s timer) rather than a polled one -- the actual
-//! `tty`/line-discipline layer is future work.
+//! reached the normal device-driver protocol (`rust/README.md`'s
+//! roadmap -- there's still no real `tty` server for this port's
+//! `console_task` to be a stand-in for, so it talks to `crate::fs`
+//! directly instead of through one). `console_task` is nonetheless this
+//! port's first real line discipline: `on_char` (called from
+//! `crate::interrupts::keyboard_interrupt_handler`) accumulates
+//! translated characters into `LINE` until a newline completes one, then
+//! `crate::ipc::notify`s `console_task` -- exactly the same
+//! interrupt-handler-notifies-a-real-task shape `crate::proc::clock_tick`
+//! already uses for `SYN_ALARM`, just triggered by a keypress instead of
+//! a timer tick.
+
+use crate::{com, fs, ipc, serial_println};
 
 /// Standard IBM PC/AT "scancode set 1" (what real hardware -- and QEMU's
 /// PS/2 emulation -- both still send by default), unshifted-key mapping
@@ -98,5 +108,102 @@ pub fn translate(scancode: u8) -> Option<u8> {
     match SCANCODE_TO_ASCII.get(scancode as usize) {
         Some(&0) | None => None,
         Some(&ascii) => Some(ascii),
+    }
+}
+
+/// Longest line `on_char`/`console_task` will buffer. A character typed
+/// past this is silently dropped -- a real line discipline would likely
+/// bell or refuse further input instead; this port doesn't have a way to
+/// signal that back to the (nonexistent) terminal yet.
+const LINE_CAPACITY: usize = 64;
+
+struct LineBuffer {
+    buf: [u8; LINE_CAPACITY],
+    len: usize,
+    /// Set by `on_char` on a newline, cleared by `take_line` once
+    /// `console_task` has consumed it. `on_char` keeps accumulating into
+    /// `buf`/`len` for the *next* line even before this one's been taken
+    /// (mirroring a real line discipline's typeahead), rather than
+    /// blocking further input until `console_task` catches up.
+    ready: bool,
+}
+
+/// The one pending (or just-completed) line, shared between the keyboard
+/// IRQ handler (producer) and `console_task` (consumer). A `spin::Mutex`
+/// rather than anything fancier: the producer only ever holds it for a
+/// few array writes, never across a block/switch, so there's no
+/// deadlock risk against `console_task` (which never holds it across a
+/// blocking call either).
+static LINE: spin::Mutex<LineBuffer> =
+    spin::Mutex::new(LineBuffer { buf: [0; LINE_CAPACITY], len: 0, ready: false });
+
+/// Called from `crate::interrupts::keyboard_interrupt_handler` for every
+/// translated character. A newline marks the buffered line ready and
+/// wakes `console_task` (`crate::ipc::notify`, which -- like
+/// `crate::proc::clock_tick`'s own `SYN_ALARM` delivery -- reschedules
+/// immediately if that just woke a higher-priority task); anything else
+/// is appended to the line in progress.
+pub fn on_char(ascii: u8) {
+    if ascii == b'\n' {
+        LINE.lock().ready = true;
+        crate::ipc::notify(crate::com::CONSOLE_PROC_NR, LINE_READY);
+        return;
+    }
+    let mut line = LINE.lock();
+    if line.len < LINE_CAPACITY {
+        let len = line.len;
+        line.buf[len] = ascii;
+        line.len += 1;
+    }
+}
+
+/// Notification type `on_char` sends `console_task`. Distinct from the
+/// `NOTIFY_MESSAGE`-based ones (`com::notify_from`) purely so it can't be
+/// confused with one of those; nothing currently sends both to the same
+/// task, so this is a stylistic distinction more than a load-bearing one.
+const LINE_READY: i32 = crate::com::NOTIFY_MESSAGE | 0x0100;
+
+/// Take the completed line out of `LINE` (if one is ready) and reset it
+/// for the next one. Returns the line's bytes and length -- a fixed-size
+/// array rather than a slice, so `console_task` can hold it across the
+/// `LINE` lock being released.
+fn take_line() -> Option<([u8; LINE_CAPACITY], usize)> {
+    let mut line = LINE.lock();
+    if !line.ready {
+        return None;
+    }
+    let result = (line.buf, line.len);
+    line.len = 0;
+    line.ready = false;
+    Some(result)
+}
+
+/// `console`'s task body: block for `on_char`'s notification, then take
+/// the completed line and append it (plus a newline) to a real file via
+/// `crate::fs` -- proof a keypress can drive a real, scheduled task that
+/// itself does real IPC, not just a direct function call
+/// (`crate::vga::select_button`) from the interrupt handler, and not
+/// just proof the hardware event fires.
+///
+/// Opens `/console.log` exactly once, before the loop, and keeps writing
+/// through that same descriptor for every subsequent line: `fs::open`
+/// always starts a fresh descriptor's cursor at `0` (see `crate::fs`'s
+/// known simplifications -- there's no explicit "append" mode), so
+/// re-opening on every line would overwrite from the start each time
+/// instead of accumulating one line after another.
+pub fn console_task() -> ! {
+    let fd = fs::open("/console.log");
+    if fd < 0 {
+        serial_println!("[console] fs::open(\"/console.log\") failed: {}", fd);
+    }
+    loop {
+        ipc::receive(com::ANY);
+        let Some((buf, len)) = take_line() else { continue };
+        let line = core::str::from_utf8(&buf[..len]).unwrap_or("<invalid utf8>");
+        serial_println!("[console] received line: {:?}", line);
+        if fd >= 0 {
+            fs::write(fd, &buf[..len]);
+            fs::write(fd, b"\n");
+        }
     }
 }

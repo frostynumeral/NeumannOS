@@ -197,6 +197,7 @@ fn spawn_tasks(ring3_address_space: PhysFrame, elf_address_space: PhysFrame) {
         Some(elf_address_space),
     );
     rs::spawn_flaky();
+    proc::spawn(com::CONSOLE_PROC_NR, "console", keyboard::console_task, 5, 16, true, None);
 }
 
 /// Real MINIX's idle task just halts, waking on the next interrupt; ported
