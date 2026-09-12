@@ -26,8 +26,19 @@ external contract.
 - `src/table.rs` — the boot image (fixed process list), ported from
   `kernel/table.c`'s `image[]`.
 - `src/ipc.rs` — `Message` (ported from the `mess_*`/`message` union in
-  `include/minix/ipc.h`) plus `send`/`receive`/`notify`, a non-blocking
-  stand-in for MINIX's `SEND`/`RECEIVE`/`NOTIFY` kernel calls.
+  `include/minix/ipc.h`) plus `send`/`receive`/`notify`, standing in for
+  MINIX's `SEND`/`RECEIVE`/`NOTIFY` kernel calls. These genuinely block now
+  (see `src/proc.rs`): a `send`/`receive` that can't complete immediately
+  context-switches to another runnable task instead of returning an error.
+- `src/proc.rs` — the process table and scheduler, ported from
+  `kernel/proc.h`/`kernel/proc.c`: `NR_SCHED_QUEUES` priority-ordered ready
+  queues, `enqueue`/`dequeue`/`sched`/`pick_proc`, and the rendezvous IPC
+  algorithm (`mini_send`/`mini_receive`/`mini_notify`) that `ipc.rs` calls
+  into. Also has no C equivalent of its own: the low-level `switch_to`
+  (save/restore callee-saved registers and the stack pointer) and the
+  `trampoline` a freshly spawned task's stack is primed to land in on its
+  first run, standing in for the register save/restore and initial-frame
+  setup that `kernel/mpx386.s` and `kernel/main.c` handle in C MINIX.
 - `src/gdt.rs` — Global Descriptor Table and Task State Segment, ported from
   the segment/TSS setup in `kernel/protect.c`. Its only real job right now
   is giving the double-fault handler a dedicated stack (via the TSS's
@@ -41,7 +52,28 @@ external contract.
   reports and returns — exercised by a self-test in `main.rs`.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, prints the boot
-  image table over COM1, and runs a send/receive/notify self-test.
+  image table over COM1, spawns the kernel tasks, and hands off to the
+  scheduler. Spawns `IDLE` and `CLOCK` as real kernel tasks (same as the
+  boot image), plus temporary stand-in bodies in the `pm`/`fs` process
+  table slots that ping-pong three blocking messages back and forth, to
+  exercise the scheduler and rendezvous IPC end to end before the real
+  servers exist.
+
+### Known simplifications in the scheduler/IPC port
+
+- **No preemption**: real MINIX switches processes unconditionally on
+  every single trap/interrupt return (`restart()` in `kernel/mpx386.s`),
+  so a higher-priority process that becomes ready preempts immediately.
+  This port has no timer interrupt yet (next on the roadmap below), so
+  switching only happens when the running task itself blocks in
+  `send`/`receive` or explicitly calls `proc::yield_now()`. A task that
+  never does either would starve every lower-priority task forever.
+- **No pending-notification bitmap**: `mini_notify` on a task that isn't
+  blocked in `receive` at that exact instant is simply dropped, rather
+  than queued in a per-process bitmap for later delivery like
+  `kernel/proc.c`'s `s_notify_pending` does.
+- **SEND/SEND deadlock panics** instead of returning `ELOCKED`: there's no
+  error-propagating IPC API yet for a caller to recover with.
 
 ## What's not implemented yet (roadmap)
 
@@ -50,19 +82,24 @@ Roughly in the order the original kernel needs them:
 1. ~~**GDT/IDT and exception handling**~~ — done (`src/gdt.rs`,
    `src/interrupts.rs`). CPU faults are now reported instead of silently
    triple-faulting.
-2. **A real scheduler and process table** (`kernel/proc.c`, `kernel/proto.h`)
-   — actual context switching between processes, not just an in-kernel
-   mailbox array.
-3. **User-mode processes and address-space isolation** — right now
-   everything (including "servers") runs in kernel context. Blocking
-   `send`/`receive` (parking a process until a partner is ready) only makes
-   sense once there are processes to park.
-4. **Kernel calls** (`kernel/system.c`, `kernel/system/do_*.c`) — the
+2. ~~**A real scheduler and process table**~~ — done (`src/proc.rs`).
+   Priority ready queues, blocking `send`/`receive`/`notify`, and real
+   context switching between kernel tasks. See "known simplifications"
+   above for what's still missing (chiefly: no preemption, since there's
+   no timer interrupt yet).
+3. **A timer interrupt** (PIT programming + 8259 PIC remap, ported from
+   `kernel/clock.c` + `kernel/i8259.c`) — needed for real preemption
+   (enforcing `p_quantum_size`/`p_ticks_left` instead of relying on tasks
+   to call `yield_now()`) and for `CLOCK` to do its actual job.
+4. **User-mode processes and address-space isolation** — right now
+   everything (including the `pm`/`fs` stand-ins) runs in kernel context.
+5. **Kernel calls** (`kernel/system.c`, `kernel/system/do_*.c`) — the
    privileged operations servers need (`sys_vircopy`, `sys_setalarm`, etc.).
-5. **The servers themselves**: `pm` (process manager), `fs` (file system),
+6. **The servers themselves**: `pm` (process manager), `fs` (file system),
    `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
-   order, matching `servers/` and `drivers/` in the C tree.
-6. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
+   order, matching `servers/` and `drivers/` in the C tree -- replacing the
+   temporary ping-pong stand-ins in `main.rs`.
+7. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 
 ## Building
 
@@ -102,4 +139,7 @@ qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/booti
 
 (or `cargo run`, which invokes `bootimage runner` per `.cargo/config.toml`
 and does the same thing). Expected output on COM1: the boot image table,
-followed by the IPC self-test results, then a halt message.
+`CLOCK`'s three simulated ticks, the `pm`/`fs` demo tasks ping-ponging
+three messages back and forth (proving real blocking `send`/`receive` and
+context switching), and finally `IDLE` reporting that it's halting once
+everything else has blocked.
