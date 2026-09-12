@@ -2,34 +2,43 @@
 //!
 //! This is the Rust port's `kernel/main.c` equivalent: it boots, sets up
 //! the GDT/IDT so CPU faults are reported instead of triple-faulting
-//! (`crate::gdt`, `crate::interrupts`), programs the PIC/PIT and enables
-//! interrupts so the timer starts driving real, asynchronously-preemptive
-//! scheduling (`crate::pic`, `crate::pit`, `crate::proc`), prints the boot
-//! image (the process table MINIX would load into memory at this point),
-//! spawns the kernel tasks (`crate::proc`), and hands off to the scheduler
-//! -- just as `kernel/main.c` ends by calling `restart()`. There is no
-//! user-mode and no MMU-based address-space isolation yet — see
-//! `rust/README.md` for what's implemented versus planned.
+//! (`crate::gdt`, `crate::interrupts`), sets up paging and a heap
+//! allocator (`crate::memory`, `crate::allocator`), programs the PIC/PIT
+//! and enables interrupts so the timer starts driving real,
+//! asynchronously-preemptive scheduling (`crate::pic`, `crate::pit`,
+//! `crate::proc`), prints the boot image (the process table MINIX would
+//! load into memory at this point), spawns the kernel tasks
+//! (`crate::proc`), and hands off to the scheduler -- just as
+//! `kernel/main.c` ends by calling `restart()`. There is no user-mode and
+//! no per-process address-space isolation yet — see `rust/README.md` for
+//! what's implemented versus planned.
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
 
+extern crate alloc;
+
+mod allocator;
 mod com;
 mod gdt;
 mod interrupts;
 mod ipc;
+mod memory;
 mod pic;
 mod pit;
 mod proc;
 mod serial;
 mod table;
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
+use x86_64::VirtAddr;
 
 entry_point!(kernel_main);
 
-fn kernel_main(_boot_info: &'static BootInfo) -> ! {
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial::init();
     serial_println!("NeumannOS kernel booting (Rust port of MINIX 3.1.0)");
     serial_println!();
@@ -42,6 +51,32 @@ fn kernel_main(_boot_info: &'static BootInfo) -> ! {
     // doesn't crash the kernel.
     x86_64::instructions::interrupts::int3();
     serial_println!("survived breakpoint exception");
+
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    serial_println!(
+        "heap mapped: {} KiB at {:#x}",
+        allocator::HEAP_SIZE / 1024,
+        allocator::HEAP_START
+    );
+    // Self-test: exercise the global allocator through both a Box (single
+    // fixed-size allocation) and a growing Vec (multiple reallocations),
+    // proving the heap actually works rather than merely compiling.
+    let boxed = Box::new(41u32 + 1);
+    let mut vec: Vec<u32> = Vec::new();
+    for i in 0..100u32 {
+        vec.push(i);
+    }
+    serial_println!(
+        "heap self-test: boxed={}, vec.len()={}, vec.sum()={}",
+        boxed,
+        vec.len(),
+        vec.iter().sum::<u32>()
+    );
+    drop(boxed);
+    drop(vec);
 
     serial_println!();
 

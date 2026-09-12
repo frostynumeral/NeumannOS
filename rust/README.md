@@ -5,10 +5,10 @@ this repository (see the top-level `README.md` for the original C
 codebase's history). It is a **starting skeleton**, not a finished port: a
 real microkernel, its servers (`pm`, `fs`, `rs`, ...), and its drivers are a
 multi-month undertaking on their own. What's here boots in QEMU, sets up
-exception handling, schedules kernel tasks with real, asynchronously
-preemptive hardware-timer-driven quantum accounting, and exercises
-blocking message-passing IPC between them — enough to build the rest of
-the system on top of.
+exception handling and a heap, schedules kernel tasks with real,
+asynchronously preemptive hardware-timer-driven quantum accounting, and
+exercises blocking message-passing IPC between them — enough to build the
+rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -67,16 +67,31 @@ external contract.
 - `src/interrupts.rs` additionally handles IRQ0 (the timer), calling
   `proc::clock_tick` on every tick -- standing in for the
   `hwint00`/`clock_handler` pair in `kernel/mpx386.s`/`kernel/clock.c`.
+- `src/memory.rs` + `src/allocator.rs` — paging and a heap allocator. No
+  direct C equivalent: 2005-era i386 MINIX uses segment-based protection
+  (`kernel/kernel.h`'s `struct mem_map`, translated by kernel calls like
+  `sys_umap`/`sys_vircopy` in `kernel/system/`), not paging, but x86_64 has
+  no non-paged protected mode at all, so paging here is mandatory
+  groundwork rather than a ported feature. Building on the page table the
+  `bootloader` crate already installed, `memory.rs` adds a physical frame
+  allocator over the usable regions of the boot-time memory map, and
+  `allocator.rs` uses it to map and initialize a 1 MiB heap (via the
+  `linked_list_allocator` crate) so `alloc`-crate types (`Box`, `Vec`, ...)
+  work -- exercised by a self-test in `main.rs`. This is the first step
+  toward the next roadmap item below: per-process page tables are where
+  `sys_umap`/`sys_vircopy`'s actual job (translating between address
+  spaces) starts to apply.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
-  crate): loads the GDT/IDT, runs a breakpoint self-test, spawns the kernel
-  tasks, programs the PIC/PIT and enables interrupts, and hands off to the
-  scheduler. Spawns `IDLE` and `CLOCK` as real kernel tasks (same as the
-  boot image), plus temporary stand-in bodies in the `pm`/`fs`/`rs`/`memory`
-  process table slots: `pm`/`fs` ping-pong three blocking messages back and
-  forth (exercising the rendezvous IPC), and `rs`/`memory` each spin in a
-  tight, CPU-bound loop with no `yield_now()`/IPC call anywhere in it
-  (proving the timer interrupt truly preempts a task asynchronously,
-  mid-loop, rather than only ever switching at cooperative checkpoints).
+  crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
+  and the heap, spawns the kernel tasks, programs the PIC/PIT and enables
+  interrupts, and hands off to the scheduler. Spawns `IDLE` and `CLOCK` as
+  real kernel tasks (same as the boot image), plus temporary stand-in
+  bodies in the `pm`/`fs`/`rs`/`memory` process table slots: `pm`/`fs`
+  ping-pong three blocking messages back and forth (exercising the
+  rendezvous IPC), and `rs`/`memory` each spin in a tight, CPU-bound loop
+  with no `yield_now()`/IPC call anywhere in it (proving the timer
+  interrupt truly preempts a task asynchronously, mid-loop, rather than
+  only ever switching at cooperative checkpoints).
 
 ### Known simplifications in the scheduler/IPC/timer port
 
@@ -118,16 +133,21 @@ Roughly in the order the original kernel needs them:
    prove a task that never blocks or yields gets preempted mid-loop and
    later resumes exactly where it left off. See "known simplifications"
    above for the (latency-only) gap that's left.
-5. **User-mode processes and address-space isolation** — right now
+5. ~~**A physical frame allocator and heap**~~ — done (`src/memory.rs`,
+   `src/allocator.rs`). First step toward the next item.
+6. **User-mode processes and address-space isolation** — right now
    everything (including the `pm`/`fs`/`rs`/`memory` stand-ins) runs in
-   kernel context.
-6. **Kernel calls** (`kernel/system.c`, `kernel/system/do_*.c`) — the
+   kernel context, sharing one address space. Needs: a per-process page
+   table (cloning/reusing the kernel mapping, giving each process its own
+   user-space region), GDT user-mode code/data segments plus a TSS `RSP0`
+   for ring 3 → ring 0 transitions, and a syscall entry gate.
+7. **Kernel calls** (`kernel/system.c`, `kernel/system/do_*.c`) — the
    privileged operations servers need (`sys_vircopy`, `sys_setalarm`, etc.).
-7. **The servers themselves**: `pm` (process manager), `fs` (file system),
+8. **The servers themselves**: `pm` (process manager), `fs` (file system),
    `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
    order, matching `servers/` and `drivers/` in the C tree -- replacing the
    temporary stand-ins in `main.rs`.
-8. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
+9. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 
 ## Building
 
@@ -157,20 +177,26 @@ The target (`x86_64-unknown-none`) and build flags are pinned in
 `relocation-model=static`: the builtin target defaults to a
 position-independent executable, which the `bootloader` 0.9 crate's simple
 ELF loader does not relocate, causing the kernel to jump into garbage on
-boot if left at the default.
+boot if left at the default. The kernel's `Cargo.toml` also enables the
+`bootloader` crate's `map_physical_memory` feature, which `src/memory.rs`
+depends on to reach arbitrary physical frames.
 
 ## Running
 
 ```
-qemu-system-x86_64 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-neumannos-kernel.bin -serial stdio
+qemu-system-x86_64 -m 256 -drive format=raw,file=target/x86_64-unknown-none/debug/bootimage-neumannos-kernel.bin -serial stdio
 ```
 
 (or `cargo run`, which invokes `bootimage runner` per `.cargo/config.toml`
-and does the same thing). Expected output on COM1: the boot image table,
-`CLOCK` reporting a handful of real PIT ticks it observed while waiting,
-the `pm`/`fs` demo tasks ping-ponging three messages back and forth
-(blocking `send`/`receive`), the `rs`/`memory` demo tasks trading off every
-quantum purely because the timer forces it (asynchronous preemption --
-watch `memory`'s counter resume from exactly where it left off after
-`rs` gets a turn), and finally `IDLE` reporting that it's halting (with
-the accumulated tick count) once everything else has blocked.
+and does the same thing, though without the explicit `-m 256` -- pass it
+via `QEMU_ARGS` if the default memory size turns out too small for the
+heap plus everything else once more of this grows). Expected output on
+COM1: a heap self-test (`Box`/`Vec` both actually work), the boot image
+table, `CLOCK` reporting a handful of real PIT ticks it observed while
+waiting, the `pm`/`fs` demo tasks ping-ponging three messages back and
+forth (blocking `send`/`receive`), the `rs`/`memory` demo tasks trading
+off every quantum purely because the timer forces it (asynchronous
+preemption -- watch `memory`'s counter resume from exactly where it left
+off after `rs` gets a turn), and finally `IDLE` reporting that it's
+halting (with the accumulated tick count) once everything else has
+blocked.

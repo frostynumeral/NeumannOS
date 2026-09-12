@@ -75,7 +75,7 @@ POSIX calls like `read()`/`open()`/`fork()` are implemented in `lib/posix/_*.c`:
 
 ## Rust port (`rust/`)
 
-Unlike the C tree, this builds and boots directly on a modern Linux host — no MINIX guest needed. It's a bare-metal `no_std` kernel (`rust/kernel/`) using the `bootloader` 0.9 crate to produce a bootable BIOS disk image, run under QEMU. See `rust/README.md` for the architecture mapping (which MINIX C files each Rust module ports) and the roadmap of what isn't built yet (no scheduler, no user-mode processes, no kernel calls, no servers).
+Unlike the C tree, this builds and boots directly on a modern Linux host — no MINIX guest needed. It's a bare-metal `no_std` kernel (`rust/kernel/`) using the `bootloader` 0.9 crate to produce a bootable BIOS disk image, run under QEMU. It has exception handling, a priority-queue scheduler with real hardware-timer-driven asynchronous preemption, blocking rendezvous IPC, and a heap allocator — see `rust/README.md` for the full architecture mapping (which MINIX C files each Rust module ports) and the roadmap of what's still missing (user-mode processes/address-space isolation, kernel calls, the real servers).
 
 ```
 rustup toolchain install nightly
