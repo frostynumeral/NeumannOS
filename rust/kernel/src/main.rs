@@ -61,8 +61,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
-    let mut frame_allocator = unsafe { memory::BootInfoFrameAllocator::init(&boot_info.memory_map) };
-    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+    unsafe { memory::init_frame_allocator(&boot_info.memory_map) };
+    allocator::init_heap(&mut mapper).expect("heap initialization failed");
     serial_println!(
         "heap mapped: {} KiB at {:#x}",
         allocator::HEAP_SIZE / 1024,
@@ -86,10 +86,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     drop(vec);
 
     // Build the ring-3 demo task's own address space and map its
-    // code/stack pages into it now, while `frame_allocator` is handy; the
-    // task itself (spawned below) does the actual jump to ring 3 once the
-    // scheduler runs it.
-    let ring3_address_space = usermode::create_address_space(phys_mem_offset, &mut frame_allocator);
+    // code/stack pages into it now; the task itself (spawned below) does
+    // the actual jump to ring 3 once the scheduler runs it.
+    let ring3_address_space = usermode::create_address_space(phys_mem_offset);
     // Self-test: this is the actual proof of isolation, not just that
     // things still work. The demo pages were never mapped into *this*
     // (the kernel's own) page table -- only into `ring3_address_space` --
@@ -241,7 +240,8 @@ fn vircopy_demo() {
 
 /// Temporary stand-in for the `pm` server (see `spawn_tasks`): proves
 /// blocking `send`/`receive` by pinging `fs` a few times and printing each
-/// reply.
+/// reply, then demonstrates `sys_fork` (see `fork_demo` below) -- fitting,
+/// since real `pm` is exactly who would call it.
 fn demo_pm_task() -> ! {
     for i in 0..3 {
         serial_println!("[pm] sending ping {} to fs", i);
@@ -249,9 +249,92 @@ fn demo_pm_task() -> ! {
         let reply = ipc::receive(com::FS_PROC_NR);
         serial_println!("[pm] got reply from fs: {:?}", reply);
     }
+
+    fork_demo();
+
     serial_println!("[pm] demo finished, blocking for good");
     ipc::receive(com::ANY); // nothing left to receive; parks pm so idle can run
     unreachable!("nothing sends to pm once the demo is done");
+}
+
+/// Proves `sys_fork` (`crate::calls`) gives the child a genuinely
+/// independent *copy* of the forked page, not just another alias of the
+/// same physical memory: forks the ring-3 demo task's code page into a
+/// new child (`init`), overwrites the *child's* copy with a canary value,
+/// then reads back both copies. If fork only cloned the top-level page
+/// table (`memory::new_address_space` alone) rather than deep-copying the
+/// page (`memory::fork_address_space`), the original task's page would
+/// show the canary too, since both sides would still be the same
+/// physical frame.
+fn fork_demo() {
+    let code_addr = x86_64::VirtAddr::new(usermode::USER_CODE_ADDR);
+
+    serial_println!("[pm] forking the ring-3 task's address space into a new child (init)");
+    calls::sys_fork(
+        com::DRVR_PROC_NR,
+        &[code_addr],
+        com::INIT_PROC_NR,
+        "init (forked child)",
+        forked_child_task,
+        5,
+        24,
+        true,
+    );
+
+    let canary: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
+    calls::sys_vircopy(
+        com::PM_PROC_NR,
+        x86_64::VirtAddr::new(canary.as_ptr() as u64),
+        com::INIT_PROC_NR,
+        code_addr,
+        canary.len(),
+    )
+    .expect("writing the canary into the forked child's page failed");
+
+    let mut child_copy = [0u8; 4];
+    calls::sys_vircopy(
+        com::INIT_PROC_NR,
+        code_addr,
+        com::PM_PROC_NR,
+        x86_64::VirtAddr::new(child_copy.as_mut_ptr() as u64),
+        4,
+    )
+    .expect("reading back the child's page failed");
+
+    let mut original_copy = [0u8; 4];
+    calls::sys_vircopy(
+        com::DRVR_PROC_NR,
+        code_addr,
+        com::PM_PROC_NR,
+        x86_64::VirtAddr::new(original_copy.as_mut_ptr() as u64),
+        4,
+    )
+    .expect("reading back the original task's page failed");
+
+    serial_println!(
+        "[pm] after writing a canary into the forked child's copy: child={:?}, original={:?} (unchanged: {:?})",
+        child_copy,
+        original_copy,
+        usermode::USER_CODE
+    );
+    assert_eq!(child_copy, canary, "the forked child's page didn't receive the write");
+    assert_eq!(
+        original_copy,
+        usermode::USER_CODE,
+        "fork did not give the child an independent copy -- the write leaked into the original task's page!"
+    );
+}
+
+/// The child `sys_fork` creates in `fork_demo`. Its code page was
+/// overwritten with a canary value for the divergence test, so it
+/// deliberately doesn't try to jump to ring 3 and execute it (it's no
+/// longer valid `int 0x80` machine code) -- it exists only to prove the
+/// process-table/scheduler side of `sys_fork` works, alongside the memory
+/// side `fork_demo` checks directly.
+fn forked_child_task() -> ! {
+    serial_println!("[init] forked child task running (proc_nr {})", proc::current_proc_nr());
+    ipc::receive(com::ANY); // nothing left to receive; parks init for good
+    unreachable!("nothing sends to init in this demo");
 }
 
 /// Temporary stand-in for the `fs` server (see `spawn_tasks`): the other

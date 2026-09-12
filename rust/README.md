@@ -8,11 +8,13 @@ multi-month undertaking on their own. What's here boots in QEMU, sets up
 exception handling and a heap, schedules kernel tasks with real,
 asynchronously preemptive hardware-timer-driven quantum accounting
 (including a task that runs in ring 3, in its own genuinely isolated
-address space), exercises blocking message-passing IPC between them, and
-has its first two real kernel calls (a genuine cross-address-space
-`sys_vircopy`, and `sys_setalarm` waking a blocked task with a real
-notification instead of it polling) — enough to build the rest of the
-system on top of.
+address space), exercises blocking message-passing IPC between them, has
+its first real kernel calls (a genuine cross-address-space `sys_vircopy`;
+`sys_setalarm` waking a blocked task with a real notification instead of
+it polling), and can `sys_fork` a real child process with a *deep-copied*,
+independent address space (verified by writing to the child's copy and
+confirming the parent's is untouched, not just aliasing the same physical
+memory) — enough to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -95,6 +97,18 @@ external contract.
   and copy page-at-a-time between two such address spaces -- this is
   where `sys_umap`/`sys_vircopy`'s actual job (translating between address
   spaces) applies; see `src/calls.rs` below for the kernel-call wrapper.
+  `fork_address_space` goes one step further than `new_address_space`
+  alone can: for each address in an explicit list, it walks that
+  address's *entire* page-table path fresh, duplicating any level still
+  shared with the source (so touching it can never modify the original)
+  and deep-copying the leaf page's contents into a newly allocated frame
+  -- what real `fork()` needs for every page the parent already had, not
+  just ones mapped after the fork. The physical frame allocator is now a
+  global, lock-protected resource (`GlobalFrameAllocator`,
+  `init_frame_allocator`) rather than a value threaded through
+  `kernel_main`'s locals, since a kernel call like `sys_fork` needs to
+  allocate memory from whichever task happens to call it, not just during
+  boot setup.
 - `src/gdt.rs` also now sets up user-mode (ring 3) code/data segments and
   a TSS `RSP0` (the stack the CPU switches to automatically on *any*
   ring-3-to-ring-0 transition) -- `set_rsp0`, called from `crate::proc` on
@@ -127,21 +141,27 @@ external contract.
   other's saved state the moment either faulted or was preempted);
   per-task `CR3` is what makes that isolation *real* rather than just a
   CPU privilege level.
-- `src/calls.rs` — the first two kernel calls, ported from
-  `kernel/system/do_copy.c` (`sys_vircopy`) and `do_setalarm.c`
-  (`sys_setalarm`). Real MINIX dispatches these by call number out of a
-  message a process sends to `SYSTEM`; this port has no such dispatch yet
-  (see "known simplifications" below), so for now they're just ordinary
-  Rust functions any kernel task can call directly -- the same way
-  `crate::ipc`'s `send`/`receive`/`notify` started out, before anything
-  needed them from ring 3. `sys_vircopy` is a thin wrapper resolving two
-  process numbers to address spaces (`proc::cr3_of`) and delegating to
+- `src/calls.rs` — the first kernel calls, ported from
+  `kernel/system/do_copy.c` (`sys_vircopy`), `do_setalarm.c`
+  (`sys_setalarm`), and `kernel/proc.c`'s `do_fork()` (`sys_fork`). Real
+  MINIX dispatches these by call number out of a message a process sends
+  to `SYSTEM`; this port has no such dispatch yet (see "known
+  simplifications" below), so for now they're just ordinary Rust functions
+  any kernel task can call directly -- the same way `crate::ipc`'s
+  `send`/`receive`/`notify` started out, before anything needed them from
+  ring 3. `sys_vircopy` is a thin wrapper resolving two process numbers to
+  address spaces (`proc::cr3_of`) and delegating to
   `memory::copy_between_address_spaces`; `sys_setalarm` delegates to
   `proc::set_alarm`, and `proc::clock_tick` is what actually notices an
   alarm's deadline and delivers the `SYN_ALARM` notification for it (using
   a `Scheduler::try_deliver_notification` helper shared with
   `mini_notify`, since `clock_tick` is already inside the scheduler lock
-  and can't re-enter it).
+  and can't re-enter it); `sys_fork` resolves a parent process number to
+  an address space, deep-copies the given pages into a brand new one
+  (`memory::fork_address_space`), and spawns a task into it
+  (`proc::spawn`) -- bundling what real MINIX splits into a kernel call
+  (duplicate the memory) and a separate scheduling step, since nothing in
+  this port needs them separated yet.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
   and the heap, builds the ring-3 demo task's address space and maps its
@@ -150,12 +170,17 @@ external contract.
   real kernel tasks (same as the boot image), plus temporary stand-in
   bodies in the `pm`/`fs`/`rs`/`memory`/`driver` process table slots:
   `pm`/`fs` ping-pong three blocking messages back and forth (exercising
-  the rendezvous IPC), `rs`/`memory` each spin in a tight, CPU-bound loop
-  with no `yield_now()`/IPC call anywhere in it (proving the timer
-  interrupt truly preempts a task asynchronously, mid-loop, rather than
-  only ever switching at cooperative checkpoints), and `driver` runs the
-  ring-3 demo task described above -- the only one of these with its own
-  address space rather than sharing the kernel's. `CLOCK` now genuinely
+  the rendezvous IPC) -- `pm` also `sys_fork`s the ring-3 task's code page
+  into a brand new `init` process afterward, then overwrites *just the
+  child's copy* with a canary value and reads back both copies to prove
+  they've genuinely diverged, not aliased the same physical page -- and
+  `rs`/`memory` each spin in a tight, CPU-bound loop with no
+  `yield_now()`/IPC call anywhere in it (proving the timer interrupt truly
+  preempts a task asynchronously, mid-loop, rather than only ever
+  switching at cooperative checkpoints). `driver` runs the ring-3 demo task
+  described above -- the only one of these with its own address space
+  rather than sharing the kernel's, aside from `pm`'s forked child.
+  `CLOCK` now genuinely
   calls `sys_setalarm` and blocks in `receive` -- exactly real MINIX's
   `while (TRUE) receive(HARDWARE, &m)` -- instead of polling
   `uptime_ticks()`, and also exercises `sys_vircopy` by reading the
@@ -230,14 +255,14 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   (`interrupts::SYSCALL_COUNT`) exists purely so `usermode::USER_CODE`'s
   hand-assembly can stay a trivial two-instruction loop instead of needing
   a counter encoded by hand.
-- **Only one task has its own address space.** `Proc::cr3` supports it
-  per-task, but only the ring-3 demo actually gets one; every other task
-  still shares the kernel's. That's deliberate for now -- kernel tasks
-  (`IDLE`, `CLOCK`) and the `pm`/`fs`/`rs`/`memory` stand-ins all run
-  kernel-trusted code today, so there's nothing to isolate them *from*
-  yet -- but it means there's no isolation between, say, `pm` and `fs`'s
-  demo bodies either. That only starts to matter once real, mutually
-  distrusting user-mode servers exist.
+- **Only two tasks have their own address space** (the ring-3 demo and
+  its `sys_fork`ed child); every other task still shares the kernel's.
+  That's deliberate for now -- kernel tasks (`IDLE`, `CLOCK`) and the
+  `pm`/`fs`/`rs`/`memory` stand-ins all run kernel-trusted code today, so
+  there's nothing to isolate them *from* yet -- but it means there's no
+  isolation between, say, `pm` and `fs`'s demo bodies either. That only
+  starts to matter once real, mutually distrusting user-mode servers
+  exist.
 - **A new address space is a full clone of the kernel's page table**,
   not a minimal one built from scratch. This is simple and correct (every
   kernel mapping the task might need -- code, the heap, the
@@ -250,13 +275,27 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the kernel calls
 
-- **No real dispatch.** `sys_vircopy`/`sys_setalarm` are ordinary Rust
-  functions any kernel task calls directly, not entries reached via a
-  message to `SYSTEM` and a call-number dispatch table
+- **No real dispatch.** `sys_vircopy`/`sys_setalarm`/`sys_fork` are
+  ordinary Rust functions any kernel task calls directly, not entries
+  reached via a message to `SYSTEM` and a call-number dispatch table
   (`kernel/system.c`'s `map(SYS_xxx, do_xxx)`). That dispatch has nowhere
   to live yet: there's no real syscall argument-passing convention (the
   one `int 0x80` gate that exists is `usermode`'s fixed demo action, not a
   general call mechanism -- see its own known-simplifications section).
+- **`sys_fork`'s child starts at a fixed entry point, not "wherever the
+  parent was."** Real `fork()` gives the child an exact copy of the
+  parent's *entire* address space and resumes both sides from the same
+  call site (the child's `fork()` returns `0`, the parent's returns the
+  child's pid). This port's tasks are built around a fixed `fn() -> !`
+  entry point (`crate::proc::spawn`) instead, so `sys_fork`'s child starts
+  fresh at whatever entry point the caller supplies -- a real, working
+  process-creation primitive with genuinely independent memory (see the
+  `pm`/`init` canary demo in `main.rs`), just not full POSIX continuation
+  semantics.
+- **`private_pages` must be listed explicitly**, rather than discovered
+  by walking the parent's entire user-accessible page-table range. There's
+  no per-process memory-map bookkeeping yet (`kernel/kernel.h`'s
+  `struct mem_map`) to read it back out of.
 - **`sys_vircopy` skips validation** real MINIX's `do_copy` does first:
   resolving `SELF` to the caller's own process number, and rejecting
   invalid process numbers. Every current caller already knows both real
@@ -309,23 +348,28 @@ Roughly in the order the original kernel needs them:
    what's still narrow about it: only this one task has its own address
    space, and it's a full clone of the kernel's rather than a minimal one.
 9. ~~**Kernel calls**~~ — started (`src/calls.rs`): `sys_vircopy` (backed
-   by `memory::copy_between_address_spaces`) and `sys_setalarm` (backed by
-   `proc::set_alarm`/`clock_tick`). `CLOCK` now uses both for real instead
-   of polling. See "known simplifications" above for what's not
-   implemented yet (real call dispatch, `sys_umap`, more of
-   `kernel/system/do_*.c`).
+   by `memory::copy_between_address_spaces`), `sys_setalarm` (backed by
+   `proc::set_alarm`/`clock_tick`), and `sys_fork` (backed by
+   `memory::fork_address_space` + `proc::spawn`). `CLOCK` uses the first
+   two for real instead of polling; `pm` uses the third to create a real
+   child process with a genuinely independent, deep-copied address space
+   (verified with a canary write). See "known simplifications" above for
+   what's not implemented yet (real call dispatch, `sys_umap`, more of
+   `kernel/system/do_*.c`, full POSIX fork continuation semantics).
 10. **The servers themselves**: `pm` (process manager), `fs` (file system),
     `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
     order, matching `servers/` and `drivers/` in the C tree -- replacing the
-    temporary stand-ins in `main.rs`. First slice done: `proc::spawn` is
-    now proven safe to call from an already-running task, not just
+    temporary stand-ins in `main.rs`. Two slices done: `proc::spawn` is
+    proven safe to call from an already-running task, not just
     `kernel_main`'s boot-time setup (`clock_task` dynamically spawns `log`
-    at runtime) -- the actual primitive real `rs` needs to bring services
-    up on demand. Still missing: a real `rs` that decides *what* to start
-    and *why* (crash detection/restart policy, `servers/rs/manager.c`),
-    and everything `pm`/`fs` actually need to do their jobs (process
-    creation with copy-on-fork-like semantics rather than a fixed
-    `fn() -> !` entry point, and a real filesystem, respectively).
+    at runtime); and `sys_fork` gives a task a real way to create a child
+    with its own independent memory (`pm`'s `init` demo) -- the two
+    primitives real `rs`/`pm` actually need. Still missing: a real `rs`
+    that decides *what* to start and *why* (crash detection/restart
+    policy, `servers/rs/manager.c`), full POSIX fork/exec semantics (the
+    child resuming from the parent's exact call site, and loading a
+    program image rather than starting at a fixed entry point), and a real
+    filesystem for `fs`.
 11. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 
 ## Building
@@ -374,7 +418,10 @@ COM1: a heap self-test (`Box`/`Vec` both actually work), an isolation
 self-test (the ring-3 demo's code page translates to `None` through the
 kernel's own page table -- it only exists in that task's private address
 space), the boot image table, the `pm`/`fs` demo tasks ping-ponging three
-messages back and forth (blocking `send`/`receive`), five ring-3 round
+messages back and forth (blocking `send`/`receive`) followed by `pm`
+`sys_fork`ing a real child (`init`) and proving its copy of the ring-3
+task's code page has genuinely diverged (a canary written to the child's
+copy doesn't show up in the original), five ring-3 round
 trips (`[syscall] iteration N from Ring3 ...`, printed from inside the
 syscall handler using the CPU-captured selector -- not something the
 kernel side merely claims) before that task blocks for good, `CLOCK`

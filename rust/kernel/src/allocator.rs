@@ -15,6 +15,8 @@ use x86_64::structures::paging::{
 };
 use x86_64::VirtAddr;
 
+use crate::memory::GlobalFrameAllocator;
+
 /// Arbitrary, fixed virtual address range for the kernel heap -- there's no
 /// user-mode address space yet to conflict with (see `rust/README.md`), so
 /// there's no real constraint on where this lives other than "not already
@@ -26,12 +28,10 @@ pub const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 /// Map `HEAP_SIZE` bytes at `HEAP_START` and hand that range to the global
-/// allocator. Must run once, after `crate::memory::init`, before any
-/// `alloc`-crate type (`Box`, `Vec`, ...) is used.
-pub fn init_heap(
-    mapper: &mut impl Mapper<Size4KiB>,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> Result<(), MapToError<Size4KiB>> {
+/// allocator. Must run once, after `crate::memory::init` and
+/// `crate::memory::init_frame_allocator`, before any `alloc`-crate type
+/// (`Box`, `Vec`, ...) is used.
+pub fn init_heap(mapper: &mut impl Mapper<Size4KiB>) -> Result<(), MapToError<Size4KiB>> {
     let page_range = {
         let heap_start = VirtAddr::new(HEAP_START as u64);
         let heap_end = heap_start + HEAP_SIZE as u64 - 1u64;
@@ -40,12 +40,13 @@ pub fn init_heap(
         Page::range_inclusive(heap_start_page, heap_end_page)
     };
 
+    let mut frame_allocator = GlobalFrameAllocator;
     for page in page_range {
         let frame = frame_allocator
             .allocate_frame()
             .ok_or(MapToError::FrameAllocationFailed)?;
         let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-        unsafe { mapper.map_to(page, frame, flags, frame_allocator)?.flush() };
+        unsafe { mapper.map_to(page, frame, flags, &mut frame_allocator)?.flush() };
     }
 
     unsafe {

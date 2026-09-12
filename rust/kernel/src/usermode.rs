@@ -19,8 +19,8 @@
 
 use crate::gdt;
 use crate::interrupts::SYSCALL_VECTOR;
-use crate::memory;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
+use crate::memory::{self, GlobalFrameAllocator};
+use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame};
 use x86_64::VirtAddr;
 
 /// Arbitrary, fixed addresses for the demo's one code page and one stack
@@ -51,16 +51,12 @@ pub const USER_CODE: [u8; 4] = [0xCD, SYSCALL_VECTOR, 0xEB, 0xFC];
 /// kernel's own mapper, which is the whole point of this slice. Returns
 /// the new address space's top-level page table frame, for
 /// `crate::proc::spawn` to record as this task's `CR3`. Called once from
-/// `kernel_main`, before any tasks are spawned, using the same frame
-/// allocator `kernel_main` sets up for the heap (`crate::memory`,
-/// `crate::allocator`).
-pub fn create_address_space(
-    physical_memory_offset: VirtAddr,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
-) -> PhysFrame {
-    let (pml4_frame, mut mapper) = memory::new_address_space(physical_memory_offset, frame_allocator);
+/// `kernel_main`, before any tasks are spawned.
+pub fn create_address_space(physical_memory_offset: VirtAddr) -> PhysFrame {
+    let (pml4_frame, mut mapper) = memory::new_address_space(physical_memory_offset);
     let flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let mut frame_allocator = GlobalFrameAllocator;
 
     let code_page = Page::containing_address(VirtAddr::new(USER_CODE_ADDR));
     let code_frame = frame_allocator
@@ -74,7 +70,7 @@ pub fn create_address_space(
         // `USER_CODE_ADDR` directly, since that virtual address isn't
         // mapped in the *currently active* (kernel's) table at all.
         mapper
-            .map_to(code_page, code_frame, flags, frame_allocator)
+            .map_to(code_page, code_frame, flags, &mut frame_allocator)
             .expect("failed to map the user-mode demo's code page")
             .ignore();
         let code_via_phys_offset =
@@ -88,7 +84,7 @@ pub fn create_address_space(
         .expect("out of physical frames for the user-mode demo's stack page");
     unsafe {
         mapper
-            .map_to(stack_page, stack_frame, flags, frame_allocator)
+            .map_to(stack_page, stack_frame, flags, &mut frame_allocator)
             .expect("failed to map the user-mode demo's stack page")
             .ignore();
     }
