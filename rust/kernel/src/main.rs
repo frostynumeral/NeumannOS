@@ -36,6 +36,7 @@ mod pic;
 mod pit;
 mod proc;
 mod serial;
+mod syscall;
 mod table;
 mod usermode;
 mod vga;
@@ -271,20 +272,21 @@ fn vircopy_demo() {
 }
 
 /// Proves `elf::HELLO_ELF`'s loaded code genuinely ran -- not just that
-/// it trapped into the kernel the right number of times, but that its
+/// it made the syscalls `crate::syscall::dispatch` logged, but that its
 /// own `incl counter(%rip)` instruction, executing out of pages this
 /// port's own ELF loader mapped (not the kernel poking bytes in
 /// directly, like `usermode`'s demo), actually wrote through to physical
 /// memory. Reads `tty`'s copy of its own `.data` counter back into a
 /// local buffer via `sys_vircopy` and checks it against the five
-/// iterations `interrupts::syscall_handler` counted for it.
+/// `SYS_GET_UPTIME` calls `user/hello.s` makes before moving on to
+/// `SYS_WRITE_LINE`/`SYS_BLOCK_FOREVER`.
 ///
-/// Relies on `tty` (proc 5) having already run its five iterations and
-/// blocked by the time this runs -- true in practice, since `tty` and
-/// `driver` share the same priority queue and `tty` is enqueued right
-/// after `driver` blocks, well before `CLOCK`'s alarm (3 ticks) fires --
-/// same kind of scheduling-order dependency `vircopy_demo` above already
-/// has on `driver`.
+/// Relies on `tty` (proc 5) having already run to completion (blocked in
+/// `SYS_BLOCK_FOREVER`) by the time this runs -- true in practice, since
+/// `tty` and `driver` share the same priority queue and `tty` is
+/// enqueued right after `driver` blocks, well before `CLOCK`'s alarm (3
+/// ticks) fires -- same kind of scheduling-order dependency
+/// `vircopy_demo` above already has on `driver`.
 fn elf_counter_demo() {
     let mut buf = [0u8; 4];
     calls::sys_vircopy(
@@ -425,7 +427,7 @@ fn fork_demo() {
     assert_eq!(child_copy, canary, "the forked child's page didn't receive the write");
     assert_eq!(
         original_copy,
-        usermode::USER_CODE,
+        usermode::USER_CODE[..4],
         "fork did not give the child an independent copy -- the write leaked into the original task's page!"
     );
 }

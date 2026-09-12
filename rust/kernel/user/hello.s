@@ -1,7 +1,11 @@
-# A trivial, freestanding ELF64 user-mode demo program: increment a
-# .data counter, trap into the kernel (int 0x80 -- crate::interrupts'
-# SYSCALL_VECTOR), repeat. No libc, no _start-time setup: the kernel's
-# elf.rs loader jumps straight to _start with nothing but a stack.
+# A trivial, freestanding ELF64 user-mode demo program, exercising a
+# real syscall ABI (crate::syscall, called through int 0x80): increment
+# a .data counter and call SYS_GET_UPTIME five times, then call
+# SYS_WRITE_LINE with a pointer into this program's own .data (proving
+# a real cross-ring argument -- a pointer -- gets read correctly),
+# then SYS_BLOCK_FOREVER, which never returns. No libc, no _start-time
+# setup: the kernel's elf.rs loader jumps straight to _start with
+# nothing but a stack.
 #
 # Built into hello.elf (checked in alongside this file, since the kernel
 # build has no cross toolchain wired in yet to assemble this
@@ -22,12 +26,26 @@
 .section .text
 .global _start
 _start:
+    mov $5, %ecx
 1:
     incl counter(%rip)
+    mov $1, %eax        # SYS_GET_UPTIME (crate::syscall::SYS_GET_UPTIME)
     int $0x80
-    jmp 1b
+    loop 1b
+
+    lea message(%rip), %rdi
+    mov $message_len, %esi
+    mov $2, %eax        # SYS_WRITE_LINE (crate::syscall::SYS_WRITE_LINE)
+    int $0x80
+
+    mov $3, %eax        # SYS_BLOCK_FOREVER (crate::syscall::SYS_BLOCK_FOREVER)
+    int $0x80
+    # unreachable: SYS_BLOCK_FOREVER's handler never returns.
 
 .section .data
 .global counter
 counter:
     .long 0
+message:
+    .ascii "hello from the ELF-loaded ring-3 task!"
+message_len = . - message
