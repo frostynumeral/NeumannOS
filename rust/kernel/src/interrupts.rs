@@ -1,18 +1,24 @@
-//! CPU exception handling.
+//! CPU exception handling, plus the one hardware interrupt this port
+//! currently handles (the timer).
 //!
-//! Rust equivalent of `kernel/exception.c`. The original `exception()`
-//! function is a single dispatcher indexed by vector number: for a fault in
-//! a user process it converts the fault into a POSIX signal (`SIGFPE`,
-//! `SIGSEGV`, ...) delivered to that process; for a fault in a kernel task
-//! it panics. This port has no user processes or signals yet (see
-//! `rust/README.md`), so every handler here takes the "kernel task" branch:
-//! report the fault and halt. What's new compared to the C version is the
-//! double-fault handler, which needs its own dedicated stack (set up in
-//! `crate::gdt`) purely so that a fault *while already faulting* — e.g. a
-//! kernel stack overflow — is reported instead of silently triple-faulting
-//! the CPU and resetting the machine.
+//! The exception handlers are a Rust equivalent of `kernel/exception.c`.
+//! The original `exception()` function is a single dispatcher indexed by
+//! vector number: for a fault in a user process it converts the fault into
+//! a POSIX signal (`SIGFPE`, `SIGSEGV`, ...) delivered to that process; for
+//! a fault in a kernel task it panics. This port has no user processes or
+//! signals yet (see `rust/README.md`), so every handler here takes the
+//! "kernel task" branch: report the fault and halt. What's new compared to
+//! the C version is the double-fault handler, which needs its own
+//! dedicated stack (set up in `crate::gdt`) purely so that a fault *while
+//! already faulting* — e.g. a kernel stack overflow — is reported instead
+//! of silently triple-faulting the CPU and resetting the machine.
+//!
+//! `timer_interrupt_handler` is the IRQ0 handler `crate::pic`/`crate::pit`
+//! set up, standing in for the `hwint00`/`clock_handler` pair in
+//! `kernel/mpx386.s`/`kernel/clock.c`.
 
 use crate::gdt;
+use crate::pic;
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
@@ -29,6 +35,7 @@ lazy_static! {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
+        idt[pic::IRQ0_VECTOR].set_handler_fn(timer_interrupt_handler);
         idt
     };
 }
@@ -86,4 +93,9 @@ extern "x86-interrupt" fn double_fault_handler(
         "EXCEPTION: DOUBLE FAULT (error code {:#x})\n{:#?}",
         error_code, frame
     );
+}
+
+extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
+    crate::proc::clock_tick();
+    pic::end_of_interrupt(0);
 }
