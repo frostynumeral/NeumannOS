@@ -3,7 +3,8 @@
 //! Rust port of `kernel/i8259.c`'s `intr_init()`: reprograms the master and
 //! slave PICs so hardware IRQs land on vectors we control instead of the
 //! CPU-exception range (0-31), then masks every line except IRQ0 (the
-//! timer, wired up in `crate::pit`/`crate::interrupts`) -- we don't have
+//! timer, wired up in `crate::pit`/`crate::interrupts`) and IRQ1 (the
+//! keyboard, `crate::keyboard`/`crate::interrupts`) -- we don't have
 //! handlers for anything else yet.
 //!
 //! One deliberate deviation from the C: real MINIX remaps IRQ0-7 to
@@ -55,9 +56,10 @@ pub fn init() {
         master_data.write(ICW4_8086);
         slave_data.write(ICW4_8086);
 
-        // Mask everything except IRQ0 on the master, everything on the
-        // slave (we have no handlers for IRQ1-15 yet).
-        master_data.write(!0b0000_0001u8);
+        // Mask everything except IRQ0 (timer) and IRQ1 (keyboard) on the
+        // master, everything on the slave (we have no handlers for
+        // IRQ2-15 yet).
+        master_data.write(!0b0000_0011u8);
         slave_data.write(0xFF);
     }
 }

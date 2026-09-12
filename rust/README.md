@@ -20,8 +20,10 @@ a second ring-3 task that runs a *real, statically linked ELF64 binary*
 (parsed and mapped by this port's own minimal ELF loader, not
 hand-assembled bytes poked into a fixed page), and — the first step
 toward the BeOS/Haiku-flavored desktop-OS direction noted below — real
-VGA graphics: a static, LCARS-style panel (flat-colored rounded-rectangle
-bars and buttons, no text) painted into a real linear framebuffer — enough
+VGA graphics (a static, LCARS-style panel of flat-colored rounded-rectangle
+bars and buttons, no text, painted into a real linear framebuffer) and a
+real PS/2 keyboard driver (hardware IRQ1, scancodes read and translated to
+ASCII, asynchronously -- even waking the CPU from `IDLE`'s `hlt`) — enough
 to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
@@ -224,6 +226,20 @@ external contract.
   calls `init_palette`/`draw_demo_panel` as early as possible (before
   paging/heap/scheduler setup), so the panel stays on screen even if
   something later in boot panics.
+- `src/keyboard.rs` + `src/interrupts.rs`'s `keyboard_interrupt_handler` —
+  a real PS/2 keyboard driver. No MINIX C kernel equivalent: 2005-era
+  MINIX handles the keyboard in a driver process
+  (`drivers/tty/keyboard.c`), not the kernel proper, reached the normal
+  device-driver protocol way; this port has no real `tty` server yet to
+  hand scancodes to (see `rust/README.md`'s roadmap), so this is the
+  minimal first slice, proving the hardware event itself works. `pic.rs`
+  now unmasks IRQ1 alongside IRQ0; `keyboard_interrupt_handler` reads the
+  scancode byte off port `0x60` (`keyboard::read_scancode`), translates
+  it via a scancode-set-1-to-ASCII table (`keyboard::translate`, unshifted
+  keys only, release ("break") codes -- bit 7 set -- ignored), and prints
+  it -- entirely asynchronous and hardware-driven, the same way
+  `timer_interrupt_handler` is for IRQ0, including waking the CPU from
+  `IDLE`'s `hlt` the instant a key is pressed.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
   and the heap, builds the ring-3 demo task's and the ELF-loaded task's
@@ -449,8 +465,10 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   long-term direction note above).
 - **A single, fixed, hardcoded layout.** `draw_demo_panel` always draws
   the same bars/buttons at the same coordinates; there's no generic
-  "layout a panel of N elements" API, windowing, or input handling
-  (mouse/keyboard) yet -- this is a static image, not a UI.
+  "layout a panel of N elements" API or windowing yet -- this is a
+  static image, not a UI. `crate::keyboard` (below) reads real input at
+  the hardware level, but nothing connects it to the panel yet (no
+  buttons to click, no focus, no redraw-on-input).
 - **No double buffering.** `draw_demo_panel` writes directly to the
   live, currently-displayed framebuffer; fine for one paint that never
   changes again, but a real UI redrawing every frame would need to draw
@@ -459,6 +477,26 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   call**, rather than precomputed into a reusable mask or drawn via a
   midpoint-circle algorithm. Fine at 320x200 and a handful of shapes;
   would matter at a much bigger framebuffer or redrawn every frame.
+
+### Known simplifications in the keyboard driver
+
+- **No shift/caps-lock/ctrl/alt state tracking.** `keyboard::translate`
+  always uses the unshifted mapping (lowercase letters, unshifted
+  punctuation) regardless of which modifier keys are actually held, and
+  has no translation at all for modifier keys, F-keys, arrows, or any
+  other non-alphanumeric key -- real MINIX's keyboard driver tracks this
+  state (`drivers/tty/keyboard.c`) to produce the right shifted/control
+  character.
+- **Scancode set 1 only**, and only the alphanumeric/punctuation block
+  (`0x02`-`0x39`); no handling for scancode set 2/3, the `E0`-prefixed
+  extended keys (arrows, the right-hand Ctrl/Alt, ...), or PS/2
+  controller configuration beyond what the BIOS/QEMU already leaves in
+  place at boot.
+- **Nothing consumes the translated character except `serial_println!`.**
+  There's no keyboard buffer, no line discipline, and no `tty`
+  server/IPC message to deliver it to (see `rust/README.md`'s roadmap) --
+  this is proof the hardware event and translation work, not a usable
+  input path yet.
 
 ## What's not implemented yet (roadmap)
 
@@ -549,6 +587,15 @@ Roughly in the order the original kernel needs them:
     missing (a higher-resolution/color-depth mode, a real layout/windowing
     system, input handling, double buffering) before this is a UI rather
     than a static image.
+14. ~~**Real keyboard input**~~ — started (`src/keyboard.rs`): IRQ1
+    unmasked, a real PS/2 scancode read off port `0x60` and translated to
+    ASCII (unshifted alphanumeric/punctuation only), proven asynchronous
+    and hardware-driven -- it wakes the CPU from `IDLE`'s `hlt` the
+    instant a key is pressed, the same way the timer already does every
+    tick. See "known simplifications in the keyboard driver" above for
+    what's missing (modifier-key state, extended scancodes, and -- the
+    big one -- anything that actually *consumes* a keypress yet, since
+    there's no `tty` server or line discipline for it to reach).
 
 ## Building
 
@@ -602,7 +649,13 @@ QMP client sends `{"execute": "screendump", "arguments": {"filename":
 resulting image is double the mode's logical 320x200 (640x400): real
 mode 13h hardware double-scans it, and QEMU's screendump reflects that,
 so multiply logical panel coordinates by 2 before sampling a pixel from
-the dump. Expected output on COM1: a line confirming the LCARS demo panel
+the dump. The keyboard driver can be exercised the same headless way:
+with the same `-qmp` socket from above, send
+`{"execute": "send-key", "arguments": {"keys": [{"type": "qcode", "data": "a"}]}}`
+after the capabilities handshake, and COM1 should print
+`[kbd] key: 'a' (scancode 0x1e)` -- this works even after `IDLE` has
+logged that it's halting, since the keyboard IRQ wakes the CPU straight
+out of `hlt`. Expected output on COM1: a line confirming the LCARS demo panel
 was painted (`vga: painted the LCARS demo panel ...`, printed as early as
 possible -- before paging/heap/scheduler setup -- so the panel is on
 screen even if something later panics), a heap self-test (`Box`/`Vec` both actually work), an isolation
