@@ -12,9 +12,9 @@
 //! message-passing entry point from ring 3 yet, and building the real
 //! thing needs this register-level plumbing first regardless.
 //!
-//! Convention: call number in `rax`, up to two arguments in `rdi`, `rsi`
-//! (the first two System V integer-argument registers), return value in
-//! `rax`. `entry` is the actual `SYSCALL_VECTOR` IDT handler (installed
+//! Convention: call number in `rax`, up to three arguments in `rdi`,
+//! `rsi`, `rdx` (the first three System V integer-argument registers),
+//! return value in `rax`. `entry` is the actual `SYSCALL_VECTOR` IDT handler (installed
 //! via `Entry::set_handler_addr` in `crate::interrupts`, not
 //! `set_handler_fn` -- this needs full control over the trap frame that
 //! the `x86-interrupt` calling convention doesn't expose, namely the
@@ -48,14 +48,36 @@
 //! ring-3 task can genuinely block on a kernel call and later resume
 //! executing ring-3 code afterward (via this same trap's `iretq`), not
 //! just make one-shot, always-returns-immediately calls.
+//!
+//! `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` go one step further: a real
+//! IPC round trip to `fs` (`crate::fs`), not just another kernel-internal
+//! call. Their pointer arguments get one more layer of care than
+//! `SYS_WRITE_LINE`'s: `dispatch` copies a caller's buffer into a local
+//! (kernel-stack) buffer *before* calling into `crate::fs`'s client stubs,
+//! rather than handing the caller's own pointer to them directly. That
+//! extra copy matters here in a way it didn't for `SYS_WRITE_LINE`: `fs`
+//! is a *different task*, and by the time it actually dereferences a
+//! pointer in the request message, `CR3` may no longer be the caller's
+//! (`crate::fs`'s own module doc comment covers the rest of this
+//! caveat). A kernel-stack buffer is safe to hand across that boundary
+//! because it lives in memory the kernel maps identically into every
+//! address space (like any other kernel-static data), unlike a ring-3
+//! task's own private pages.
 
-use crate::{calls, com, ipc, proc, serial_println};
+use crate::{calls, com, fs, ipc, proc, serial_println};
 
 pub const SYS_GET_UPTIME: u64 = 1;
 pub const SYS_WRITE_LINE: u64 = 2;
 pub const SYS_BLOCK_FOREVER: u64 = 3;
 pub const SYS_SET_ALARM: u64 = 4;
 pub const SYS_WAIT_ALARM: u64 = 5;
+pub const SYS_FS_OPEN: u64 = 6;
+pub const SYS_FS_WRITE: u64 = 7;
+pub const SYS_FS_READ: u64 = 8;
+
+/// Longest path/buffer `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` will
+/// copy through a local kernel-stack buffer in either direction.
+const MAX_FS_BUF: usize = 256;
 
 /// Longest string `SYS_WRITE_LINE` will read, purely as a sanity bound on
 /// `arg2` (an untrusted length from ring 3) -- not a real buffer, since
@@ -74,9 +96,9 @@ pub const ERROR: u64 = u64::MAX;
 
 /// The actual dispatch, called by `entry` (via `core::arch::naked_asm!`'s
 /// `sym` operand) with the caller's original `rax` (as `call_num`),
-/// `rdi` (`arg1`), and `rsi` (`arg2`) -- `entry`'s doc comment has the
-/// full register-to-argument mapping.
-extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64) -> u64 {
+/// `rdi` (`arg1`), `rsi` (`arg2`), and `rdx` (`arg3`) -- `entry`'s doc
+/// comment has the full register-to-argument mapping.
+extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
     let caller = proc::current_proc_nr();
     match call_num {
         SYS_GET_UPTIME => {
@@ -148,6 +170,57 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64) -> u64 {
             );
             ticks
         }
+        SYS_FS_OPEN => {
+            if arg2 as usize > MAX_FS_BUF {
+                return ERROR;
+            }
+            // Safety: same reasoning as SYS_WRITE_LINE -- CR3 is still
+            // the caller's own here.
+            let src = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
+            let mut path_buf = [0u8; MAX_FS_BUF];
+            path_buf[..src.len()].copy_from_slice(src);
+            match core::str::from_utf8(&path_buf[..src.len()]) {
+                Ok(path) => {
+                    let result = fs::open(path);
+                    serial_println!("[syscall] proc {}: SYS_FS_OPEN({:?}) -> {}", caller, path, result);
+                    result as u64
+                }
+                Err(_) => ERROR,
+            }
+        }
+        SYS_FS_WRITE => {
+            let fd = arg1 as i64;
+            let len = arg3 as usize;
+            if len > MAX_FS_BUF {
+                return ERROR;
+            }
+            // Copy the caller's buffer into a local, kernel-mapped-
+            // everywhere buffer *before* calling into crate::fs -- see
+            // the module doc comment for why this copy (unlike
+            // SYS_WRITE_LINE's lack of one) is load-bearing here.
+            let src = unsafe { core::slice::from_raw_parts(arg2 as *const u8, len) };
+            let mut buf = [0u8; MAX_FS_BUF];
+            buf[..len].copy_from_slice(src);
+            let result = fs::write(fd, &buf[..len]);
+            serial_println!("[syscall] proc {}: SYS_FS_WRITE(fd {}, {} bytes) -> {}", caller, fd, len, result);
+            result as u64
+        }
+        SYS_FS_READ => {
+            let fd = arg1 as i64;
+            let len = core::cmp::min(arg3 as usize, MAX_FS_BUF);
+            let mut buf = [0u8; MAX_FS_BUF];
+            let result = fs::read(fd, &mut buf[..len]);
+            // By the time fs::read returns, this task has been resumed
+            // (its own CR3 is active again -- see the module doc
+            // comment), so writing straight to the caller's own pointer
+            // here is safe again, the same as SYS_WRITE_LINE's read was.
+            if result > 0 {
+                let dst = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, result as usize) };
+                dst.copy_from_slice(&buf[..result as usize]);
+            }
+            serial_println!("[syscall] proc {}: SYS_FS_READ(fd {}) -> {}", caller, fd, result);
+            result as u64
+        }
         _ => {
             serial_println!("[syscall] proc {}: unknown call number {}", caller, call_num);
             ERROR
@@ -168,11 +241,11 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64) -> u64 {
 /// (every one except `rsp`, which `iretq` restores from the hardware
 /// frame), in a fixed order, then reads the caller's original `rax`
 /// (offset `+112` from the post-push `rsp`: 14 registers were pushed
-/// after it) as the call number and `rdi`/`rsi` (`+72`/`+80`) as the
-/// first two arguments, calls `dispatch`, writes its `u64` return value
-/// back into the saved `rax` slot, and pops everything -- so the only
-/// register the caller sees changed across the trap is `rax`, exactly
-/// like a real syscall's result.
+/// after it) as the call number and `rdi`/`rsi`/`rdx` (`+72`/`+80`/`+88`)
+/// as the first three arguments, calls `dispatch`, writes its `u64`
+/// return value back into the saved `rax` slot, and pops everything --
+/// so the only register the caller sees changed across the trap is
+/// `rax`, exactly like a real syscall's result.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn entry() -> ! {
     core::arch::naked_asm!(
@@ -194,6 +267,7 @@ pub(crate) unsafe extern "C" fn entry() -> ! {
         "mov rdi, [rsp + 112]", // call_num = caller's original rax
         "mov rsi, [rsp + 72]",  // arg1     = caller's original rdi
         "mov rdx, [rsp + 80]",  // arg2     = caller's original rsi
+        "mov rcx, [rsp + 88]",  // arg3     = caller's original rdx
         "call {dispatch}",
         "mov [rsp + 112], rax", // overwrite the saved rax slot with the result
         "pop r15",

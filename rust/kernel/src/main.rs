@@ -202,9 +202,41 @@ fn spawn_tasks(ring3_address_space: PhysFrame, elf_address_space: PhysFrame) {
 /// Real MINIX's idle task just halts, waking on the next interrupt; ported
 /// as-is. It's still preemptible (matching `IDL_F`), though with nothing
 /// else runnable that mostly just means its own ticks get charged to it.
+///
+/// `IDLE` only ever becomes current once *everything* else has blocked
+/// (it's the lowest-priority queue, `proc::IDLE_Q`) -- `memory`'s
+/// busy-loop alone keeps that from happening until around tick 30 (see
+/// `busy_task`), comfortably after `tty`'s own alarm-triggered
+/// `SYS_FS_OPEN`/`SYS_FS_WRITE` (`user/hello.s`) has had time to run --
+/// so this is a safe, "everything that's going to happen already has"
+/// checkpoint for `fs_from_ring3_verify` to run at, the same way
+/// `clock_task`'s own checks rely on `tty`'s *counter loop* (not its full
+/// sequence) having already finished by the time *it* runs.
 fn idle_task() -> ! {
+    fs_from_ring3_verify();
     serial_println!("[idle] no other task is ready, halting (uptime: {} ticks)", proc::uptime_ticks());
     halt_loop()
+}
+
+/// Proves `tty`'s `SYS_FS_OPEN`/`SYS_FS_WRITE` calls (`user/hello.s`, via
+/// `crate::syscall`) genuinely reached `fs` over IPC and landed in real
+/// storage: opens the same path *fresh* (a distinct file descriptor, its
+/// own cursor at `0`, reached the ordinary kernel-side way -- `crate::fs`'s
+/// client stubs, not a syscall) and reads back exactly the bytes `tty`
+/// wrote from ring 3. Not just "the syscall didn't crash" -- the actual
+/// content, read back through a completely independent path.
+fn fs_from_ring3_verify() {
+    let expected = b"written from ring 3 via a real syscall, IPC, and fs!";
+    let fd = fs::open("/from_ring3.txt");
+    assert!(fd >= 0, "fs::open(\"/from_ring3.txt\") failed: {}", fd);
+    let mut buf = [0u8; 64];
+    let n = fs::read(fd, &mut buf);
+    serial_println!(
+        "[idle] read back {:?} from /from_ring3.txt (written by tty from ring 3 via SYS_FS_OPEN/SYS_FS_WRITE)",
+        core::str::from_utf8(&buf[..n.max(0) as usize]).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(n, expected.len() as i64, "wrong length read back from /from_ring3.txt");
+    assert_eq!(&buf[..n as usize], expected, "fs content doesn't match what tty wrote via a real syscall");
 }
 
 /// Stand-in for `kernel/clock.c`'s clock task. Now much closer to the real

@@ -40,7 +40,11 @@ now a real reincarnation server: a ring-3 task that deliberately crashes
 (`flaky`, its one instruction being `ud2`) is isolated -- the CPU
 exception it raises kills just that one process, not the whole
 machine -- and `rs` restarts it, up to a bounded number of times, exactly
-MINIX's signature self-healing behavior — enough
+MINIX's signature self-healing behavior. The syscall ABI now also reaches
+`fs` for real: a ring-3 task opens and writes a real file over a genuine
+`int 0x80` -> syscall dispatch -> IPC -> `fs` round trip, verified by
+reading the same file back through a completely independent, kernel-side
+path afterward — enough
 to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
@@ -183,25 +187,25 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   asynchronously preempted by the timer while in ring 3 exactly like any
   other task.
 - `src/syscall.rs` — the real `int 0x80` gate: call-number/register
-  dispatch (call number in `rax`, up to two arguments in `rdi`/`rsi`,
-  return value in `rax`), replacing a fixed action performed regardless
-  of what the caller asked for. Ported in spirit from `kernel/system.c`'s
-  kernel-call dispatch table and the trap gate that reaches it
-  (`kernel/mpx386.s`'s `s_call`), though real MINIX dispatches kernel
-  calls through the same message-passing rendezvous as everything else
-  (a `SENDREC` to `SYSTEM`), not a raw register convention -- this port's
-  is closer to Linux's `int 0x80` than MINIX's own, since there's no
-  in-kernel message-passing entry point reachable from ring 3 yet, and
-  building that needs this register-level plumbing first regardless.
-  `entry` is a hand-written naked trap gate (installed via
-  `Entry::set_handler_addr`, not `set_handler_fn`, since the
+  dispatch (call number in `rax`, up to three arguments in
+  `rdi`/`rsi`/`rdx`, return value in `rax`), replacing a fixed action
+  performed regardless of what the caller asked for. Ported in spirit
+  from `kernel/system.c`'s kernel-call dispatch table and the trap gate
+  that reaches it (`kernel/mpx386.s`'s `s_call`), though real MINIX
+  dispatches kernel calls through the same message-passing rendezvous as
+  everything else (a `SENDREC` to `SYSTEM`), not a raw register
+  convention -- this port's is closer to Linux's `int 0x80` than MINIX's
+  own, since there's no in-kernel message-passing entry point reachable
+  from ring 3 yet, and building that needs this register-level plumbing
+  first regardless. `entry` is a hand-written naked trap gate (installed
+  via `Entry::set_handler_addr`, not `set_handler_fn`, since the
   `x86-interrupt` calling convention doesn't expose the caller's
   general-purpose registers, only the hardware-pushed
   `InterruptStackFrame`): it saves all 15 general-purpose registers the
   CPU didn't already save, calls `dispatch` with the caller's original
-  `rax`/`rdi`/`rsi`, writes the `u64` result back into the saved `rax`
-  slot, restores everything else unchanged, and `iretq`s. `dispatch`
-  implements five calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  `rax`/`rdi`/`rsi`/`rdx`, writes the `u64` result back into the saved
+  `rax` slot, restores everything else unchanged, and `iretq`s. `dispatch`
+  implements eight calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
@@ -215,9 +219,14 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   system (other tasks, the scheduler, the timer) continuing normally
   while it's blocked, and later resume ring-3 execution right where it
   left off, not just make one-shot calls that always return immediately),
-  and `SYS_BLOCK_FOREVER` (calls `ipc::receive(ANY)` directly from inside
-  the trap, never returning -- the same "nothing sends to this proc
-  again" pattern every other demo task in `main.rs` ends with).
+  `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` (a real IPC round trip to
+  `fs` -- not just another kernel-internal call -- copying a caller's
+  buffer into a local kernel-stack buffer first, since (unlike
+  `SYS_WRITE_LINE`) `fs` is a *different task* that may see a different
+  `CR3` by the time it actually dereferences anything; see `src/fs.rs`
+  above), and `SYS_BLOCK_FOREVER` (calls `ipc::receive(ANY)` directly from
+  inside the trap, never returning -- the same "nothing sends to this
+  proc again" pattern every other demo task in `main.rs` ends with).
 - `src/proc.rs`'s `reschedule`/`start` call `gdt::set_rsp0` *and* switch
   `CR3` on every switch, pointing both at whichever task just became
   current: `RSP0` at that task's own dedicated kernel stack (the same one
@@ -271,7 +280,14 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `servers/fs/path.c`'s `lookup()` does -- `ENOENT` if the parent doesn't
   exist, `ENOTDIR` if it exists but is a file, `EISDIR` if the path
   itself is a directory being opened as a file, `EEXIST` if `mkdir`
-  targets a path that already exists.
+  targets a path that already exists. Every client stub now sets the
+  request's `source` to `proc::current_proc_nr()` -- the real caller --
+  rather than a hardcoded `PM_PROC_NR`: `fs` addresses its reply using
+  that field, so a wrong one would silently misdeliver the reply to
+  whoever the field named instead of the actual, blocked-waiting caller.
+  This is what makes it safe for `crate::syscall`'s `SYS_FS_OPEN`/
+  `SYS_FS_WRITE`/`SYS_FS_READ` to call these stubs on behalf of whichever
+  ring-3 task is trapped in, not just kernel tasks like `pm`.
 - `src/elf.rs` — a minimal ELF64 loader. No direct MINIX C equivalent:
   2005-era MINIX 3.1 loads a program via `execve`'s a.out-format path
   (`servers/pm/exec.c`), not ELF; this is a step up from
@@ -388,9 +404,12 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   built) -- a real ELF64 binary (`user/hello.elf`) executing its own
   counter-increment/`SYS_GET_UPTIME` loop in ring 3 five times, then a real
   `SYS_SET_ALARM`/`SYS_WAIT_ALARM` (genuinely blocking and later resuming
-  in ring 3), a `SYS_WRITE_LINE`, and finally `SYS_BLOCK_FOREVER` -- see
-  `src/syscall.rs` below for what each of those actually does. `CLOCK` now
-  genuinely
+  in ring 3), a `SYS_WRITE_LINE`, a real `SYS_FS_OPEN`/`SYS_FS_WRITE`
+  round trip to `fs` (opening `/from_ring3.txt` and writing a message to
+  it, all the way from ring 3), and finally `SYS_BLOCK_FOREVER` -- see
+  `src/syscall.rs` below for what each of those actually does. `IDLE`
+  (below) reads that same file back afterward to confirm the content
+  genuinely landed in `fs`. `CLOCK` now genuinely
   calls `sys_setalarm` and blocks in `receive` -- exactly real MINIX's
   `while (TRUE) receive(HARDWARE, &m)` -- instead of polling
   `uptime_ticks()`, and also exercises `sys_vircopy` twice: reading the
@@ -482,27 +501,30 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Only five calls exist**, and only `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
-  are `crate::calls`' real kernel calls (`sys_vircopy`/`sys_fork` still
-  aren't reachable from ring 3 at all). This is deliberately the minimal
-  set needed to prove the dispatch mechanism itself (a call that returns
-  data, one that takes a pointer argument, one that genuinely blocks and
-  resumes, one that ends the caller for good), not a real syscall
-  surface.
-- **Two arguments, not a full calling convention.** Only `rdi`/`rsi` are
-  read as arguments; a real syscall ABI (or MINIX's own message-based
-  one) would want more, plus a real error-reporting convention (`dispatch`
-  returns a single `ERROR: u64 = u64::MAX` sentinel for every failure,
-  rather than distinct negative `errno`-style codes the way `crate::calls`
-  already does for its own kernel calls).
-- **No validation beyond a length bound.** `SYS_WRITE_LINE` checks `arg2`
-  against `MAX_LINE_LEN` before reading, but never checks that `arg1`
-  actually points at memory the caller is allowed to read (a real kernel
-  validates a user pointer against the process's known memory map, or
-  handles the page fault gracefully if it doesn't; a bad pointer here
-  page-faults the kernel itself, in the caller's still-active address
-  space, which isn't handled any more gracefully than any other
-  in-kernel fault -- see `crate::interrupts`).
+- **Eight calls exist**, and only `SYS_SET_ALARM`/`SYS_WAIT_ALARM`/
+  `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` reach real server logic
+  (`sys_vircopy`/`sys_fork` still aren't reachable from ring 3 at all).
+  Real enough to write a genuine ring-3 program against (a demo user
+  program can now get the time, print, sleep, and do real file I/O), but
+  still a hand-picked set proving the dispatch mechanism works, not a
+  real syscall surface.
+- **Three arguments, not a full calling convention.** Only `rdi`/`rsi`/
+  `rdx` are read as arguments; a real syscall ABI (or MINIX's own
+  message-based one) would want more, plus a real error-reporting
+  convention (`dispatch` returns a single `ERROR: u64 = u64::MAX`
+  sentinel for every failure, rather than distinct negative `errno`-style
+  codes the way `crate::calls`/`crate::fs` already do for their own
+  calls -- `SYS_FS_*` do at least forward `fs`'s own real error codes
+  through unchanged, just without a *second*, syscall-level failure mode
+  of their own beyond `MAX_FS_BUF` truncation).
+- **No validation beyond a length bound.** `SYS_WRITE_LINE`/`SYS_FS_*`
+  check a length against `MAX_LINE_LEN`/`MAX_FS_BUF` before reading, but
+  never check that a pointer actually points at memory the caller is
+  allowed to read (a real kernel validates a user pointer against the
+  process's known memory map, or handles the page fault gracefully if it
+  doesn't; a bad pointer here page-faults the kernel itself, in the
+  caller's still-active address space, which isn't handled any more
+  gracefully than any other in-kernel fault -- see `crate::interrupts`).
 - **`entry`'s register save list is fixed and total** (all 15
   general-purpose registers, every call), rather than saving only what a
   real syscall convention requires (e.g. SysV's syscall-clobbered set) or
@@ -775,9 +797,14 @@ Roughly in the order the original kernel needs them:
     full POSIX fork/exec semantics (the child resuming from the parent's
     exact call site, and using the ELF loader above to load a program
     image instead of starting at a fixed entry point), and `fs` growing
-    `readdir`, cross-address-space copies, and a real backing store (see
-    "known simplifications in `fs`" above) rather than a flat, in-memory,
-    single-address-space file/directory table.
+    `readdir` and a real backing store (see "known simplifications in
+    `fs`" above) rather than a flat, in-memory, single-address-space
+    file/directory table. Ring-3 callers can now reach `fs` for real
+    (`crate::syscall`'s `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ`), but
+    only because the *syscall layer* copies buffers through a
+    kernel-stack buffer around the IPC call -- `fs` itself still has no
+    `sys_vircopy`-style cross-address-space copy of its own for a caller
+    that reaches it some other way.
 12. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 13. ~~**Real graphics output**~~ — started (`src/vga.rs`): VGA mode 13h
     (320x200, 256-color), a real palette (VGA DAC ports) and a real
@@ -807,26 +834,33 @@ Roughly in the order the original kernel needs them:
     `usermode`'s old fixed-action, count-and-cut-off `int 0x80` handler
     with genuine call-number/register dispatch: a hand-written naked trap
     gate saves every general-purpose register, reads the caller's `rax`
-    (call number) and `rdi`/`rsi` (arguments), dispatches to one of five
-    calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE` -- a real cross-ring pointer
-    argument, read directly since entering a trap gate never switches
-    `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` -- the first of `crate::calls`'
-    own kernel calls reachable from ring 3, and the first syscall here
-    that genuinely blocks the caller and resumes it later rather than
-    always returning immediately; and `SYS_BLOCK_FOREVER`), and writes
-    the result back into `rax` before `iretq`. Both ring-3 tasks
-    (`usermode`'s hand-assembled demo and `crate::elf`'s loaded ELF
-    binary) now exercise real syscalls, each ending on its own terms
+    (call number) and `rdi`/`rsi`/`rdx` (up to three arguments),
+    dispatches to one of eight calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    -- a real cross-ring pointer argument, read directly since entering a
+    trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
+    the first of `crate::calls`' own kernel calls reachable from ring 3,
+    and the first syscall here that genuinely blocks the caller and
+    resumes it later rather than always returning immediately;
+    `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` -- a real IPC round trip to
+    `fs`, copying pointer arguments through a kernel-stack buffer first
+    since `fs` runs with a potentially different `CR3` by the time it
+    dereferences anything; and `SYS_BLOCK_FOREVER`), and writes the
+    result back into `rax` before `iretq`. Both ring-3 tasks (`usermode`'s
+    hand-assembled demo and `crate::elf`'s loaded ELF binary) now
+    exercise real syscalls, each ending on its own terms
     (`SYS_BLOCK_FOREVER`) instead of being cut off by a kernel-side
     iteration counter; `tty` (the ELF-loaded one) additionally sets a
     real 3-tick alarm and blocks waiting for it, verified in QEMU to
     resume in ring 3 exactly where it left off once the alarm fires,
     with the rest of the system (`CLOCK`'s own alarm, the dynamically
     spawned `log` task, `rs`/`memory`'s preemption) continuing normally
-    the whole time it's blocked. See "known simplifications in the
-    syscall ABI" above for what's not a real syscall surface yet (only
-    five calls, `sys_vircopy`/`sys_fork` still not reachable, a single
-    `u64::MAX` error sentinel instead of real error codes).
+    the whole time it's blocked, and then opens and writes a real file
+    over `SYS_FS_OPEN`/`SYS_FS_WRITE`, verified by `IDLE` reading it back
+    afterward through a completely independent path. See "known
+    simplifications in the syscall ABI" above for what's not a real
+    syscall surface yet (eight calls, `sys_vircopy`/`sys_fork` still not
+    reachable, a single `u64::MAX` error sentinel for syscall-level
+    failures instead of real error codes).
 
 ## Building
 
@@ -947,6 +981,10 @@ proof the scheduler was already running other tasks when it showed up),
 `memory`'s demo task spinning through many quanta purely because the
 timer forces it to keep yielding and resuming (asynchronous preemption --
 watch its counter resume from exactly where it left off every time), and
-finally
-`IDLE` reporting that it's halting (with the accumulated tick count) once
-everything else has blocked.
+finally, once everything else has blocked, `IDLE` reading back
+`/from_ring3.txt` (`[idle] read back "written from ring 3 via a real
+syscall, IPC, and fs!" from /from_ring3.txt ...`) to confirm `tty`'s
+`SYS_FS_OPEN`/`SYS_FS_WRITE` calls genuinely reached `fs` -- through a
+completely independent, kernel-side path, not just "the syscall didn't
+crash" -- before reporting that it's halting (with the accumulated tick
+count).
