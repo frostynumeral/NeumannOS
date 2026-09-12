@@ -3,15 +3,17 @@
 //! This is the Rust port's `kernel/main.c` equivalent: it boots, sets up
 //! the GDT/IDT so CPU faults are reported instead of triple-faulting
 //! (`crate::gdt`, `crate::interrupts`), sets up paging and a heap
-//! allocator (`crate::memory`, `crate::allocator`), programs the PIC/PIT
-//! and enables interrupts so the timer starts driving real,
+//! allocator (`crate::memory`, `crate::allocator`), proves a one-shot ring
+//! 3 round trip works (`crate::usermode`), programs the PIC/PIT and
+//! enables interrupts so the timer starts driving real,
 //! asynchronously-preemptive scheduling (`crate::pic`, `crate::pit`,
 //! `crate::proc`), prints the boot image (the process table MINIX would
 //! load into memory at this point), spawns the kernel tasks
 //! (`crate::proc`), and hands off to the scheduler -- just as
-//! `kernel/main.c` ends by calling `restart()`. There is no user-mode and
-//! no per-process address-space isolation yet — see `rust/README.md` for
-//! what's implemented versus planned.
+//! `kernel/main.c` ends by calling `restart()`. There is no per-process
+//! address-space isolation, and the ring-3 demo isn't yet a real,
+//! schedulable user-mode process — see `rust/README.md` for what's
+//! implemented versus planned.
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
@@ -29,6 +31,7 @@ mod pit;
 mod proc;
 mod serial;
 mod table;
+mod usermode;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -78,6 +81,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     drop(boxed);
     drop(vec);
 
+    // Self-test: a one-shot round trip to ring 3 and back (see
+    // usermode.rs for why this isn't yet a real, schedulable user
+    // process). Runs before the timer/scheduler exist, precisely so there
+    // is no risk of it being asynchronously preempted mid-excursion.
+    usermode::demo(&mut mapper, &mut frame_allocator);
+    serial_println!("returned from ring 3 to kernel_main");
     serial_println!();
 
     serial_println!("boot image:");
