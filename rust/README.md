@@ -23,7 +23,9 @@ toward the BeOS/Haiku-flavored desktop-OS direction noted below — real
 VGA graphics (a static, LCARS-style panel of flat-colored rounded-rectangle
 bars and buttons, no text, painted into a real linear framebuffer) and a
 real PS/2 keyboard driver (hardware IRQ1, scancodes read and translated to
-ASCII, asynchronously -- even waking the CPU from `IDLE`'s `hlt`) — enough
+ASCII, asynchronously -- even waking the CPU from `IDLE`'s `hlt`), now
+connected to the panel: pressing a digit key highlights the matching
+button on screen, a real (if minimal) input-to-output loop — enough
 to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
@@ -225,7 +227,14 @@ external contract.
   `draw_demo_panel` is one of these, not a plain rectangle. `kernel_main`
   calls `init_palette`/`draw_demo_panel` as early as possible (before
   paging/heap/scheduler setup), so the panel stays on screen even if
-  something later in boot panics.
+  something later in boot panics. `select_button` is the panel's one
+  piece of live state: it records which of the four buttons (if any) is
+  "selected" (a `spin::Mutex<Option<usize>>`) and immediately redraws the
+  whole panel, painting a white `HIGHLIGHT`-colored frame behind that
+  button -- reaching the framebuffer itself via
+  `crate::memory::physical_memory_offset` (now `pub(crate)`) rather than
+  requiring a caller (in practice, the keyboard interrupt handler below)
+  to have a pointer to it on hand.
 - `src/keyboard.rs` + `src/interrupts.rs`'s `keyboard_interrupt_handler` —
   a real PS/2 keyboard driver. No MINIX C kernel equivalent: 2005-era
   MINIX handles the keyboard in a driver process
@@ -239,7 +248,12 @@ external contract.
   keys only, release ("break") codes -- bit 7 set -- ignored), and prints
   it -- entirely asynchronous and hardware-driven, the same way
   `timer_interrupt_handler` is for IRQ0, including waking the CPU from
-  `IDLE`'s `hlt` the instant a key is pressed.
+  `IDLE`'s `hlt` the instant a key is pressed. Digit keys `1`-`4` go
+  further: `keyboard_interrupt_handler` maps them to `vga::select_button`,
+  so pressing one visibly highlights the matching panel button -- the
+  first real input-to-output loop in this port (`crate::keyboard` driving
+  a `crate::vga` redraw), not just proof the input side works in
+  isolation.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
   and the heap, builds the ring-3 demo task's and the ELF-loaded task's
@@ -466,9 +480,11 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 - **A single, fixed, hardcoded layout.** `draw_demo_panel` always draws
   the same bars/buttons at the same coordinates; there's no generic
   "layout a panel of N elements" API or windowing yet -- this is a
-  static image, not a UI. `crate::keyboard` (below) reads real input at
-  the hardware level, but nothing connects it to the panel yet (no
-  buttons to click, no focus, no redraw-on-input).
+  static image with one piece of live state (`select_button`'s highlight),
+  not a UI. Selection is keyboard-driven only (digit keys `1`-`4`, see
+  `crate::keyboard` below) -- there's no mouse, no hit-testing against
+  button bounds, and no notion of "clicking" a button (as opposed to
+  just selecting/highlighting it).
 - **No double buffering.** `draw_demo_panel` writes directly to the
   live, currently-displayed framebuffer; fine for one paint that never
   changes again, but a real UI redrawing every frame would need to draw
@@ -492,11 +508,13 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   extended keys (arrows, the right-hand Ctrl/Alt, ...), or PS/2
   controller configuration beyond what the BIOS/QEMU already leaves in
   place at boot.
-- **Nothing consumes the translated character except `serial_println!`.**
-  There's no keyboard buffer, no line discipline, and no `tty`
-  server/IPC message to deliver it to (see `rust/README.md`'s roadmap) --
-  this is proof the hardware event and translation work, not a usable
-  input path yet.
+- **Only digit keys `1`-`4` do anything beyond a serial print** (they
+  pick a `vga::select_button` index); every other translated character
+  is still just logged. There's no keyboard buffer, no line discipline,
+  and no `tty` server/IPC message to deliver a keypress to (see
+  `rust/README.md`'s roadmap) -- `select_button` is a direct function
+  call from the interrupt handler, not a real input event delivered to a
+  process the way a real driver would.
 
 ## What's not implemented yet (roadmap)
 
@@ -592,10 +610,15 @@ Roughly in the order the original kernel needs them:
     ASCII (unshifted alphanumeric/punctuation only), proven asynchronous
     and hardware-driven -- it wakes the CPU from `IDLE`'s `hlt` the
     instant a key is pressed, the same way the timer already does every
-    tick. See "known simplifications in the keyboard driver" above for
-    what's missing (modifier-key state, extended scancodes, and -- the
-    big one -- anything that actually *consumes* a keypress yet, since
-    there's no `tty` server or line discipline for it to reach).
+    tick. Digit keys `1`-`4` are wired all the way through to
+    `vga::select_button`, so a keypress visibly changes the framebuffer
+    (a real, if minimal, input-to-output loop) -- verified headlessly via
+    QMP `send-key` followed by a `screendump` showing the matching
+    button's highlight frame move. See "known simplifications in the
+    keyboard driver" above for what's missing (modifier-key state,
+    extended scancodes, and -- the big one -- anything that reaches a
+    real process instead of calling straight into `crate::vga`, since
+    there's no `tty` server or line discipline yet).
 
 ## Building
 
@@ -655,7 +678,16 @@ with the same `-qmp` socket from above, send
 after the capabilities handshake, and COM1 should print
 `[kbd] key: 'a' (scancode 0x1e)` -- this works even after `IDLE` has
 logged that it's halting, since the keyboard IRQ wakes the CPU straight
-out of `hlt`. Expected output on COM1: a line confirming the LCARS demo panel
+out of `hlt`. To see a digit key's effect on the panel, send a `qcode`
+of `"1"`-`"4"` instead and take a `screendump` afterward -- **wait a beat
+(e.g. `time.sleep(0.5)`) between the two QMP commands first**: `send-key`
+returns as soon as the key event is queued, not once the guest has
+actually taken the interrupt and redrawn, and a `screendump` fired
+immediately back-to-back can (and, observed once during development,
+did) capture the frame from just before the highlight was painted. The
+resulting image should show a white rounded-rect frame behind the
+button matching the digit pressed (button `N` for digit `N`), and
+nowhere else. Expected output on COM1: a line confirming the LCARS demo panel
 was painted (`vga: painted the LCARS demo panel ...`, printed as early as
 possible -- before paging/heap/scheduler setup -- so the panel is on
 screen even if something later panics), a heap self-test (`Box`/`Vec` both actually work), an isolation

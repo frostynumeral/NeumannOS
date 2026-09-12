@@ -195,6 +195,15 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame
     let scancode = crate::keyboard::read_scancode();
     if let Some(ascii) = crate::keyboard::translate(scancode) {
         crate::serial_println!("[kbd] key: {:?} (scancode {:#04x})", ascii as char, scancode);
+        // Digits '1'-'4' pick one of the VGA demo panel's buttons and
+        // redraw it highlighted -- the first real input-to-output loop
+        // in this port (crate::keyboard -> crate::vga), not just proof
+        // the hardware event fires.
+        if ascii.is_ascii_digit() {
+            if let Some(index) = (ascii - b'0').checked_sub(1) {
+                crate::vga::select_button(index as usize);
+            }
+        }
     }
     pic::end_of_interrupt(1);
 }
