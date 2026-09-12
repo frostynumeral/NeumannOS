@@ -25,6 +25,7 @@ extern crate alloc;
 mod allocator;
 mod calls;
 mod com;
+mod elf;
 mod fs;
 mod gdt;
 mod interrupts;
@@ -90,6 +91,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // code/stack pages into it now; the task itself (spawned below) does
     // the actual jump to ring 3 once the scheduler runs it.
     let ring3_address_space = usermode::create_address_space(phys_mem_offset);
+    // Same idea, but loading a real ELF binary's segments (crate::elf)
+    // instead of hand-placing a fixed byte array.
+    let elf_address_space = elf::load(elf::HELLO_ELF, phys_mem_offset);
     // Self-test: this is the actual proof of isolation, not just that
     // things still work. The demo pages were never mapped into *this*
     // (the kernel's own) page table -- only into `ring3_address_space` --
@@ -113,7 +117,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // programmed, and its handler calls `reschedule()` unconditionally
     // (see `proc.rs`'s module doc comment) -- with no task enqueued yet,
     // there would be nothing for it to pick.
-    spawn_tasks(ring3_address_space);
+    spawn_tasks(ring3_address_space, elf_address_space);
     serial_println!("tasks spawned");
 
     pic::init();
@@ -126,17 +130,22 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 }
 
 /// Spawn the kernel tasks. `IDLE` and `CLOCK` are real kernel tasks, same
-/// as in the boot image; `pm`/`fs`/`rs`/`memory`/`driver` don't exist as
-/// real servers yet (see `rust/README.md`), so their process table slots
-/// run small stand-in bodies instead: `pm`/`fs` exercise blocking
-/// `send`/`receive`, `rs`/`memory` (as `busy_task_a`/`busy_task_b`)
-/// exercise asynchronous preemption, and `driver` (as
-/// `usermode::ring3_task_entry`) runs in its own address space
-/// (`ring3_address_space`, built in `kernel_main`) -- the only task here
-/// that isn't sharing the kernel's. Priorities, quantum sizes, and
-/// preemptibility match `kernel/table.c`'s image entries
-/// (`IDL_F`/`TSK_F`/`SRV_F` flags).
-fn spawn_tasks(ring3_address_space: PhysFrame) {
+/// as in the boot image; `pm`/`rs`/`memory`/`driver` don't exist as real
+/// servers yet (see `rust/README.md`), so their process table slots run
+/// small stand-in bodies instead: `pm` exercises blocking `send`/
+/// `receive` (and now real IPC-served file I/O via `fs`), `rs`/`memory`
+/// (as `busy_task_a`/`busy_task_b`) exercise asynchronous preemption, and
+/// `driver` (as `usermode::ring3_task_entry`) runs in its own address
+/// space (`ring3_address_space`, built in `kernel_main`) -- one of two
+/// tasks here that isn't sharing the kernel's. `fs` is now a real,
+/// in-memory file server (`fs::InMemoryFs::serve`). `tty` (as
+/// `elf::task_entry`) is the other task with its own address space
+/// (`elf_address_space`): a real ELF binary (`elf::HELLO_ELF`), loaded
+/// and run in ring 3 rather than a hand-assembled demo. Priorities,
+/// quantum sizes, and preemptibility match `kernel/table.c`'s image
+/// entries (`IDL_F`/`TSK_F`/`SRV_F` flags) where a real counterpart
+/// exists.
+fn spawn_tasks(ring3_address_space: PhysFrame, elf_address_space: PhysFrame) {
     proc::spawn(com::IDLE, "IDLE", idle_task, proc::IDLE_Q, 8, true, None);
     proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false, None);
     proc::spawn(com::PM_PROC_NR, "pm (demo)", demo_pm_task, 3, 32, true, None);
@@ -151,6 +160,15 @@ fn spawn_tasks(ring3_address_space: PhysFrame) {
         16,
         true,
         Some(ring3_address_space),
+    );
+    proc::spawn(
+        com::TTY_PROC_NR,
+        "tty (elf demo)",
+        elf::task_entry,
+        6,
+        16,
+        true,
+        Some(elf_address_space),
     );
 }
 
@@ -191,6 +209,7 @@ fn clock_task() -> ! {
     );
 
     vircopy_demo();
+    elf_counter_demo();
 
     serial_println!("[clock] dynamically spawning a new task (log) at runtime");
     proc::spawn(com::LOG_PROC_NR, "log (dynamic)", dynamic_log_task, 5, 24, true, None);
@@ -237,6 +256,42 @@ fn vircopy_demo() {
         usermode::USER_CODE
     );
     assert_eq!(buf, usermode::USER_CODE, "sys_vircopy returned the wrong bytes");
+}
+
+/// Proves `elf::HELLO_ELF`'s loaded code genuinely ran -- not just that
+/// it trapped into the kernel the right number of times, but that its
+/// own `incl counter(%rip)` instruction, executing out of pages this
+/// port's own ELF loader mapped (not the kernel poking bytes in
+/// directly, like `usermode`'s demo), actually wrote through to physical
+/// memory. Reads `tty`'s copy of its own `.data` counter back into a
+/// local buffer via `sys_vircopy` and checks it against the five
+/// iterations `interrupts::syscall_handler` counted for it.
+///
+/// Relies on `tty` (proc 5) having already run its five iterations and
+/// blocked by the time this runs -- true in practice, since `tty` and
+/// `driver` share the same priority queue and `tty` is enqueued right
+/// after `driver` blocks, well before `CLOCK`'s alarm (3 ticks) fires --
+/// same kind of scheduling-order dependency `vircopy_demo` above already
+/// has on `driver`.
+fn elf_counter_demo() {
+    let mut buf = [0u8; 4];
+    calls::sys_vircopy(
+        com::TTY_PROC_NR,
+        x86_64::VirtAddr::new(elf::COUNTER_ADDR),
+        com::CLOCK,
+        x86_64::VirtAddr::new(buf.as_mut_ptr() as u64),
+        buf.len(),
+    )
+    .expect("sys_vircopy failed reading the ELF task's counter");
+    let counter = i32::from_le_bytes(buf);
+    serial_println!(
+        "[clock] sys_vircopy read back the ELF-loaded task's own .data counter: {} (expected 5)",
+        counter
+    );
+    assert_eq!(
+        counter, 5,
+        "the loaded ELF binary's own code should have incremented its counter 5 times"
+    );
 }
 
 /// Temporary stand-in for the `pm` server (see `spawn_tasks`): proves

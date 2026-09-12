@@ -119,14 +119,20 @@ extern "x86-interrupt" fn double_fault_handler(
     );
 }
 
-/// How many times the ring-3 demo task's `int 0x80` loop gets to actually
-/// resume ring 3 before this handler ends the demo instead. A real
-/// dispatch (once there's more than one caller, or real call numbers to
-/// distinguish) would replace this whole counter-based scheme; for now it
-/// exists purely to keep `usermode::USER_CODE`'s hand-assembly to a
-/// trivial two-instruction loop instead of encoding a counter in machine
-/// code by hand.
-static SYSCALL_COUNT: AtomicU32 = AtomicU32::new(0);
+/// How many times each ring-3 task's `int 0x80` loop gets to actually
+/// resume ring 3 before this handler ends its demo instead. A real
+/// dispatch (real call numbers to distinguish, instead of "whoever traps
+/// gets counted and eventually cut off") would replace this whole
+/// counter-based scheme; for now it exists purely to keep a demo user
+/// program's code trivial (a bare loop, no counter encoded in it) while
+/// still letting the demo end on its own. Indexed per-process
+/// (`com::slot(current_proc_nr())`) rather than one shared count, so two
+/// independent ring-3 tasks (`crate::usermode`'s hand-assembled demo and
+/// `crate::elf`'s loaded ELF binary) each get their own run of iterations
+/// instead of racing to the same threshold.
+const MAX_SYSCALL_SLOTS: usize = 16;
+static SYSCALL_COUNTS: [AtomicU32; MAX_SYSCALL_SLOTS] =
+    [const { AtomicU32::new(0) }; MAX_SYSCALL_SLOTS];
 
 extern "x86-interrupt" fn syscall_handler(frame: InterruptStackFrame) {
     // Printing `frame.code_segment` here is the actual proof this all
@@ -134,13 +140,15 @@ extern "x86-interrupt" fn syscall_handler(frame: InterruptStackFrame) {
     // machinery, so an RPL of 3 in it is the CPU itself confirming the
     // interrupted code was genuinely running in ring 3 -- not something
     // `crate::usermode` merely asserts.
-    let count = SYSCALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let proc_nr = crate::proc::current_proc_nr();
+    let slot = crate::com::slot(proc_nr);
+    let count = SYSCALL_COUNTS[slot].fetch_add(1, Ordering::Relaxed) + 1;
     crate::serial_println!(
         "[syscall] iteration {} from {:?} (CS index {}, proc {})",
         count,
         frame.code_segment.rpl(),
         frame.code_segment.index(),
-        crate::proc::current_proc_nr(),
+        proc_nr,
     );
     if count >= 5 {
         crate::serial_println!("[syscall] ring-3 demo finished, blocking for good");
