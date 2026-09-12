@@ -18,8 +18,8 @@
 //! spaces the way this does), not a ported feature.
 
 use crate::gdt;
-use crate::interrupts::SYSCALL_VECTOR;
 use crate::memory::{self, GlobalFrameAllocator};
+use crate::syscall;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame};
 use x86_64::VirtAddr;
 
@@ -33,16 +33,24 @@ pub const USER_CODE_ADDR: u64 = 0x_5555_5555_0000;
 pub const USER_STACK_ADDR: u64 = 0x_6666_6666_0000;
 const PAGE_SIZE: u64 = 4096;
 
-/// `int 0x80` (`SYSCALL_VECTOR`) followed by a two-byte jump back to the
-/// start -- loop forever, trapping into the kernel each time round. Hand-
-/// assembled because there's no user-mode-capable toolchain to compile
-/// this from source yet (see `rust/README.md`'s libc-equivalent roadmap
-/// item) -- this stands in for an entire user-mode program.
-/// `crate::interrupts::syscall_handler` decides when the loop actually
-/// stops (by not resuming ring 3 past a fixed number of iterations),
-/// keeping this hand-assembly trivial rather than needing a real loop
-/// counter encoded by hand.
-pub const USER_CODE: [u8; 4] = [0xCD, SYSCALL_VECTOR, 0xEB, 0xFC];
+/// Three real syscalls -- `SYS_GET_UPTIME` (`crate::syscall`) three times,
+/// then `SYS_BLOCK_FOREVER` once -- hand-assembled a straight-line
+/// instruction at a time (`mov eax, imm32` is `B8` + the four
+/// little-endian immediate bytes; `int 0x80` is `CD 80`) since there's no
+/// user-mode-capable toolchain to compile this from source yet (see
+/// `rust/README.md`'s libc-equivalent roadmap item; contrast
+/// `crate::elf`'s demo, which *is* built with a real assembler, since its
+/// job is proving a real ELF loader rather than staying hand-encodable).
+/// No trailing jump needed: `SYS_BLOCK_FOREVER`'s handler
+/// (`crate::syscall::dispatch`) blocks this task for good from inside the
+/// trap itself, so control never returns here a fourth time.
+#[rustfmt::skip]
+pub const USER_CODE: [u8; 28] = [
+    0xB8, syscall::SYS_GET_UPTIME as u8, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, SYS_GET_UPTIME; int 0x80
+    0xB8, syscall::SYS_GET_UPTIME as u8, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, SYS_GET_UPTIME; int 0x80
+    0xB8, syscall::SYS_GET_UPTIME as u8, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, SYS_GET_UPTIME; int 0x80
+    0xB8, syscall::SYS_BLOCK_FOREVER as u8, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, SYS_BLOCK_FOREVER; int 0x80
+];
 
 /// Build a new address space (`crate::memory::new_address_space`) for the
 /// demo task and map its code and stack pages into *that* table (with
