@@ -8,8 +8,11 @@ multi-month undertaking on their own. What's here boots in QEMU, sets up
 exception handling and a heap, schedules kernel tasks with real,
 asynchronously preemptive hardware-timer-driven quantum accounting
 (including a task that runs in ring 3, in its own genuinely isolated
-address space), and exercises blocking message-passing IPC between them —
-enough to build the rest of the system on top of.
+address space), exercises blocking message-passing IPC between them, and
+has its first two real kernel calls (a genuine cross-address-space
+`sys_vircopy`, and `sys_setalarm` waking a blocked task with a real
+notification instead of it polling) — enough to build the rest of the
+system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -85,9 +88,13 @@ external contract.
   lower-level tables, and only becoming genuinely private wherever
   something is mapped into a PML4 slot the original table didn't already
   use. `crate::usermode` is the first thing to use this, to give the
-  ring-3 demo task real isolation instead of just a CPU privilege level --
-  this is where `sys_umap`/`sys_vircopy`'s actual job (translating between
-  address spaces) starts to apply, though neither is ported yet.
+  ring-3 demo task real isolation instead of just a CPU privilege level.
+  `page_table_for` and `copy_between_address_spaces` build on it: given
+  any process's PML4 frame, translate a virtual address through *that*
+  table (via the physical-memory window, without switching `CR3` to it)
+  and copy page-at-a-time between two such address spaces -- this is
+  where `sys_umap`/`sys_vircopy`'s actual job (translating between address
+  spaces) applies; see `src/calls.rs` below for the kernel-call wrapper.
 - `src/gdt.rs` also now sets up user-mode (ring 3) code/data segments and
   a TSS `RSP0` (the stack the CPU switches to automatically on *any*
   ring-3-to-ring-0 transition) -- `set_rsp0`, called from `crate::proc` on
@@ -120,6 +127,21 @@ external contract.
   other's saved state the moment either faulted or was preempted);
   per-task `CR3` is what makes that isolation *real* rather than just a
   CPU privilege level.
+- `src/calls.rs` — the first two kernel calls, ported from
+  `kernel/system/do_copy.c` (`sys_vircopy`) and `do_setalarm.c`
+  (`sys_setalarm`). Real MINIX dispatches these by call number out of a
+  message a process sends to `SYSTEM`; this port has no such dispatch yet
+  (see "known simplifications" below), so for now they're just ordinary
+  Rust functions any kernel task can call directly -- the same way
+  `crate::ipc`'s `send`/`receive`/`notify` started out, before anything
+  needed them from ring 3. `sys_vircopy` is a thin wrapper resolving two
+  process numbers to address spaces (`proc::cr3_of`) and delegating to
+  `memory::copy_between_address_spaces`; `sys_setalarm` delegates to
+  `proc::set_alarm`, and `proc::clock_tick` is what actually notices an
+  alarm's deadline and delivers the `SYN_ALARM` notification for it (using
+  a `Scheduler::try_deliver_notification` helper shared with
+  `mini_notify`, since `clock_tick` is already inside the scheduler lock
+  and can't re-enter it).
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
   and the heap, builds the ring-3 demo task's address space and maps its
@@ -133,11 +155,17 @@ external contract.
   interrupt truly preempts a task asynchronously, mid-loop, rather than
   only ever switching at cooperative checkpoints), and `driver` runs the
   ring-3 demo task described above -- the only one of these with its own
-  address space rather than sharing the kernel's. Also runs an isolation
-  self-test right after building that address space: translating the
-  ring-3 code page's address through the *kernel's own* page table
-  returns `None`, proving the mapping really is private and not merely
-  inaccessible-by-privilege-level.
+  address space rather than sharing the kernel's. `CLOCK` now genuinely
+  calls `sys_setalarm` and blocks in `receive` -- exactly real MINIX's
+  `while (TRUE) receive(HARDWARE, &m)` -- instead of polling
+  `uptime_ticks()`, and also exercises `sys_vircopy` by reading the
+  ring-3 task's code page back out of *its* address space into a local
+  buffer, proving the copy really goes through a different process's page
+  table (`CLOCK` itself never leaves the kernel's own address space).
+  Also runs an isolation self-test right after building that address
+  space: translating the ring-3 code page's address through the
+  *kernel's own* page table returns `None`, proving the mapping really is
+  private and not merely inaccessible-by-privilege-level.
 
 ### A real bug found and fixed by a multi-agent review
 
@@ -214,6 +242,29 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   would for any other address the task hasn't been given a `USER_ACCESSIBLE`
   mapping for.
 
+### Known simplifications in the kernel calls
+
+- **No real dispatch.** `sys_vircopy`/`sys_setalarm` are ordinary Rust
+  functions any kernel task calls directly, not entries reached via a
+  message to `SYSTEM` and a call-number dispatch table
+  (`kernel/system.c`'s `map(SYS_xxx, do_xxx)`). That dispatch has nowhere
+  to live yet: there's no real syscall argument-passing convention (the
+  one `int 0x80` gate that exists is `usermode`'s fixed demo action, not a
+  general call mechanism -- see its own known-simplifications section).
+- **`sys_vircopy` skips validation** real MINIX's `do_copy` does first:
+  resolving `SELF` to the caller's own process number, and rejecting
+  invalid process numbers. Every current caller already knows both real
+  process numbers, so this hasn't mattered yet.
+- **`sys_setalarm` is notification-only.** Real MINIX also lets a caller
+  register an in-kernel watchdog callback (a function pointer run directly
+  by `do_clocktick`, no message involved) instead of a `SYN_ALARM`
+  notification; nothing in this port has an in-kernel watchdog to
+  register yet, so only the notification path exists.
+- **`clock_tick` scans every process table slot every tick** to check for
+  an expired alarm, instead of keeping a sorted timer queue and checking
+  only `next_timeout <= realtime` like `kernel/clock.c` does. Fine at
+  `NR_PROCS` scale; would need the sorted-queue approach at real scale.
+
 ## What's not implemented yet (roadmap)
 
 Roughly in the order the original kernel needs them:
@@ -251,8 +302,12 @@ Roughly in the order the original kernel needs them:
    own page table returns `None`). See "known simplifications" above for
    what's still narrow about it: only this one task has its own address
    space, and it's a full clone of the kernel's rather than a minimal one.
-9. **Kernel calls** (`kernel/system.c`, `kernel/system/do_*.c`) — the
-   privileged operations servers need (`sys_vircopy`, `sys_setalarm`, etc.).
+9. ~~**Kernel calls**~~ — started (`src/calls.rs`): `sys_vircopy` (backed
+   by `memory::copy_between_address_spaces`) and `sys_setalarm` (backed by
+   `proc::set_alarm`/`clock_tick`). `CLOCK` now uses both for real instead
+   of polling. See "known simplifications" above for what's not
+   implemented yet (real call dispatch, `sys_umap`, more of
+   `kernel/system/do_*.c`).
 10. **The servers themselves**: `pm` (process manager), `fs` (file system),
     `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
     order, matching `servers/` and `drivers/` in the C tree -- replacing the
@@ -308,9 +363,13 @@ space), the boot image table, the `pm`/`fs` demo tasks ping-ponging three
 messages back and forth (blocking `send`/`receive`), five ring-3 round
 trips (`[syscall] iteration N from Ring3 ...`, printed from inside the
 syscall handler using the CPU-captured selector -- not something the
-kernel side merely claims) before that task blocks for good, the
-`rs`/`memory` demo tasks trading off every quantum purely because the
-timer forces it (asynchronous preemption -- watch `memory`'s counter
-resume from exactly where it left off after `rs` gets a turn), and
-finally `IDLE` reporting that it's halting (with the accumulated tick
-count) once everything else has blocked.
+kernel side merely claims) before that task blocks for good, `CLOCK`
+waking from a real `sys_setalarm`-driven `SYN_ALARM` notification and then
+using `sys_vircopy` to read the ring-3 task's code bytes back out of its
+own address space (proving a genuine cross-address-space copy, since
+`CLOCK` never leaves the kernel's), the `rs`/`memory` demo tasks trading
+off every quantum purely because the timer forces it (asynchronous
+preemption -- watch `memory`'s counter resume from exactly where it left
+off after `rs` gets a turn), and finally `IDLE` reporting that it's
+halting (with the accumulated tick count) once everything else has
+blocked.

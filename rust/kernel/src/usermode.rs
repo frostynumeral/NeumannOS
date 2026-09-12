@@ -42,7 +42,7 @@ const PAGE_SIZE: u64 = 4096;
 /// stops (by not resuming ring 3 past a fixed number of iterations),
 /// keeping this hand-assembly trivial rather than needing a real loop
 /// counter encoded by hand.
-const USER_CODE: [u8; 4] = [0xCD, SYSCALL_VECTOR, 0xEB, 0xFC];
+pub const USER_CODE: [u8; 4] = [0xCD, SYSCALL_VECTOR, 0xEB, 0xFC];
 
 /// Build a new address space (`crate::memory::new_address_space`) for the
 /// demo task and map its code and stack pages into *that* table (with
