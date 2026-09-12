@@ -48,8 +48,13 @@ path afterward. The keyboard now drives a real line discipline too: typed
 characters build up a line in `crate::keyboard`, and pressing Enter wakes
 a real, scheduled `console` task (not just a direct function call) that
 writes the completed line to a real file via `fs` — a keypress now
-reaches a real process doing real IPC, not just `vga::select_button` —
-enough to build the rest of the system on top of.
+reaches a real process doing real IPC, not just `vga::select_button`.
+The syscall ABI's `SYS_READ_LINE` closes that loop the other direction:
+a real ring-3 task blocks *inside its own trap* for however long it
+takes a human to actually type a line and press Enter, then resumes in
+ring 3 with the typed bytes — a real keypress, reaching a real process,
+by way of a real syscall — enough to build the rest of the system on
+top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -209,7 +214,7 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   CPU didn't already save, calls `dispatch` with the caller's original
   `rax`/`rdi`/`rsi`/`rdx`, writes the `u64` result back into the saved
   `rax` slot, restores everything else unchanged, and `iretq`s. `dispatch`
-  implements eight calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  implements nine calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
@@ -228,8 +233,15 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   buffer into a local kernel-stack buffer first, since (unlike
   `SYS_WRITE_LINE`) `fs` is a *different task* that may see a different
   `CR3` by the time it actually dereferences anything; see `src/fs.rs`
-  above), and `SYS_BLOCK_FOREVER` (calls `ipc::receive(ANY)` directly from
-  inside the trap, never returning -- the same "nothing sends to this
+  above), `SYS_READ_LINE` (the same kernel-stack-buffer trick, in the
+  *input* direction: blocks in `keyboard::read_line` for however long it
+  takes a human to actually type a line and press Enter -- unbounded, and
+  genuinely inside this trap, the same shape as `SYS_WAIT_ALARM` but
+  driven by a keypress instead of a timer -- then copies the result into
+  the caller's own buffer once this task's own `CR3` is active again; see
+  `src/keyboard.rs` above), and `SYS_BLOCK_FOREVER` (calls
+  `ipc::receive(ANY)` directly from inside the trap, never returning --
+  the same "nothing sends to this
   proc again" pattern every other demo task in `main.rs` ends with).
 - `src/proc.rs`'s `reschedule`/`start` call `gdt::set_rsp0` *and* switch
   `CR3` on every switch, pointing both at whichever task just became
@@ -369,7 +381,17 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   interactively via QEMU's QMP `send-key`, sent well after boot (with
   `IDLE` already halted): typing `h`, `i`, `ret` and then `w`, `o`, `r`,
   `l`, `d`, `ret` produces `[console] received line: "hi"` and
-  `[console] received line: "world"` as two distinct lines.
+  `[console] received line: "world"` as two distinct lines. `console_task`
+  now also serves real `CONSOLE_READ_LINE` requests (a genuine `send`/
+  reply, not a fire-and-forget notification like `LINE_READY`) from
+  `read_line` (`crate::syscall`'s `SYS_READ_LINE`): if a caller is already
+  waiting when a line completes, `deliver_line` copies it straight into a
+  pointer the caller provided and replies with the length -- safe because
+  that pointer is always a kernel-stack buffer (mapped identically in
+  every address space), never a ring-3 pointer directly, the same
+  reasoning `crate::fs`'s `SYS_FS_*` calls already rely on. Only one
+  pending reader is tracked at a time (a known simplification, below);
+  fine for this port's one caller (`tty`, see `user/hello.s`).
 - `src/rs.rs` — a real reincarnation server, replacing `rs`'s busy-loop
   stand-in. Ported in spirit from `servers/rs/manager.c`'s crash-handling
   path -- real MINIX gets there via `PM` noticing a process's unexpected
@@ -429,10 +451,15 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `SYS_SET_ALARM`/`SYS_WAIT_ALARM` (genuinely blocking and later resuming
   in ring 3), a `SYS_WRITE_LINE`, a real `SYS_FS_OPEN`/`SYS_FS_WRITE`
   round trip to `fs` (opening `/from_ring3.txt` and writing a message to
-  it, all the way from ring 3), and finally `SYS_BLOCK_FOREVER` -- see
+  it, all the way from ring 3), then a real `SYS_READ_LINE` -- blocking
+  for however long it takes a human to actually type a line -- followed
+  by a second `SYS_FS_OPEN`/`SYS_FS_WRITE` writing whatever line arrived
+  to `/from_console.txt`, and finally `SYS_BLOCK_FOREVER` -- see
   `src/syscall.rs` below for what each of those actually does. `IDLE`
-  (below) reads that same file back afterward to confirm the content
-  genuinely landed in `fs`. `CLOCK` now genuinely
+  (below) reads `/from_ring3.txt` back afterward to confirm the content
+  genuinely landed in `fs`; `/from_console.txt` needs a human (or a QMP
+  `send-key` script) to actually type something first, so nothing reads
+  it back automatically -- see the "Running" section. `CLOCK` now genuinely
   calls `sys_setalarm` and blocks in `receive` -- exactly real MINIX's
   `while (TRUE) receive(HARDWARE, &m)` -- instead of polling
   `uptime_ticks()`, and also exercises `sys_vircopy` twice: reading the
@@ -524,13 +551,13 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Eight calls exist**, and only `SYS_SET_ALARM`/`SYS_WAIT_ALARM`/
-  `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` reach real server logic
-  (`sys_vircopy`/`sys_fork` still aren't reachable from ring 3 at all).
-  Real enough to write a genuine ring-3 program against (a demo user
-  program can now get the time, print, sleep, and do real file I/O), but
-  still a hand-picked set proving the dispatch mechanism works, not a
-  real syscall surface.
+- **Nine calls exist**, and only `SYS_SET_ALARM`/`SYS_WAIT_ALARM`/
+  `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ`/`SYS_READ_LINE` reach real
+  server logic (`sys_vircopy`/`sys_fork` still aren't reachable from
+  ring 3 at all). Real enough to write a genuine ring-3 program against
+  (a demo user program can now get the time, print, sleep, do real file
+  I/O, and block for real keyboard input), but still a hand-picked set
+  proving the dispatch mechanism works, not a real syscall surface.
 - **Three arguments, not a full calling convention.** Only `rdi`/`rsi`/
   `rdx` are read as arguments; a real syscall ABI (or MINIX's own
   message-based one) would want more, plus a real error-reporting
@@ -720,6 +747,19 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   only because `crate::fs` has no explicit "append" mode to fall back on
   (see "known simplifications in `fs`" above); re-opening on every line
   would silently overwrite from the start each time instead.
+- **Only one pending `SYS_READ_LINE` reader is tracked at a time.**
+  `console_task`'s `pending_reader` is a single `Option`, not a queue: a
+  second `CONSOLE_READ_LINE` request arriving before the first is
+  satisfied would silently overwrite (and so permanently starve) the
+  first caller. Fine for this port's one caller (`tty`); not fine for
+  more than one ring-3 task blocking on console input at once.
+- **A completed line with no pending reader is only logged, not saved
+  for a future reader.** If a line finishes before anyone calls
+  `SYS_READ_LINE` for it, `console_task` still appends it to
+  `/console.log`, but a *later* `SYS_READ_LINE` call will wait for the
+  *next* line typed, not receive the one that already happened. Fine for
+  this port's demo (`tty` calls `SYS_READ_LINE` well before any human
+  types anything), not a general "replay history" mailbox.
 
 ### Known simplifications in `rs`/crash recovery
 
@@ -875,10 +915,16 @@ Roughly in the order the original kernel needs them:
     item used to cite (anything reaching a real process, not just calling
     straight into `crate::vga`) is closed, verified interactively by
     typing `"hi"` and `"world"` (each terminated with Enter) well after
-    boot, once `IDLE` had already halted. See "known simplifications in
-    the keyboard driver" above for what's still missing (modifier-key
-    state, extended scancodes, echo/editing, and a real `tty` server this
-    port's `console_task` stands in for by talking to `fs` directly).
+    boot, once `IDLE` had already halted. `console_task` now also answers
+    real `SYS_READ_LINE` requests from ring 3 (`crate::syscall`): `tty`
+    blocks for an entire line of real, human-timed keyboard input from
+    inside its own trap, then writes what it received to a second file --
+    verified end to end by typing `"neumann"` over QMP well after boot and
+    seeing it land in `/from_console.txt`, exactly as typed. See "known
+    simplifications in the keyboard driver" above for what's still missing
+    (modifier-key state, extended scancodes, echo/editing, only one
+    pending reader tracked at a time, and a real `tty` server this port's
+    `console_task` stands in for by talking to `fs` directly).
 15. ~~**A real syscall ABI**~~ — done (`src/syscall.rs`). Replaced
     `usermode`'s old fixed-action, count-and-cut-off `int 0x80` handler
     with genuine call-number/register dispatch: a hand-written naked trap
@@ -893,7 +939,10 @@ Roughly in the order the original kernel needs them:
     `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` -- a real IPC round trip to
     `fs`, copying pointer arguments through a kernel-stack buffer first
     since `fs` runs with a potentially different `CR3` by the time it
-    dereferences anything; and `SYS_BLOCK_FOREVER`), and writes the
+    dereferences anything; `SYS_READ_LINE` -- the same kernel-stack-buffer
+    trick in the input direction, blocking for however long it takes a
+    human to actually type a line (`crate::keyboard::read_line`); and
+    `SYS_BLOCK_FOREVER`), and writes the
     result back into `rax` before `iretq`. Both ring-3 tasks (`usermode`'s
     hand-assembled demo and `crate::elf`'s loaded ELF binary) now
     exercise real syscalls, each ending on its own terms
@@ -905,11 +954,14 @@ Roughly in the order the original kernel needs them:
     spawned `log` task, `rs`/`memory`'s preemption) continuing normally
     the whole time it's blocked, and then opens and writes a real file
     over `SYS_FS_OPEN`/`SYS_FS_WRITE`, verified by `IDLE` reading it back
-    afterward through a completely independent path. See "known
-    simplifications in the syscall ABI" above for what's not a real
-    syscall surface yet (eight calls, `sys_vircopy`/`sys_fork` still not
-    reachable, a single `u64::MAX` error sentinel for syscall-level
-    failures instead of real error codes).
+    afterward through a completely independent path, and finally blocks
+    on `SYS_READ_LINE` for a real, human-timed line of keyboard input
+    before writing *that* to a second file -- verified end to end by
+    typing a line over QMP well after boot. See "known simplifications in
+    the syscall ABI" above for what's not a real syscall surface yet (nine
+    calls, `sys_vircopy`/`sys_fork` still not reachable, a single
+    `u64::MAX` error sentinel for syscall-level failures instead of real
+    error codes).
 
 ## Building
 
@@ -981,7 +1033,18 @@ button matching the digit pressed (button `N` for digit `N`), and
 nowhere else. The line discipline can be exercised the same way: send a
 sequence of letter `qcode`s followed by `"ret"` (e.g. `"h"`, `"i"`,
 `"ret"`), and COM1 should print `[console] received line: "hi"` --
-this too works well after boot, once `IDLE` has already halted.
+this too works well after boot, once `IDLE` has already halted. `tty`'s
+`SYS_READ_LINE` call means this actually matters for a normal run, not
+just an optional extra: since nothing else in this port types anything
+on its own, `tty` will sit blocked at
+`[syscall] proc 5: SYS_READ_LINE, blocking for a real keypress`
+indefinitely in a plain, non-interactive boot -- exactly like a real
+shell waiting at a prompt, not a hang or a bug. Typing a line (e.g. `"n"`,
+`"e"`, `"u"`, `"m"`, `"a"`, `"n"`, `"n"`, `"ret"` for `"neumann"`) over
+QMP unblocks it: COM1 should show `[console] received line: "neumann"`,
+then `[syscall] proc 5: SYS_READ_LINE -> 7 bytes`, then `tty` opening
+and writing that same text to `/from_console.txt`, then finally its
+`SYS_BLOCK_FOREVER`.
 Expected output on COM1: a line confirming the LCARS demo panel
 was painted (`vga: painted the LCARS demo panel ...`, printed as early as
 possible -- before paging/heap/scheduler setup -- so the panel is on

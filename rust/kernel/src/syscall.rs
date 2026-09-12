@@ -63,8 +63,17 @@
 //! because it lives in memory the kernel maps identically into every
 //! address space (like any other kernel-static data), unlike a ring-3
 //! task's own private pages.
+//!
+//! `SYS_READ_LINE` closes the loop the other direction: a real keypress
+//! (`crate::keyboard`) reaching a ring-3 task, not just `fs`. It hands
+//! `crate::keyboard::read_line` a pointer to a local kernel-stack buffer
+//! (the same reasoning as `SYS_FS_READ`'s buffer -- see `crate::keyboard`'s
+//! `deliver_line` for the other end of that), blocks *inside this trap*
+//! until a full line has actually been typed (there's no bound on how
+//! long that takes), and only then copies the result into the caller's
+//! own buffer, since by then this task's own `CR3` is active again.
 
-use crate::{calls, com, fs, ipc, proc, serial_println};
+use crate::{calls, com, fs, ipc, keyboard, proc, serial_println};
 
 pub const SYS_GET_UPTIME: u64 = 1;
 pub const SYS_WRITE_LINE: u64 = 2;
@@ -74,6 +83,7 @@ pub const SYS_WAIT_ALARM: u64 = 5;
 pub const SYS_FS_OPEN: u64 = 6;
 pub const SYS_FS_WRITE: u64 = 7;
 pub const SYS_FS_READ: u64 = 8;
+pub const SYS_READ_LINE: u64 = 9;
 
 /// Longest path/buffer `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` will
 /// copy through a local kernel-stack buffer in either direction.
@@ -220,6 +230,25 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             }
             serial_println!("[syscall] proc {}: SYS_FS_READ(fd {}) -> {}", caller, fd, result);
             result as u64
+        }
+        SYS_READ_LINE => {
+            let max_len = core::cmp::min(arg2 as usize, MAX_FS_BUF);
+            let mut buf = [0u8; MAX_FS_BUF];
+            serial_println!("[syscall] proc {}: SYS_READ_LINE, blocking for a real keypress", caller);
+            // Genuinely blocks -- possibly for a long time, however long
+            // a human (or a QMP send-key script) takes to type a line --
+            // inside this very trap, exactly like SYS_WAIT_ALARM. `buf`
+            // lives on this call's own stack frame, part of the caller's
+            // own per-task kernel stack, so it stays valid (and
+            // dereferenceable from crate::keyboard's task, regardless of
+            // which CR3 is active) for as long as this call is blocked.
+            let n = keyboard::read_line(buf.as_mut_ptr() as u64, max_len);
+            if n > 0 {
+                let dst = unsafe { core::slice::from_raw_parts_mut(arg1 as *mut u8, n as usize) };
+                dst.copy_from_slice(&buf[..n as usize]);
+            }
+            serial_println!("[syscall] proc {}: SYS_READ_LINE -> {} bytes", caller, n);
+            n as u64
         }
         _ => {
             serial_println!("[syscall] proc {}: unknown call number {}", caller, call_num);

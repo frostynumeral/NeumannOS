@@ -7,10 +7,19 @@
 # own .data (proving a real cross-ring argument -- a pointer -- gets read
 # correctly). Then it goes one step further: SYS_FS_OPEN a real file and
 # SYS_FS_WRITE a message to it -- a genuine ring 3 -> syscall -> IPC ->
-# fs round trip, not just a kernel-internal call -- before finally
-# SYS_BLOCK_FOREVER, which never returns. No libc, no _start-time setup:
-# the kernel's elf.rs loader jumps straight to _start with nothing but a
-# stack.
+# fs round trip, not just a kernel-internal call. Finally, SYS_READ_LINE:
+# this blocks for real, for as long as it takes a human (or a QMP
+# send-key script) to actually type a line and press Enter, then writes
+# whatever line arrives to a second file via SYS_FS_OPEN/SYS_FS_WRITE,
+# before SYS_BLOCK_FOREVER, which never returns. No libc, no
+# _start-time setup: the kernel's elf.rs loader jumps straight to
+# _start with nothing but a stack.
+#
+# Note this means a plain, non-interactive boot will show this task
+# blocked at SYS_READ_LINE indefinitely (nothing else in this port types
+# anything on its own) -- exactly like a real shell waiting at a prompt,
+# not a bug. See rust/README.md's "Running" section for how to actually
+# supply a line over QEMU's QMP interface.
 #
 # Built into hello.elf (checked in alongside this file, since the kernel
 # build has no cross toolchain wired in yet to assemble this
@@ -65,6 +74,27 @@ _start:
     mov $7, %eax        # SYS_FS_WRITE (crate::syscall::SYS_FS_WRITE)
     int $0x80
 
+    # Block for a real line of console input (rdi=buf ptr, rsi=max len).
+    # Returns however many bytes were actually typed.
+    lea line_buf(%rip), %rdi
+    mov $line_buf_cap, %esi
+    mov $9, %eax        # SYS_READ_LINE (crate::syscall::SYS_READ_LINE)
+    int $0x80
+    mov %rax, %r9       # stash the length read
+
+    # Open a second file and write the received line to it.
+    lea path2(%rip), %rdi
+    mov $path2_len, %esi
+    mov $6, %eax        # SYS_FS_OPEN
+    int $0x80
+    mov %rax, %r8       # fd
+
+    mov %r8, %rdi
+    lea line_buf(%rip), %rsi
+    mov %r9, %rdx
+    mov $7, %eax        # SYS_FS_WRITE
+    int $0x80
+
     mov $3, %eax        # SYS_BLOCK_FOREVER (crate::syscall::SYS_BLOCK_FOREVER)
     int $0x80
     # unreachable: SYS_BLOCK_FOREVER's handler never returns.
@@ -82,3 +112,9 @@ path_len = . - path
 file_message:
     .ascii "written from ring 3 via a real syscall, IPC, and fs!"
 file_message_len = . - file_message
+path2:
+    .ascii "/from_console.txt"
+path2_len = . - path2
+line_buf:
+    .skip 64
+line_buf_cap = 64
