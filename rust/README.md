@@ -18,8 +18,11 @@ memory), a real `fs` server backing genuine open/read/write requests
 with an in-memory filesystem over IPC (not a fixed-reply stand-in), and
 a second ring-3 task that runs a *real, statically linked ELF64 binary*
 (parsed and mapped by this port's own minimal ELF loader, not
-hand-assembled bytes poked into a fixed page) — enough to build the rest
-of the system on top of.
+hand-assembled bytes poked into a fixed page), and — the first step
+toward the BeOS/Haiku-flavored desktop-OS direction noted below — real
+VGA graphics: a static, LCARS-style panel (flat-colored rounded-rectangle
+bars and buttons, no text) painted into a real linear framebuffer — enough
+to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -201,6 +204,26 @@ external contract.
   mapped size are the same thing. `task_entry` reuses
   `usermode::enter_ring3` to jump to the parsed `e_entry` (not a fixed
   constant) on a mapped stack.
+- `src/vga.rs` — VGA mode 13h (320x200, 256-color) graphics. No MINIX C
+  equivalent (2005-era MINIX has no graphics stack at all); this is the
+  first concrete step toward the BeOS/Haiku-flavored desktop-OS direction
+  noted at the top of this file, not a ported feature. Mode 13h itself is
+  set by the `bootloader` crate's `vga_320x200` feature (a real-mode
+  `int 0x10` call before the jump to long mode); this module programs the
+  256-color palette via the VGA DAC ports (`0x3C8`/`0x3C9`, 6 bits per
+  channel) and writes pixels into the resulting linear framebuffer at
+  physical `0xA0000` -- reached through the same physical-memory offset
+  window `crate::memory`/`crate::calls` already use for everything else,
+  since `map_physical_memory` maps the *entire* physical address range
+  (MMIO holes included), not just RAM-typed regions. `fill_rect` is the
+  flat-fill primitive; `fill_rounded_rect` builds real rounded rectangles
+  on top of it (a pixel in one of the four corner boxes is only painted
+  if it falls within a quarter circle of the chosen radius, exactly the
+  standard rounded-rectangle construction) -- every bar and button in
+  `draw_demo_panel` is one of these, not a plain rectangle. `kernel_main`
+  calls `init_palette`/`draw_demo_panel` as early as possible (before
+  paging/heap/scheduler setup), so the panel stays on screen even if
+  something later in boot panics.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
   and the heap, builds the ring-3 demo task's and the ELF-loaded task's
@@ -414,6 +437,29 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   `user/hello.elf` is well-formed, since this port only ever loads a
   binary it built itself.
 
+### Known simplifications in the VGA graphics
+
+- **One fixed 256-color mode (320x200), not VBE/a linear high-resolution
+  framebuffer.** Mode 13h is the simplest possible real VGA graphics
+  mode to drive (no bank switching, no mode-setting protocol beyond one
+  `int 0x10` call) and is exactly what the `bootloader` crate's
+  `vga_320x200` feature already sets up; a real desktop UI would want a
+  much higher resolution and color depth (the `bootloader` crate has no
+  VBE/framebuffer feature of its own to build on for that -- see the
+  long-term direction note above).
+- **A single, fixed, hardcoded layout.** `draw_demo_panel` always draws
+  the same bars/buttons at the same coordinates; there's no generic
+  "layout a panel of N elements" API, windowing, or input handling
+  (mouse/keyboard) yet -- this is a static image, not a UI.
+- **No double buffering.** `draw_demo_panel` writes directly to the
+  live, currently-displayed framebuffer; fine for one paint that never
+  changes again, but a real UI redrawing every frame would need to draw
+  off-screen and flip, to avoid visible tearing.
+- **`fill_rounded_rect`'s corner circles are computed per pixel, every
+  call**, rather than precomputed into a reusable mask or drawn via a
+  midpoint-circle algorithm. Fine at 320x200 and a handful of shapes;
+  would matter at a much bigger framebuffer or redrawn every frame.
+
 ## What's not implemented yet (roadmap)
 
 Roughly in the order the original kernel needs them:
@@ -493,6 +539,16 @@ Roughly in the order the original kernel needs them:
     copies, and a backing store (see "known simplifications in `fs`" above)
     rather than a flat, in-memory, single-address-space file table.
 12. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
+13. ~~**Real graphics output**~~ — started (`src/vga.rs`): VGA mode 13h
+    (320x200, 256-color), a real palette (VGA DAC ports) and a real
+    linear framebuffer, `fill_rect`/`fill_rounded_rect` drawing
+    primitives, and a static LCARS-style demo panel painted on boot. This
+    is the first concrete step toward the BeOS/Haiku-flavored desktop-OS
+    direction noted above, not part of MINIX-fidelity roadmap items 1-12.
+    See "known simplifications in the VGA graphics" above for what's
+    missing (a higher-resolution/color-depth mode, a real layout/windowing
+    system, input handling, double buffering) before this is a UI rather
+    than a static image.
 
 ## Building
 
@@ -535,8 +591,21 @@ qemu-system-x86_64 -m 256 -drive format=raw,file=target/x86_64-unknown-none/debu
 (or `cargo run`, which invokes `bootimage runner` per `.cargo/config.toml`
 and does the same thing, though without the explicit `-m 256` -- pass it
 via `QEMU_ARGS` if the default memory size turns out too small for the
-heap plus everything else once more of this grows). Expected output on
-COM1: a heap self-test (`Box`/`Vec` both actually work), an isolation
+heap plus everything else once more of this grows). The VGA display
+itself (mode 13h, the LCARS demo panel from `src/vga.rs`) needs an actual
+display backend, so `-display none` (used for headless/CI runs, e.g. no
+`DISPLAY` available) won't show it -- drop `-display none` for a real
+window, or capture it headlessly via QEMU's QMP `screendump` command
+(`-qmp unix:/tmp/qmp.sock,server,nowait -display none -vga std`, then a
+QMP client sends `{"execute": "screendump", "arguments": {"filename":
+"/tmp/screen.ppm"}}` after the capabilities handshake). Note the
+resulting image is double the mode's logical 320x200 (640x400): real
+mode 13h hardware double-scans it, and QEMU's screendump reflects that,
+so multiply logical panel coordinates by 2 before sampling a pixel from
+the dump. Expected output on COM1: a line confirming the LCARS demo panel
+was painted (`vga: painted the LCARS demo panel ...`, printed as early as
+possible -- before paging/heap/scheduler setup -- so the panel is on
+screen even if something later panics), a heap self-test (`Box`/`Vec` both actually work), an isolation
 self-test (the ring-3 demo's code page translates to `None` through the
 kernel's own page table -- it only exists in that task's private address
 space), the boot image table, the `pm`/`fs` demo tasks ping-ponging three
