@@ -1,0 +1,14 @@
+[build]
+target = "x86_64-unknown-none"
+# The `bootloader` 0.9 crate's ELF loader expects a statically-linked,
+# non-relocatable kernel at a fixed link address. The builtin
+# x86_64-unknown-none target defaults to a position-independent
+# executable, which the loader does not relocate, so force it off.
+rustflags = ["-C", "relocation-model=static"]
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]
+
+[target.x86_64-unknown-none]
+runner = "bootimage runner"
