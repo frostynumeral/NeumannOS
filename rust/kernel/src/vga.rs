@@ -13,6 +13,7 @@
 //! programs the color palette and writes pixels into the resulting
 //! linear framebuffer.
 
+use spin::Mutex;
 use x86_64::instructions::port::Port;
 use x86_64::VirtAddr;
 
@@ -66,15 +67,20 @@ pub mod palette {
     pub const RED_ALERT: u8 = 3;
     pub const BLUE: u8 = 4;
     pub const TAN: u8 = 5;
+    /// Used only for the selection frame `draw_demo_panel` paints behind
+    /// whichever button `select_button` last picked -- not one of the
+    /// panel's own resting colors.
+    pub const HIGHLIGHT: u8 = 6;
 
     /// `(index, r6, g6, b6, "approximate 8-bit RGB")` for `init`.
-    pub const ENTRIES: [(u8, u8, u8, u8); 6] = [
+    pub const ENTRIES: [(u8, u8, u8, u8); 7] = [
         (BLACK, 0, 0, 0),        // (0, 0, 0)
         (ORANGE, 63, 38, 0),     // (255, 153, 0)
         (PURPLE, 38, 25, 50),    // (153, 102, 204)
         (RED_ALERT, 50, 25, 25), // (204, 102, 102)
         (BLUE, 25, 38, 50),      // (102, 153, 204)
         (TAN, 63, 50, 38),       // (255, 204, 153)
+        (HIGHLIGHT, 63, 63, 63), // (255, 255, 255)
     ];
 }
 
@@ -177,7 +183,10 @@ pub fn fill_rounded_rect(
 /// "LCARS" layout -- an orange sweep bar with a rounded left end, a
 /// purple descender bar below it with a rounded bottom end (together
 /// forming an L, the classic LCARS silhouette), and a column of smaller,
-/// fully-rounded buttons along the right edge.
+/// fully-rounded buttons along the right edge (see `BUTTON_COLORS` and
+/// friends). Whichever button `select_button` last picked (if any) gets
+/// a highlighted frame drawn behind it -- the panel's one piece of live
+/// state, driven by `crate::keyboard`'s digit keys.
 pub fn draw_demo_panel(fb: *mut u8) {
     fill_rect(fb, 0, 0, WIDTH, HEIGHT, palette::BLACK);
 
@@ -208,8 +217,56 @@ pub fn draw_demo_panel(fb: *mut u8) {
     );
 
     // A column of small, fully-rounded "buttons" along the right edge.
-    let button_colors = [palette::RED_ALERT, palette::BLUE, palette::TAN, palette::ORANGE];
-    for (i, &color) in button_colors.iter().enumerate() {
-        fill_rounded_rect(fb, 250, 15 + i * 40, 55, 30, 10, Corners::ALL, color);
+    let selected = *SELECTED_BUTTON.lock();
+    for (i, &color) in BUTTON_COLORS.iter().enumerate() {
+        let y = BUTTON_Y0 + i * BUTTON_SPACING;
+        if selected == Some(i) {
+            // A highlight frame, slightly larger than the button and
+            // drawn first so only its border shows once the button is
+            // painted on top -- proof of a real input-to-output loop
+            // (`crate::keyboard` -> `select_button` -> a visibly
+            // different framebuffer), not just that the keypress was
+            // read.
+            fill_rounded_rect(
+                fb,
+                BUTTON_X - HIGHLIGHT_MARGIN,
+                y - HIGHLIGHT_MARGIN,
+                BUTTON_W + 2 * HIGHLIGHT_MARGIN,
+                BUTTON_H + 2 * HIGHLIGHT_MARGIN,
+                BUTTON_RADIUS + HIGHLIGHT_MARGIN,
+                Corners::ALL,
+                palette::HIGHLIGHT,
+            );
+        }
+        fill_rounded_rect(fb, BUTTON_X, y, BUTTON_W, BUTTON_H, BUTTON_RADIUS, Corners::ALL, color);
     }
+}
+
+pub const BUTTON_COUNT: usize = 4;
+const BUTTON_X: usize = 250;
+const BUTTON_Y0: usize = 15;
+const BUTTON_SPACING: usize = 40;
+const BUTTON_W: usize = 55;
+const BUTTON_H: usize = 30;
+const BUTTON_RADIUS: usize = 10;
+const HIGHLIGHT_MARGIN: usize = 4;
+const BUTTON_COLORS: [u8; BUTTON_COUNT] = [palette::RED_ALERT, palette::BLUE, palette::TAN, palette::ORANGE];
+
+/// Which button (`0..BUTTON_COUNT`) `select_button` last picked, if any.
+/// The panel's only piece of live state -- everything else `draw_demo_panel`
+/// paints is fixed at compile time.
+static SELECTED_BUTTON: Mutex<Option<usize>> = Mutex::new(None);
+
+/// Select button `index` (silently ignored if out of range) and
+/// immediately repaint the whole panel to show it -- the input-to-output
+/// half of the loop `crate::keyboard`'s digit-key handling starts.
+/// Reaches the framebuffer itself via `crate::memory::physical_memory_offset`
+/// rather than requiring a caller (an interrupt handler, in practice) to
+/// have one on hand.
+pub fn select_button(index: usize) {
+    if index >= BUTTON_COUNT {
+        return;
+    }
+    *SELECTED_BUTTON.lock() = Some(index);
+    draw_demo_panel(framebuffer(crate::memory::physical_memory_offset()));
 }

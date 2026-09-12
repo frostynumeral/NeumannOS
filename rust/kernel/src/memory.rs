@@ -83,7 +83,7 @@ pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static>
     OffsetPageTable::new(level_4_table, physical_memory_offset)
 }
 
-fn physical_memory_offset() -> VirtAddr {
+pub(crate) fn physical_memory_offset() -> VirtAddr {
     VirtAddr::new(unsafe { PHYSICAL_MEMORY_OFFSET })
 }
 
