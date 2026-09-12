@@ -178,12 +178,78 @@ fn take_line() -> Option<([u8; LINE_CAPACITY], usize)> {
     Some(result)
 }
 
-/// `console`'s task body: block for `on_char`'s notification, then take
-/// the completed line and append it (plus a newline) to a real file via
-/// `crate::fs` -- proof a keypress can drive a real, scheduled task that
-/// itself does real IPC, not just a direct function call
-/// (`crate::vga::select_button`) from the interrupt handler, and not
-/// just proof the hardware event fires.
+/// Real message type (not a fire-and-forget notification like
+/// `LINE_READY`: a genuine `send`/reply pair) a caller uses to ask
+/// `console_task` for the next completed line -- see `read_line` and
+/// `crate::syscall`'s `SYS_READ_LINE`, the only current caller.
+const CONSOLE_READ_LINE: i32 = 400;
+
+/// A caller blocked waiting for the next line, remembered by
+/// `console_task` across however many `LINE_READY` notifications (and
+/// whatever else console does in between) it takes for one to actually
+/// arrive. `ptr`/`max_len` describe *where* to write the line's bytes,
+/// not just *who* to reply to -- see `read_line`'s doc comment for why
+/// writing straight into a pointer the caller gave us is safe here in a
+/// way it wouldn't be for an arbitrary ring-3 pointer.
+struct PendingReader {
+    proc_nr: i32,
+    ptr: u64,
+    max_len: usize,
+}
+
+/// Copy up to `reader.max_len` bytes of `line` into `reader.ptr` and
+/// reply to `reader.proc_nr` with how many bytes that was.
+fn deliver_line(reader: &PendingReader, line: &[u8]) {
+    let n = core::cmp::min(line.len(), reader.max_len);
+    // Safety: `reader.ptr` was handed to us by `crate::syscall`'s
+    // `SYS_READ_LINE`, which always points at a *kernel*-stack buffer
+    // (part of the calling task's own per-task kernel stack, mapped
+    // identically in every address space -- see `crate::proc`'s
+    // `STACKS`) precisely so it stays dereferenceable here regardless of
+    // which `CR3` happens to be active when `console_task` (which always
+    // runs in the kernel's own address space) gets around to writing it,
+    // possibly much later than when the request arrived.
+    unsafe { core::ptr::copy_nonoverlapping(line.as_ptr(), reader.ptr as *mut u8, n) };
+    ipc::send(
+        reader.proc_nr,
+        ipc::Message { source: com::CONSOLE_PROC_NR, m_type: CONSOLE_READ_LINE, args: [n as i64, 0, 0, 0] },
+    );
+}
+
+/// Client-side stub for `crate::syscall`'s `SYS_READ_LINE`: ask
+/// `console_task` for the next completed line, blocking until one is
+/// typed (there's no "no line available" reply -- a caller that doesn't
+/// want to block has nothing to call instead yet). `ptr` must point at
+/// memory valid in *this* address space for at least `max_len` bytes --
+/// `SYS_READ_LINE` only ever passes a kernel-stack buffer, never a
+/// ring-3 pointer directly, for exactly the reason `deliver_line`'s doc
+/// comment explains.
+pub fn read_line(ptr: u64, max_len: usize) -> i64 {
+    let reply = ipc::send_receive(
+        com::CONSOLE_PROC_NR,
+        ipc::Message {
+            source: crate::proc::current_proc_nr(),
+            m_type: CONSOLE_READ_LINE,
+            args: [ptr as i64, max_len as i64, 0, 0],
+        },
+    );
+    reply.args[0]
+}
+
+/// `console`'s task body: a real, if minimal, line-oriented server.
+/// Every completed line (`on_char`'s `LINE_READY` notification) gets
+/// logged and appended to `/console.log` via `crate::fs` unconditionally
+/// (the original proof this task does real IPC, not just a direct
+/// function call like `crate::vga::select_button`); if some other task
+/// is also waiting for a line (`CONSOLE_READ_LINE`, from
+/// `crate::syscall`'s `SYS_READ_LINE`), that same line is delivered to
+/// them too, directly into the buffer their request pointed at
+/// (`deliver_line`). A `CONSOLE_READ_LINE` request that arrives with no
+/// line buffered yet is remembered (`pending_reader`) rather than
+/// replied to immediately, and satisfied whenever the next line
+/// completes -- proof a ring-3 task can genuinely block waiting for
+/// keyboard input and resume once a human (or, in QEMU, a QMP
+/// `send-key` sequence) actually types something.
 ///
 /// Opens `/console.log` exactly once, before the loop, and keeps writing
 /// through that same descriptor for every subsequent line: `fs::open`
@@ -196,14 +262,33 @@ pub fn console_task() -> ! {
     if fd < 0 {
         serial_println!("[console] fs::open(\"/console.log\") failed: {}", fd);
     }
+    let mut pending_reader: Option<PendingReader> = None;
+
     loop {
-        ipc::receive(com::ANY);
+        let msg = ipc::receive(com::ANY);
+
+        if msg.m_type == CONSOLE_READ_LINE {
+            // Simplification: only one pending reader is tracked at a
+            // time -- a second SYS_READ_LINE arriving before the first
+            // is satisfied would overwrite (and so silently starve) it.
+            // Fine for this port's one demo caller.
+            pending_reader =
+                Some(PendingReader { proc_nr: msg.source, ptr: msg.args[0] as u64, max_len: msg.args[1] as usize });
+            continue;
+        }
+
         let Some((buf, len)) = take_line() else { continue };
-        let line = core::str::from_utf8(&buf[..len]).unwrap_or("<invalid utf8>");
-        serial_println!("[console] received line: {:?}", line);
+        let line = &buf[..len];
+        serial_println!(
+            "[console] received line: {:?}",
+            core::str::from_utf8(line).unwrap_or("<invalid utf8>")
+        );
         if fd >= 0 {
-            fs::write(fd, &buf[..len]);
+            fs::write(fd, line);
             fs::write(fd, b"\n");
+        }
+        if let Some(reader) = pending_reader.take() {
+            deliver_line(&reader, line);
         }
     }
 }
