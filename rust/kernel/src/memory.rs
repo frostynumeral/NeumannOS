@@ -20,6 +20,7 @@
 //! address space" part is what this module adds).
 
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
+use spin::Mutex;
 use x86_64::structures::paging::{
     FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB, Translate,
 };
@@ -32,6 +33,39 @@ use x86_64::{PhysAddr, VirtAddr};
 /// Written once, at boot, before any other CPU-visible state depends on
 /// it; read-only after.
 static mut PHYSICAL_MEMORY_OFFSET: u64 = 0;
+
+/// The one physical frame allocator, behind a lock so it can be reached
+/// from anywhere -- not just `kernel_main`'s boot-time setup, which is all
+/// that could allocate memory before this existed. `crate::calls::sys_fork`
+/// is the first kernel call that needs to allocate at an arbitrary runtime
+/// point, from whichever task happens to call it.
+static FRAME_ALLOCATOR: Mutex<Option<BootInfoFrameAllocator>> = Mutex::new(None);
+
+/// Install the global frame allocator. Called once from `kernel_main`,
+/// right after the memory map is available.
+///
+/// # Safety
+/// Same requirement as `BootInfoFrameAllocator::init`: the memory map must
+/// be valid and every frame it marks `Usable` must really be unused.
+pub unsafe fn init_frame_allocator(memory_map: &'static MemoryMap) {
+    *FRAME_ALLOCATOR.lock() = Some(BootInfoFrameAllocator::init(memory_map));
+}
+
+/// A `FrameAllocator` handle that delegates to the global one -- for
+/// passing to APIs (like `Mapper::map_to`) that need a
+/// `&mut impl FrameAllocator<Size4KiB>` rather than a bare
+/// `allocate_frame()` call.
+pub struct GlobalFrameAllocator;
+
+unsafe impl FrameAllocator<Size4KiB> for GlobalFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        FRAME_ALLOCATOR
+            .lock()
+            .as_mut()
+            .expect("global frame allocator used before init_frame_allocator")
+            .allocate_frame()
+    }
+}
 
 /// Build an `OffsetPageTable` over the page table the bootloader already
 /// installed (it maps the kernel plus, thanks to the `map_physical_memory`
@@ -78,9 +112,8 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 /// to guarantee this.
 pub fn new_address_space(
     physical_memory_offset: VirtAddr,
-    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
 ) -> (PhysFrame, OffsetPageTable<'static>) {
-    let new_frame = frame_allocator
+    let new_frame = GlobalFrameAllocator
         .allocate_frame()
         .expect("out of physical frames for a new address space's PML4");
 
@@ -94,6 +127,86 @@ pub fn new_address_space(
         let table = &mut *new_ptr;
         (new_frame, OffsetPageTable::new(table, physical_memory_offset))
     }
+}
+
+/// Fork `src_pml4` into a brand-new, independent address space: like
+/// `new_address_space`, everything is shared by default (aliasing the
+/// same lower-level tables) -- but for each address in `private_pages`,
+/// this also walks that address's *entire* page-table path fresh,
+/// duplicating any table level still shared with `src_pml4` (so modifying
+/// it can never modify the original), and deep-copies the leaf page's
+/// *contents* into a freshly allocated frame. This is what
+/// `new_address_space` alone can't do: it only ever shares an existing
+/// mapping or adds a brand-new one, never disentangles an address the
+/// source already had mapped -- which real `fork()` needs for every page
+/// the parent already had (its stack, its data), not just future ones.
+///
+/// `crate::calls::sys_fork` is the first (and so far only) caller;
+/// `private_pages` there is `usermode`'s two demo pages, since that's the
+/// only address space this port creates. A real `fork()` would instead
+/// walk the *entire* user-accessible range of the parent's page tables,
+/// rather than needing an explicit list.
+pub fn fork_address_space(src_pml4: PhysFrame, private_pages: &[VirtAddr]) -> PhysFrame {
+    let offset = physical_memory_offset();
+
+    // Start the same way `new_address_space` does: an exact top-level copy.
+    let dst_pml4_frame = GlobalFrameAllocator
+        .allocate_frame()
+        .expect("out of physical frames for fork's PML4");
+    unsafe {
+        let src_ptr: *const PageTable = (offset + src_pml4.start_address().as_u64()).as_ptr();
+        let dst_ptr: *mut PageTable =
+            (offset + dst_pml4_frame.start_address().as_u64()).as_mut_ptr();
+        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 1);
+    }
+
+    for &addr in private_pages {
+        unsafe { fork_one_page(dst_pml4_frame, addr, offset) };
+    }
+
+    dst_pml4_frame
+}
+
+/// Walk from `pml4_frame` down to the leaf (page table) entry for `addr`,
+/// duplicating each intermediate level along the way (so it stops being
+/// shared with wherever it was cloned from), then replace the final leaf
+/// entry with a fresh frame holding a copy of the original page's bytes.
+unsafe fn fork_one_page(pml4_frame: PhysFrame, addr: VirtAddr, offset: VirtAddr) {
+    let mut table_frame = pml4_frame;
+    for index in [addr.p4_index(), addr.p3_index(), addr.p2_index()] {
+        let table: &mut PageTable =
+            &mut *((offset + table_frame.start_address().as_u64()).as_mut_ptr());
+        let entry = &mut table[index];
+        let next_frame = entry
+            .frame()
+            .expect("fork_one_page: intermediate page table not present");
+
+        // Duplicate this level so modifying it (here, or one level down)
+        // can never affect whoever it was shared with.
+        let fresh_frame = GlobalFrameAllocator
+            .allocate_frame()
+            .expect("out of physical frames for fork");
+        let src_ptr: *const PageTable = (offset + next_frame.start_address().as_u64()).as_ptr();
+        let dst_ptr: *mut PageTable = (offset + fresh_frame.start_address().as_u64()).as_mut_ptr();
+        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 1);
+        entry.set_frame(fresh_frame, entry.flags());
+
+        table_frame = fresh_frame;
+    }
+
+    // `table_frame` is now our own, independent page table (not aliased
+    // with the source for this address). Replace its leaf entry with a
+    // fresh frame holding a copy of the original page's contents.
+    let pt: &mut PageTable = &mut *((offset + table_frame.start_address().as_u64()).as_mut_ptr());
+    let leaf = &mut pt[addr.p1_index()];
+    let original_frame = leaf.frame().expect("fork_one_page: page not present");
+    let fresh_data_frame = GlobalFrameAllocator
+        .allocate_frame()
+        .expect("out of physical frames for fork");
+    let src_ptr: *const u8 = (offset + original_frame.start_address().as_u64()).as_ptr();
+    let dst_ptr: *mut u8 = (offset + fresh_data_frame.start_address().as_u64()).as_mut_ptr();
+    core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
+    leaf.set_frame(fresh_data_frame, leaf.flags());
 }
 
 /// Build a *read-only-in-spirit* `OffsetPageTable` over `pml4_frame`,

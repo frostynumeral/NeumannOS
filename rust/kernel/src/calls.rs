@@ -61,3 +61,40 @@ pub fn sys_setalarm(delay_ticks: u64) {
 /// re-exported here so callers of `sys_setalarm` don't need to reach into
 /// `crate::com` just to match against it.
 pub const SYN_ALARM: i32 = com::SYN_ALARM;
+
+/// `sys_fork()`: create a new task (`child_proc_nr`) whose address space
+/// starts as an independent copy of `src_proc`'s -- not just a structural
+/// clone that still aliases the parent's existing pages
+/// (`memory::new_address_space` alone), but a real, deep copy of each
+/// address in `private_pages`, so a write to one side is invisible to the
+/// other. Ported in spirit from `kernel/proc.c`'s `do_fork()` (called via
+/// `PM_PROC_NR`'s `SYS_FORK`), which duplicates the parent's memory map
+/// for the real thing; bundles what real MINIX splits across a kernel call
+/// (duplicate the memory) and a separate scheduling step (make it
+/// runnable), since nothing in this port needs them separated yet.
+///
+/// Simplification: real `fork()` gives the child an *exact* copy of the
+/// parent's entire address space and resumes both sides from the same
+/// point (the child's `fork()` call returns `0`, the parent's returns the
+/// child's pid) -- this port's tasks are built around a fixed
+/// `fn() -> !` entry point instead (see `crate::proc::spawn`), so the
+/// child starts at `entry`, not "wherever the caller was". `private_pages`
+/// also has to be passed explicitly rather than discovered by walking the
+/// parent's entire user-accessible range, since there's no per-process
+/// memory-map bookkeeping (`kernel/kernel.h`'s `struct mem_map`) to read
+/// it back out of yet.
+#[allow(clippy::too_many_arguments)]
+pub fn sys_fork(
+    src_proc: i32,
+    private_pages: &[VirtAddr],
+    child_proc_nr: i32,
+    name: &'static str,
+    entry: fn() -> !,
+    priority: u8,
+    quantum: i32,
+    preemptible: bool,
+) {
+    let (src_cr3, _) = proc::cr3_of(src_proc);
+    let child_pml4 = memory::fork_address_space(src_cr3, private_pages);
+    proc::spawn(child_proc_nr, name, entry, priority, quantum, preemptible, Some(child_pml4));
+}
