@@ -72,6 +72,15 @@ pub mod rts {
     pub const SLOT_FREE: u8 = 0x01;
     pub const SENDING: u8 = 0x04;
     pub const RECEIVING: u8 = 0x08;
+    /// Set by `crate::proc::kill` (a fault in a ring-3 task -- see
+    /// `crate::interrupts`) and never cleared: this slot is permanently
+    /// off every ready queue until a fresh `spawn()` overwrites it
+    /// wholesale. No real MINIX `rts_flags` bit is quite this either --
+    /// there, a dead process's slot is simply freed back to `SLOT_FREE`
+    /// once `RS`/`PM` finish tearing it down; this port has no teardown
+    /// step (no memory to free -- see `crate::rs`), so `DEAD` just marks
+    /// "never schedule this slot again" until it's respawned.
+    pub const DEAD: u8 = 0x10;
 }
 
 pub struct Proc {
@@ -552,6 +561,41 @@ pub fn current_proc_nr() -> i32 {
 /// Analogous to `kernel/clock.c`'s `get_uptime()`.
 pub fn uptime_ticks() -> u64 {
     with_scheduler(|sched| sched.ticks)
+}
+
+/// Permanently stop scheduling `proc_nr`: dequeue it (if it was ready) and
+/// mark it `DEAD` so `spawn()` is the only thing that can ever bring the
+/// slot back, then notify `RS` (`com::proc_died`) so it can decide
+/// whether to restart it (`crate::rs`). Called from `crate::interrupts`
+/// when a *ring-3* task takes a CPU exception -- the kernel's own stand-in
+/// for real MINIX converting a user-process fault into a fatal signal
+/// (`kernel/exception.c`) and `PM` reporting the exit to `RS`
+/// (`servers/rs/manager.c`), collapsed into one direct call since this
+/// port has neither signals nor `PM`'s exit path yet.
+///
+/// Idempotent: a process that's already `DEAD` (e.g. a second fault
+/// landing before `RS` gets around to restarting it -- shouldn't happen
+/// with how `crate::rs` is written, but costs nothing to guard against)
+/// is left alone rather than notifying `RS` twice.
+pub fn kill(proc_nr: i32, reason: &str) {
+    let idx = com::slot(proc_nr);
+    let name = with_scheduler(|sched| {
+        if sched.procs[idx].rts_flags & rts::DEAD != 0 {
+            return None;
+        }
+        if sched.procs[idx].rts_flags == 0 {
+            sched.dequeue(idx); // already repicks if idx was current/next_ptr
+        }
+        sched.procs[idx].rts_flags |= rts::DEAD;
+        if sched.current == idx {
+            sched.pick_proc();
+        }
+        sched.try_deliver_notification(com::slot(com::RS_PROC_NR), com::KERNEL, com::proc_died(proc_nr));
+        Some(sched.procs[idx].name)
+    });
+    if let Some(name) = name {
+        crate::serial_println!("[proc] {} (proc_nr {}) killed: {}", name, proc_nr, reason);
+    }
 }
 
 /// The `(PhysFrame, Cr3Flags)` `proc_nr`'s address space is rooted at --

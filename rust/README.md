@@ -15,8 +15,10 @@ it polling), and can `sys_fork` a real child process with a *deep-copied*,
 independent address space (verified by writing to the child's copy and
 confirming the parent's is untouched, not just aliasing the same physical
 memory), a real `fs` server backing genuine open/read/write requests
-with an in-memory filesystem over IPC (not a fixed-reply stand-in), and
-a second ring-3 task that runs a *real, statically linked ELF64 binary*
+with an in-memory filesystem over IPC (not a fixed-reply stand-in) and a
+real, if shallow, directory hierarchy on top (`mkdir`, and `open`
+enforcing the usual parent-directory rules), and a second ring-3 task
+that runs a *real, statically linked ELF64 binary*
 (parsed and mapped by this port's own minimal ELF loader, not
 hand-assembled bytes poked into a fixed page), a real `int 0x80` syscall
 gate with genuine call-number/register dispatch (call number in `rax`,
@@ -33,7 +35,12 @@ bars and buttons, no text, painted into a real linear framebuffer) and a
 real PS/2 keyboard driver (hardware IRQ1, scancodes read and translated to
 ASCII, asynchronously -- even waking the CPU from `IDLE`'s `hlt`), now
 connected to the panel: pressing a digit key highlights the matching
-button on screen, a real (if minimal) input-to-output loop — enough
+button on screen, a real (if minimal) input-to-output loop. `rs` is also
+now a real reincarnation server: a ring-3 task that deliberately crashes
+(`flaky`, its one instruction being `ud2`) is isolated -- the CPU
+exception it raises kills just that one process, not the whole
+machine -- and `rs` restarts it, up to a bounded number of times, exactly
+MINIX's signature self-healing behavior — enough
 to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
@@ -81,7 +88,13 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   from inside the timer interrupt handler -- is what makes preemption
   genuinely asynchronous rather than just cooperative; see its doc comment
   and `switch_to`'s for how saving `RFLAGS` per task is what makes calling
-  the same switch code from both places sound.
+  the same switch code from both places sound. `kill(proc_nr, reason)`
+  is the newest addition: dequeue `proc_nr` (if it was ready) and mark it
+  `rts::DEAD` -- permanently off every ready queue until a fresh `spawn()`
+  overwrites the slot -- then deliver a `com::proc_died` notification to
+  `RS` (`crate::rs`). Called from `crate::interrupts` when a ring-3 task
+  takes a CPU exception; this port's stand-in for real MINIX turning a
+  user-process fault into a signal and `PM` reporting the exit to `RS`.
 - `src/gdt.rs` — Global Descriptor Table and Task State Segment, ported from
   the segment/TSS setup in `kernel/protect.c`. Its only real job right now
   is giving the double-fault handler a dedicated stack (via the TSS's
@@ -90,9 +103,17 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
 - `src/interrupts.rs` — the IDT and CPU exception handlers, ported from the
   single vector-indexed dispatcher in `kernel/exception.c`. The C version
   turns a fault into a POSIX signal for a user process or panics for a
-  kernel task; with no user processes yet, every handler here takes the
-  "kernel task" branch (report and halt), except `#BP` (breakpoint), which
-  reports and returns — exercised by a self-test in `main.rs`.
+  kernel task; `#BP` (breakpoint) reports and returns (exercised by a
+  self-test in `main.rs`), and `#DE`/`#UD`/`#GP`/`#PF` (divide error,
+  invalid opcode, general protection fault, page fault) now go through
+  `recover_or_halt`: a fault in a *ring-3* task calls `crate::proc::kill`
+  and `reschedule` instead of halting (this port's stand-in for turning
+  the fault into a fatal signal for that one process), while a fault in
+  kernel-trusted code (RPL 0) still reports and halts the whole machine,
+  same as before -- a kernel bug means the kernel's own state might
+  already be corrupted, so continuing isn't safe even by "just" killing
+  one task. See `src/rs.rs` below for what actually exercises the
+  ring-3-recovery path.
 - `src/pic.rs` — 8259 PIC remap, ported from `kernel/i8259.c`'s
   `intr_init()`: moves hardware IRQs off the CPU-exception vector range and
   masks everything except IRQ0 (the timer), since nothing else has a
@@ -314,17 +335,37 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   first real input-to-output loop in this port (`crate::keyboard` driving
   a `crate::vga` redraw), not just proof the input side works in
   isolation.
+- `src/rs.rs` — a real reincarnation server, replacing `rs`'s busy-loop
+  stand-in. Ported in spirit from `servers/rs/manager.c`'s crash-handling
+  path -- real MINIX gets there via `PM` noticing a process's unexpected
+  exit and telling `RS`, which looks up that service's startup parameters
+  in its own table and re-execs it; this port has neither signals nor
+  `PM`'s exit path yet, so `crate::proc::kill` (called directly from a
+  ring-3 task's own exception handler) delivers a `com::proc_died`
+  notification straight to `RS`, and restart parameters are hardcoded
+  here rather than looked up in a real service table. `task` is `rs`'s
+  main loop: block in `ipc::receive(ANY)`, and if the notification decodes
+  (`com::proc_died_slot`) to `flaky` (this milestone's demo service --
+  see below), restart it, up to `MAX_RESTARTS` (`3`) times before giving
+  up -- a bounded retry policy, mirroring real `RS`'s own restart limits,
+  so a service that crashes instantly every time doesn't get restarted
+  forever. `flaky` is a real ring-3 task (its own address space, built by
+  the same `usermode::build_ring3_address_space` `crate::usermode`'s own
+  demo uses) whose entire code is `ud2` -- x86's guaranteed-`#UD` opcode --
+  so it crashes the instant it runs, deterministically, giving the
+  crash-isolation/restart pipeline something real (and reproducible) to
+  prove itself against.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
   and the heap, builds the ring-3 demo task's and the ELF-loaded task's
   address spaces and maps their pages into them, spawns the kernel tasks,
   programs the PIC/PIT and enables interrupts, and hands off to the
   scheduler. Spawns `IDLE` and `CLOCK` as real kernel tasks (same as the
-  boot image), a real `fs` server (see `src/fs.rs` above), and temporary
-  stand-in bodies in the `pm`/`rs`/`memory`/`driver`/`tty` process table
-  slots: `pm`/`fs` ping-pong three blocking messages back and forth
-  (exercising the rendezvous IPC), after which `fs` becomes a real file
-  server
+  boot image), a real `fs` server (see `src/fs.rs` above) and a real `rs`
+  server (see `src/rs.rs` above), and temporary stand-in bodies in the
+  `pm`/`memory`/`driver`/`tty` process table slots: `pm`/`fs` ping-pong
+  three blocking messages back and forth (exercising the rendezvous IPC),
+  after which `fs` becomes a real file server
   (`fs::InMemoryFs::serve`) and `pm` exercises it: opens a file, writes to
   it, reopens it fresh (a distinct file descriptor with its own cursor)
   and reads the bytes back, checking they round-trip, then reads once
@@ -332,11 +373,15 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `sys_fork`s the ring-3 task's code page into a brand new `init` process,
   then overwrites *just the child's copy* with a canary value and reads
   back both copies to prove they've genuinely diverged, not aliased the
-  same physical page -- and `rs`/`memory` each spin in a tight, CPU-bound
-  loop with no
-  `yield_now()`/IPC call anywhere in it (proving the timer interrupt truly
-  preempts a task asynchronously, mid-loop, rather than only ever
-  switching at cooperative checkpoints). `driver` runs the ring-3 demo task
+  same physical page -- and `memory` spins in a tight, CPU-bound loop with
+  no `yield_now()`/IPC call anywhere in it (proving the timer interrupt
+  truly preempts a task asynchronously, mid-loop, rather than only ever
+  switching at cooperative checkpoints). `rs` is spawned at a strictly
+  higher priority than `flaky` (see `src/rs.rs` above) specifically so it
+  reaches its first blocking `receive` before `flaky` ever gets a chance
+  to crash -- `proc::kill`'s notification to `RS` is fire-and-forget, like
+  every other notification in this port, so it would otherwise be a race.
+  `driver` runs the ring-3 demo task
   described above (three real `SYS_GET_UPTIME` syscalls, then
   `SYS_BLOCK_FOREVER`), and `tty` runs `elf::task_entry` (`elf::load`
   builds its address space in `kernel_main`, the same way `driver`'s is
@@ -360,9 +405,9 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `CLOCK` then dynamically spawns a brand new task (`log`) at runtime --
   with the scheduler already running other tasks, not during
   `kernel_main`'s boot-time setup -- proving `proc::spawn` works as a
-  genuine "start a new process now" primitive: the actual thing real `rs`
-  needs to bring services up on demand, which is why "the servers
-  themselves" (the next roadmap item) needed this first.
+  genuine "start a new process now" primitive: the exact thing real `rs`
+  needs to bring services up on demand, and now genuinely does, every
+  time it restarts `flaky` (`src/rs.rs` above).
   Also runs an isolation self-test right after building `driver`'s
   address space: translating the ring-3 code page's address through the
   *kernel's own* page table returns `None`, proving the mapping really is
@@ -611,6 +656,43 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   call from the interrupt handler, not a real input event delivered to a
   process the way a real driver would.
 
+### Known simplifications in `rs`/crash recovery
+
+- **Only ring-3 faults recover; only `flaky` has a restart policy.** A
+  fault in kernel-trusted code (any kernel task, or any of the stand-in
+  server bodies that still share the kernel's own address space) still
+  halts the whole machine (see `crate::interrupts`'s doc comment for why
+  that's still the right call). Of processes that *can* fault safely,
+  `rs::task` only knows how to restart `FLAKY_PROC_NR`; a real
+  `com::proc_died` for anything else is logged and then permanently
+  ignored -- there's no general "restart whatever died" policy, since
+  there's no real service table (`servers/rs/manager.c`'s `struct rproc`)
+  recording each service's startup parameters to restart *with*.
+  `rs::spawn_flaky`'s parameters are hardcoded for exactly this reason.
+- **The "a process died" notification is fire-and-forget**, like every
+  other notification in this port (see "known simplifications in the
+  scheduler/IPC/timer port" above) -- if `RS` isn't already blocked in
+  `receive` at the exact moment `proc::kill` runs, the notification is
+  silently dropped and the dead process is never restarted. `rs` is
+  spawned at a strictly higher priority than `flaky` specifically to
+  avoid this race (see the `src/main.rs` bullet above), rather than the
+  notification itself being reliable.
+- **No real teardown.** `kill` never frees a dead process's memory (its
+  page-table frames, if it had its own address space, are simply
+  leaked -- consistent with this port having no frame-freeing path
+  anywhere yet, see `crate::memory`) or otherwise cleans up IPC state
+  (`caller_q` links, in particular, aren't unwound) beyond removing it
+  from the ready queues. Fine for a demo that only ever kills a lone,
+  never-blocked-on-by-anyone-else ring-3 task; not fine for a real,
+  general "any process can die at any time" story.
+- **A crash is only ever `ud2`.** `flaky`'s address space and stack page
+  are correctly set up (so a *real* bug -- a bad pointer dereference, a
+  divide by zero -- would be caught exactly the same way, since
+  `recover_or_halt` doesn't care which exception vector fired), but
+  nothing in this port deliberately exercises `#PF`/`#GP`/`#DE` recovery
+  the way it exercises `#UD`; `ud2` was chosen purely because it's the
+  one fault the architecture guarantees regardless of memory layout.
+
 ## What's not implemented yet (roadmap)
 
 Roughly in the order the original kernel needs them:
@@ -673,23 +755,28 @@ Roughly in the order the original kernel needs them:
 11. **The servers themselves**: `pm` (process manager), `fs` (file system),
     `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
     order, matching `servers/` and `drivers/` in the C tree -- replacing the
-    temporary stand-ins in `main.rs`. Three slices done: `proc::spawn` is
+    temporary stand-ins in `main.rs`. Four slices done: `proc::spawn` is
     proven safe to call from an already-running task, not just
     `kernel_main`'s boot-time setup (`clock_task` dynamically spawns `log`
     at runtime); `sys_fork` gives a task a real way to create a child with
-    its own independent memory (`pm`'s `init` demo); and `fs` (`src/fs.rs`)
-    is now a real, in-memory file server answering genuine open/read/write
+    its own independent memory (`pm`'s `init` demo); `fs` (`src/fs.rs`) is
+    now a real, in-memory file server answering genuine open/read/write
     requests over IPC, not a fixed-reply stand-in (`pm`'s open/write/reopen/
     read/read-past-EOF demo), with a real (if shallow) directory hierarchy
     on top (`mkdir`, and `open` enforcing `ENOENT`/`ENOTDIR`/`EISDIR`/
-    `EEXIST` against a path's parent -- `pm`'s directory demo). Still
-    missing: a real `rs` that decides *what* to start and *why* (crash
-    detection/restart policy, `servers/rs/manager.c`), full POSIX
-    fork/exec semantics (the child resuming from the parent's exact call
-    site, and using the ELF loader above to load a program image instead
-    of starting at a fixed entry point), and `fs` growing `readdir`,
-    cross-address-space copies, and a real backing store (see "known
-    simplifications in `fs`" above) rather than a flat, in-memory,
+    `EEXIST` against a path's parent -- `pm`'s directory demo); and `rs`
+    (`src/rs.rs`) is now a real reincarnation server that detects a crashed
+    ring-3 process (`crate::proc::kill`, called from a CPU exception
+    handler) and restarts it, up to a bounded number of times, exactly
+    MINIX's signature self-healing behavior (`flaky`, a task that
+    deliberately crashes via `ud2` every time it runs). Still missing:
+    `rs` deciding *what* to start and *why* for services in general, not
+    just one hardcoded demo (a real service table, `servers/rs/manager.c`),
+    full POSIX fork/exec semantics (the child resuming from the parent's
+    exact call site, and using the ELF loader above to load a program
+    image instead of starting at a fixed entry point), and `fs` growing
+    `readdir`, cross-address-space copies, and a real backing store (see
+    "known simplifications in `fs`" above) rather than a flat, in-memory,
     single-address-space file/directory table.
 12. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 13. ~~**Real graphics output**~~ — started (`src/vga.rs`): VGA mode 13h
@@ -828,7 +915,13 @@ directory succeeds, and opening a path under an ordinary *file* (not a
 directory) fails with `ENOTDIR`, then `pm`
 `sys_fork`ing a real child (`init`) and proving its copy of the ring-3
 task's code page has genuinely diverged (a canary written to the child's
-copy doesn't show up in the original), `driver` (the hand-assembled demo)
+copy doesn't show up in the original), then `flaky` immediately crashing
+in ring 3 (`EXCEPTION: INVALID OPCODE`, `code_segment` reporting `Ring3`)
+and `[proc] flaky (crash demo) (proc_nr 8) killed: invalid opcode` --
+the kernel does *not* halt -- followed by `[rs] flaky (proc_nr 8) died --
+restarting it (attempt 1/3)`, then two more identical crash/restart
+cycles, and finally `[rs] flaky (proc_nr 8) died again -- already
+restarted it 3 times, giving up` after the fourth crash, `driver` (the hand-assembled demo)
 and `tty` (a real ELF64 binary loaded by `crate::elf`) each making real,
 register-dispatched syscalls through `crate::syscall` --
 `[syscall] proc P: SYS_GET_UPTIME -> N` a few times each,
@@ -851,8 +944,9 @@ binary's own code genuinely ran, not just that it trapped the right
 number of times), then dynamically spawning a brand new
 `log` task at runtime (watch it appear interleaved with `memory`'s output,
 proof the scheduler was already running other tasks when it showed up),
-the `rs`/`memory` demo tasks trading off every quantum purely because the
-timer forces it (asynchronous preemption -- watch `memory`'s counter
-resume from exactly where it left off after `rs` gets a turn), and finally
+`memory`'s demo task spinning through many quanta purely because the
+timer forces it to keep yielding and resuming (asynchronous preemption --
+watch its counter resume from exactly where it left off every time), and
+finally
 `IDLE` reporting that it's halting (with the accumulated tick count) once
 everything else has blocked.

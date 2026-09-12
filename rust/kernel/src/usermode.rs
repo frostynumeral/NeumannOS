@@ -31,7 +31,7 @@ use x86_64::VirtAddr;
 /// `allocator::HEAP_START` for the same reason as before.
 pub const USER_CODE_ADDR: u64 = 0x_5555_5555_0000;
 pub const USER_STACK_ADDR: u64 = 0x_6666_6666_0000;
-const PAGE_SIZE: u64 = 4096;
+pub(crate) const PAGE_SIZE: u64 = 4096;
 
 /// Three real syscalls -- `SYS_GET_UPTIME` (`crate::syscall`) three times,
 /// then `SYS_BLOCK_FOREVER` once -- hand-assembled a straight-line
@@ -52,66 +52,88 @@ pub const USER_CODE: [u8; 28] = [
     0xB8, syscall::SYS_BLOCK_FOREVER as u8, 0x00, 0x00, 0x00, 0xCD, 0x80, // mov eax, SYS_BLOCK_FOREVER; int 0x80
 ];
 
-/// Build a new address space (`crate::memory::new_address_space`) for the
-/// demo task and map its code and stack pages into *that* table (with
-/// `USER_ACCESSIBLE`, without which the CPU refuses to execute or touch
-/// them at CPL 3 at all -- a `#PF`, not a `#GP`) -- never into the
-/// kernel's own mapper, which is the whole point of this slice. Returns
-/// the new address space's top-level page table frame, for
-/// `crate::proc::spawn` to record as this task's `CR3`. Called once from
-/// `kernel_main`, before any tasks are spawned.
-pub fn create_address_space(physical_memory_offset: VirtAddr) -> PhysFrame {
+/// Build a new address space (`crate::memory::new_address_space`) for a
+/// ring-3 task and map one code page (containing `code`) and one stack
+/// page into *that* table (with `USER_ACCESSIBLE`, without which the CPU
+/// refuses to execute or touch them at CPL 3 at all -- a `#PF`, not a
+/// `#GP`) -- never into the kernel's own mapper, which is the whole point
+/// of this module. Returns the new address space's top-level page table
+/// frame, for `crate::proc::spawn` to record as this task's `CR3`.
+/// Shared by `create_address_space` (this module's own demo) and
+/// `crate::rs`'s `flaky` (a second, independent ring-3 task at different
+/// addresses) so the address-space-building logic only needs to be
+/// correct once.
+pub(crate) fn build_ring3_address_space(
+    physical_memory_offset: VirtAddr,
+    code_addr: u64,
+    code: &[u8],
+    stack_addr: u64,
+) -> PhysFrame {
     let (pml4_frame, mut mapper) = memory::new_address_space(physical_memory_offset);
     let flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
     let mut frame_allocator = GlobalFrameAllocator;
 
-    let code_page = Page::containing_address(VirtAddr::new(USER_CODE_ADDR));
+    let code_page = Page::containing_address(VirtAddr::new(code_addr));
     let code_frame = frame_allocator
         .allocate_frame()
-        .expect("out of physical frames for the user-mode demo's code page");
+        .expect("out of physical frames for a ring-3 task's code page");
     unsafe {
         // This address space isn't active yet (its frame isn't loaded
         // into CR3), so the mapping itself doesn't need a TLB flush
         // (`.ignore()` rather than `.flush()`); and writing the code
         // bytes has to go through the physical-memory window rather than
-        // `USER_CODE_ADDR` directly, since that virtual address isn't
-        // mapped in the *currently active* (kernel's) table at all.
+        // `code_addr` directly, since that virtual address isn't mapped
+        // in the *currently active* (kernel's) table at all.
         mapper
             .map_to(code_page, code_frame, flags, &mut frame_allocator)
-            .expect("failed to map the user-mode demo's code page")
+            .expect("failed to map a ring-3 task's code page")
             .ignore();
         let code_via_phys_offset =
             (physical_memory_offset + code_frame.start_address().as_u64()).as_mut_ptr::<u8>();
-        core::ptr::copy_nonoverlapping(USER_CODE.as_ptr(), code_via_phys_offset, USER_CODE.len());
+        core::ptr::copy_nonoverlapping(code.as_ptr(), code_via_phys_offset, code.len());
     }
 
-    let stack_page = Page::containing_address(VirtAddr::new(USER_STACK_ADDR));
+    let stack_page = Page::containing_address(VirtAddr::new(stack_addr));
     let stack_frame = frame_allocator
         .allocate_frame()
-        .expect("out of physical frames for the user-mode demo's stack page");
+        .expect("out of physical frames for a ring-3 task's stack page");
     unsafe {
         mapper
             .map_to(stack_page, stack_frame, flags, &mut frame_allocator)
-            .expect("failed to map the user-mode demo's stack page")
+            .expect("failed to map a ring-3 task's stack page")
             .ignore();
     }
 
     pml4_frame
 }
 
-/// A `crate::proc` task body: jump to ring 3 and run `USER_CODE` there.
-/// Unlike the first slice's `demo`, this never "returns" to Rust code at
-/// this call site in the ordinary sense -- from here on, this task's
-/// kernel-mode moments are each a fresh trap entry (`SYSCALL_VECTOR`,
-/// or the timer interrupting it mid-`iretq`-loop), not a resumption of
-/// this function. That's fine: like every other task body in `main.rs`,
-/// this one is `fn() -> !` and is only ever reached once, via
-/// `proc::spawn`'s trampoline.
-pub fn ring3_task_entry() -> ! {
+/// Build this module's own demo address space (`USER_CODE` at
+/// `USER_CODE_ADDR`). Called once from `kernel_main`, before any tasks
+/// are spawned.
+pub fn create_address_space(physical_memory_offset: VirtAddr) -> PhysFrame {
+    build_ring3_address_space(physical_memory_offset, USER_CODE_ADDR, &USER_CODE, USER_STACK_ADDR)
+}
+
+/// A `crate::proc` task body: jump to ring 3 at `entry_addr` on a stack
+/// topped at `stack_top`. Shared by `ring3_task_entry` (this module's own
+/// demo) and `crate::rs`'s `flaky_task_entry`. Unlike the first slice's
+/// one-shot `demo`, this never "returns" to Rust code at this call site
+/// in the ordinary sense -- from here on, this task's kernel-mode moments
+/// are each a fresh trap entry (`SYSCALL_VECTOR`, a CPU exception, or the
+/// timer interrupting it mid-`iretq`-loop), not a resumption of this
+/// function. That's fine: like every other task body in `main.rs`, a
+/// caller of this is only ever reached once, via `proc::spawn`'s
+/// trampoline.
+pub(crate) fn jump_to_ring3(entry_addr: u64, stack_top: u64) -> ! {
     let (code_sel, data_sel) = gdt::user_selectors();
-    let stack_top = USER_STACK_ADDR + PAGE_SIZE;
-    unsafe { enter_ring3(USER_CODE_ADDR, stack_top, code_sel.0 as u64, data_sel.0 as u64) }
+    unsafe { enter_ring3(entry_addr, stack_top, code_sel.0 as u64, data_sel.0 as u64) }
+}
+
+/// This module's own demo task body: jump to ring 3 and run `USER_CODE`
+/// there.
+pub fn ring3_task_entry() -> ! {
+    jump_to_ring3(USER_CODE_ADDR, USER_STACK_ADDR + PAGE_SIZE)
 }
 
 /// Build a ring-3 `iretq` frame and jump to `entry` at CPL 3 on
