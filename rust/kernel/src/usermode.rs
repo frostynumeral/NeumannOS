@@ -111,9 +111,11 @@ pub fn ring3_task_entry() -> ! {
 /// unlike the first slice's demo, which deliberately left them off): the
 /// whole point of this slice is proving a task can safely be
 /// asynchronously preempted while in ring 3, which needs the timer to
-/// actually be able to fire during it.
+/// actually be able to fire during it. `pub(crate)` so `crate::elf` can
+/// reuse this same trampoline for a real, loaded ELF binary's entry point
+/// rather than duplicating it.
 #[unsafe(naked)]
-unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64, code_sel: u64, data_sel: u64) -> ! {
+pub(crate) unsafe extern "C" fn enter_ring3(entry: u64, stack_top: u64, code_sel: u64, data_sel: u64) -> ! {
     core::arch::naked_asm!(
         // Build the iretq frame, low address (popped first) to high:
         // RIP, CS, RFLAGS, RSP, SS -- so push in the reverse order.

@@ -14,9 +14,12 @@ its first real kernel calls (a genuine cross-address-space `sys_vircopy`;
 it polling), and can `sys_fork` a real child process with a *deep-copied*,
 independent address space (verified by writing to the child's copy and
 confirming the parent's is untouched, not just aliasing the same physical
-memory), and now a real `fs` server backing genuine open/read/write
-requests with an in-memory filesystem over IPC (not a fixed-reply
-stand-in) — enough to build the rest of the system on top of.
+memory), a real `fs` server backing genuine open/read/write requests
+with an in-memory filesystem over IPC (not a fixed-reply stand-in), and
+a second ring-3 task that runs a *real, statically linked ELF64 binary*
+(parsed and mapped by this port's own minimal ELF loader, not
+hand-assembled bytes poked into a fixed page) — enough to build the rest
+of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -181,15 +184,34 @@ external contract.
   `send_receive`) that any task can call to talk to it, mirroring
   `src/calls.rs`'s kernel-call wrappers in shape even though these cross
   a real IPC round trip rather than a direct function call.
+- `src/elf.rs` — a minimal ELF64 loader. No direct MINIX C equivalent:
+  2005-era MINIX 3.1 loads a program via `execve`'s a.out-format path
+  (`servers/pm/exec.c`), not ELF; this is a step up from
+  `crate::usermode`'s demo (which pokes a hand-assembled four-byte loop
+  directly into one fixed page), loading a real, statically linked
+  binary (`user/hello.elf`, built from `user/hello.s` -- see that file's
+  header for the exact `as`/`ld` invocation, since there's no cross
+  toolchain wired into this build to assemble it automatically) the way
+  a real loader must: `load` parses the ELF64 header and program header
+  table, maps every `PT_LOAD` segment into a fresh address space
+  (`memory::new_address_space`) at the addresses and with the
+  read/write/execute permissions the file itself specifies (not one
+  hardcoded page), and zero-fills each segment's `p_memsz - p_filesz`
+  tail (real BSS semantics) rather than assuming the file image and the
+  mapped size are the same thing. `task_entry` reuses
+  `usermode::enter_ring3` to jump to the parsed `e_entry` (not a fixed
+  constant) on a mapped stack.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
-  and the heap, builds the ring-3 demo task's address space and maps its
-  pages into it, spawns the kernel tasks, programs the PIC/PIT and enables
-  interrupts, and hands off to the scheduler. Spawns `IDLE` and `CLOCK` as
-  real kernel tasks (same as the boot image), plus temporary stand-in
-  bodies in the `pm`/`fs`/`rs`/`memory`/`driver` process table slots:
-  `pm`/`fs` ping-pong three blocking messages back and forth (exercising
-  the rendezvous IPC), after which `fs` becomes a real file server
+  and the heap, builds the ring-3 demo task's and the ELF-loaded task's
+  address spaces and maps their pages into them, spawns the kernel tasks,
+  programs the PIC/PIT and enables interrupts, and hands off to the
+  scheduler. Spawns `IDLE` and `CLOCK` as real kernel tasks (same as the
+  boot image), a real `fs` server (see `src/fs.rs` above), and temporary
+  stand-in bodies in the `pm`/`rs`/`memory`/`driver`/`tty` process table
+  slots: `pm`/`fs` ping-pong three blocking messages back and forth
+  (exercising the rendezvous IPC), after which `fs` becomes a real file
+  server
   (`fs::InMemoryFs::serve`) and `pm` exercises it: opens a file, writes to
   it, reopens it fresh (a distinct file descriptor with its own cursor)
   and reads the bytes back, checking they round-trip, then reads once
@@ -202,23 +224,30 @@ external contract.
   `yield_now()`/IPC call anywhere in it (proving the timer interrupt truly
   preempts a task asynchronously, mid-loop, rather than only ever
   switching at cooperative checkpoints). `driver` runs the ring-3 demo task
-  described above -- the only one of these with its own address space
-  rather than sharing the kernel's, aside from `pm`'s forked child.
-  `CLOCK` now genuinely
+  described above, and `tty` runs `elf::task_entry` (`elf::load` builds
+  its address space in `kernel_main`, the same way `driver`'s is built) --
+  a real ELF64 binary (`user/hello.elf`) executing its own `incl`/`int
+  0x80` loop in ring 3, its five round trips counted independently of
+  `driver`'s. `CLOCK` now genuinely
   calls `sys_setalarm` and blocks in `receive` -- exactly real MINIX's
   `while (TRUE) receive(HARDWARE, &m)` -- instead of polling
-  `uptime_ticks()`, and also exercises `sys_vircopy` by reading the
-  ring-3 task's code page back out of *its* address space into a local
-  buffer, proving the copy really goes through a different process's page
-  table (`CLOCK` itself never leaves the kernel's own address space).
+  `uptime_ticks()`, and also exercises `sys_vircopy` twice: reading the
+  ring-3 demo task's code page back out of *its* address space into a
+  local buffer, and, after `tty` has run its five iterations and blocked,
+  reading `tty`'s own `.data` counter back out of *its* address space and
+  checking it reads `5` -- proving both that the copy really goes through
+  a different process's page table (`CLOCK` itself never leaves the
+  kernel's own address space) and that the loaded ELF binary's own code
+  genuinely executed and wrote through to physical memory, not just that
+  it trapped the expected number of times.
   `CLOCK` then dynamically spawns a brand new task (`log`) at runtime --
   with the scheduler already running other tasks, not during
   `kernel_main`'s boot-time setup -- proving `proc::spawn` works as a
   genuine "start a new process now" primitive: the actual thing real `rs`
   needs to bring services up on demand, which is why "the servers
   themselves" (the next roadmap item) needed this first.
-  Also runs an isolation self-test right after building that address
-  space: translating the ring-3 code page's address through the
+  Also runs an isolation self-test right after building `driver`'s
+  address space: translating the ring-3 code page's address through the
   *kernel's own* page table returns `None`, proving the mapping really is
   private and not merely inaccessible-by-privilege-level.
 
@@ -276,17 +305,18 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   caller for good) regardless of which register values the caller set up;
   there's no argument-passing convention or call-number dispatch yet,
   since there's nothing to call. The fixed iteration count
-  (`interrupts::SYSCALL_COUNT`) exists purely so `usermode::USER_CODE`'s
-  hand-assembly can stay a trivial two-instruction loop instead of needing
-  a counter encoded by hand.
-- **Only two tasks have their own address space** (the ring-3 demo and
-  its `sys_fork`ed child); every other task still shares the kernel's.
-  That's deliberate for now -- kernel tasks (`IDLE`, `CLOCK`) and the
-  `pm`/`fs`/`rs`/`memory` stand-ins all run kernel-trusted code today, so
-  there's nothing to isolate them *from* yet -- but it means there's no
-  isolation between, say, `pm` and `fs`'s demo bodies either. That only
-  starts to matter once real, mutually distrusting user-mode servers
-  exist.
+  (`interrupts::SYSCALL_COUNTS`, one per process slot so `driver` and
+  `tty` -- see `src/elf.rs` -- don't race to the same threshold) exists
+  purely so a demo user program's code can stay a trivial loop instead of
+  needing a counter encoded by hand.
+- **Only three tasks have their own address space** (the ring-3 demo, its
+  `sys_fork`ed child, and the ELF-loaded `tty` task); every other task
+  still shares the kernel's. That's deliberate for now -- kernel tasks
+  (`IDLE`, `CLOCK`) and the `pm`/`rs`/`memory` stand-ins all run
+  kernel-trusted code today, so there's nothing to isolate them *from*
+  yet -- but it means there's no isolation between, say, `pm` and `fs`
+  either. That only starts to matter once real, mutually distrusting
+  user-mode servers exist.
 - **A new address space is a full clone of the kernel's page table**,
   not a minimal one built from scratch. This is simple and correct (every
   kernel mapping the task might need -- code, the heap, the
@@ -360,6 +390,30 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   descriptor" and "unrecognized request" both; real `fs` distinguishes
   many more `errno` values (`ENOENT`, `EACCES`, `ENOSPC`, ...).
 
+### Known simplifications in the ELF loader
+
+- **The binary is checked in pre-built, not assembled by this build.**
+  `user/hello.elf` is produced by a manual `as`/`ld` invocation (see
+  `user/hello.s`'s header comment), not a build-script step -- there's no
+  cross toolchain wired into `cargo build` yet to assemble a fresh user
+  program automatically (see the libc-equivalent roadmap item).
+- **No dynamic linking, no `argv`/`envp`/auxv, no `PT_INTERP`.** `load`
+  only understands `PT_LOAD` segments; a real `execve` also sets up the
+  initial stack contents a libc's `_start` expects (argument/environment
+  vectors, the auxiliary vector) and can invoke a dynamic linker named by
+  a `PT_INTERP` segment. `user/hello.s` is freestanding and asks for
+  none of that, so this hasn't mattered yet.
+- **One fixed binary, one fixed stack address.** `elf::load` always loads
+  `HELLO_ELF` at a hardcoded `STACK_ADDR`, the same way `usermode.rs`'s
+  demo uses fixed constants -- fine for this port's one ELF task, but not
+  a general "load any binary, anywhere" API yet (no ASLR, no picking an
+  unused address range).
+- **No `PT_LOAD` overlap/validation.** A real loader also has to guard
+  against a hostile or malformed file (overlapping segments, addresses
+  that alias kernel-reserved ranges, `p_align` mismatches); `load` trusts
+  `user/hello.elf` is well-formed, since this port only ever loads a
+  binary it built itself.
+
 ## What's not implemented yet (roadmap)
 
 Roughly in the order the original kernel needs them:
@@ -406,7 +460,21 @@ Roughly in the order the original kernel needs them:
    (verified with a canary write). See "known simplifications" above for
    what's not implemented yet (real call dispatch, `sys_umap`, more of
    `kernel/system/do_*.c`, full POSIX fork continuation semantics).
-10. **The servers themselves**: `pm` (process manager), `fs` (file system),
+10. ~~**A minimal ELF loader**~~ — done (`src/elf.rs`). Parses a real,
+    statically linked ELF64 binary (`user/hello.elf`) and maps its
+    `PT_LOAD` segments into a fresh address space at their own specified
+    addresses and permissions (not one hand-placed page), zero-filling
+    BSS; a second ring-3 task (`tty`) runs it, its five `int 0x80` round
+    trips counted independently of `driver`'s own demo (see "known
+    simplifications in the ring-3 task" above -- the syscall counter is
+    now per-process), and `CLOCK` reads its `.data` counter back via
+    `sys_vircopy` afterward to confirm the loaded code genuinely executed
+    and wrote through to physical memory, not just that it trapped in the
+    expected number of times. See "known simplifications in the ELF
+    loader" below for what's missing (no dynamic linking, no `argv`/
+    `envp`, the binary is checked in pre-built rather than assembled by
+    this build).
+11. **The servers themselves**: `pm` (process manager), `fs` (file system),
     `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
     order, matching `servers/` and `drivers/` in the C tree -- replacing the
     temporary stand-ins in `main.rs`. Three slices done: `proc::spawn` is
@@ -419,12 +487,12 @@ Roughly in the order the original kernel needs them:
     read/read-past-EOF demo). Still missing: a real `rs` that decides
     *what* to start and *why* (crash detection/restart policy,
     `servers/rs/manager.c`), full POSIX fork/exec semantics (the child
-    resuming from the parent's exact call site, and loading a program
-    image rather than starting at a fixed entry point), and `fs` growing
-    a real directory hierarchy, cross-address-space copies, and a backing
-    store (see "known simplifications in `fs`" above) rather than a flat,
-    in-memory, single-address-space file table.
-11. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
+    resuming from the parent's exact call site, and using the ELF loader
+    above to load a program image instead of starting at a fixed entry
+    point), and `fs` growing a real directory hierarchy, cross-address-space
+    copies, and a backing store (see "known simplifications in `fs`" above)
+    rather than a flat, in-memory, single-address-space file table.
+12. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 
 ## Building
 
@@ -479,14 +547,19 @@ in-memory storage, not a fixed echo), and reads once more past end of
 file (checking that returns `0` instead of repeating data), then `pm`
 `sys_fork`ing a real child (`init`) and proving its copy of the ring-3
 task's code page has genuinely diverged (a canary written to the child's
-copy doesn't show up in the original), five ring-3 round
-trips (`[syscall] iteration N from Ring3 ...`, printed from inside the
-syscall handler using the CPU-captured selector -- not something the
-kernel side merely claims) before that task blocks for good, `CLOCK`
-waking from a real `sys_setalarm`-driven `SYN_ALARM` notification and then
-using `sys_vircopy` to read the ring-3 task's code bytes back out of its
-own address space (proving a genuine cross-address-space copy, since
-`CLOCK` never leaves the kernel's), then dynamically spawning a brand new
+copy doesn't show up in the original), five ring-3 round trips each from
+`driver` (the hand-assembled demo) and `tty` (a real ELF64 binary loaded
+by `crate::elf`) (`[syscall] iteration N from Ring3 ... proc P`, printed
+from inside the syscall handler using the CPU-captured selector -- not
+something the kernel side merely claims, and counted separately per
+process) before each task blocks for good, `CLOCK` waking from a real
+`sys_setalarm`-driven `SYN_ALARM` notification and then using
+`sys_vircopy` twice: once to read the ring-3 demo task's code bytes back
+out of its own address space (proving a genuine cross-address-space copy,
+since `CLOCK` never leaves the kernel's), and once to read `tty`'s `.data`
+counter back out and confirm it reads `5` (proving the loaded ELF
+binary's own code genuinely ran, not just that it trapped the right
+number of times), then dynamically spawning a brand new
 `log` task at runtime (watch it appear interleaved with `memory`'s output,
 proof the scheduler was already running other tasks when it showed up),
 the `rs`/`memory` demo tasks trading off every quantum purely because the
