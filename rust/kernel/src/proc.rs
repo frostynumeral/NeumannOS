@@ -11,19 +11,30 @@
 //! One thing *is* different from the C kernel: there, `enqueue`/`dequeue`
 //! only ever update `next_ptr`, and the actual context switch happens
 //! unconditionally whenever the kernel returns from a trap or interrupt
-//! (the `restart()` assembly in `kernel/mpx386.s` compares `next_ptr` against
-//! `proc_ptr` on every single trap return). This port's timer interrupt
-//! handler (`clock_tick`, driven by `crate::pit`/`crate::pic`) *does* now
-//! decrement the running task's quantum and reorder the ready queues on
-//! real hardware ticks, same as `kernel/clock.c`'s `clock_handler` -- but it
-//! stops there. It does not itself force a switch, because doing so would
-//! require resuming the interrupted task later via a full trap-frame
-//! `iretq` rather than the plain `ret` `switch_to` uses, which only works
-//! for a task that is voluntarily blocked mid-function-call. So the actual
-//! switch still only happens the next time *some* task calls `reschedule()`
-//! by blocking in IPC or calling `yield_now()` -- a task that never does
-//! either would keep running past a quantum expiry uninterrupted. Closing
-//! that gap is the next step after this milestone (see `rust/README.md`).
+//! (the `restart()` assembly in `kernel/mpx386.s` compares `next_ptr`
+//! against `proc_ptr` on every single trap return). This port has no
+//! single, central "trap return" choke point to hook that check into, so
+//! instead every place that can change `next_ptr` -- `mini_send`,
+//! `mini_receive`, `mini_notify`, `yield_now`, and the timer interrupt
+//! handler's `clock_tick` -- calls `reschedule()` itself right afterwards,
+//! which performs the switch immediately if `next_ptr` now differs from
+//! the running task, or does nothing otherwise. Calling it unconditionally
+//! after every one of those (not just the ones where the *caller* blocks)
+//! means a task that just woke a higher-priority peer is preempted right
+//! away, same as real MINIX's next trap return would.
+//!
+//! Critically, `reschedule()` (via `switch_to`) is called both from
+//! ordinary task code *and* from inside the timer interrupt handler --
+//! true asynchronous preemption, not just cooperative handoffs. Making
+//! that safe took one addition beyond what a purely cooperative scheduler
+//! needs: `switch_to` saves and restores `RFLAGS` (in particular the
+//! interrupt flag) per task, alongside the callee-saved registers. Without
+//! that, a switch triggered from inside the interrupt handler (where
+//! interrupts are necessarily off) would leave interrupts looking
+//! permanently disabled to whichever task got switched to -- restoring the
+//! flags each task actually had at its own last suspension point is what
+//! keeps the two switching paths (voluntary and interrupt-driven)
+//! consistent with each other. See `switch_to`'s doc comment.
 //!
 //! Because a hardware interrupt can now land in the middle of any of the
 //! functions below, every one of them that touches `SCHEDULER` does so with
@@ -280,21 +291,23 @@ pub fn spawn(
 ) {
     let idx = com::slot(proc_nr);
     // Build the initial stack frame that `switch_to`'s epilogue will pop:
-    // six callee-saved registers (unused, so zeroed) followed by a return
-    // address, which `ret` will jump to -- landing in `trampoline` on this
-    // task's own stack for the very first time it runs.
+    // six callee-saved registers (unused, so zeroed) and an initial RFLAGS
+    // (interrupts enabled), followed by a return address, which `ret` will
+    // jump to -- landing in `trampoline` on this task's own stack for the
+    // very first time it runs.
     let rsp = unsafe {
         let stack = ptr::addr_of_mut!(STACKS.0[idx]);
         let top = (stack as *mut u8).add(STACK_SIZE);
         let frame = (top as usize & !0xf) as *mut u64; // 16-byte align
-        let frame = frame.sub(7);
+        let frame = frame.sub(8);
         frame.add(0).write(0); // r15
         frame.add(1).write(0); // r14
         frame.add(2).write(0); // r13
         frame.add(3).write(0); // r12
         frame.add(4).write(0); // rbp
         frame.add(5).write(0); // rbx
-        frame.add(6).write(trampoline as *const () as u64);
+        frame.add(6).write(0x202); // rflags: reserved bit 1 + IF (interrupts enabled)
+        frame.add(7).write(trampoline as *const () as u64);
         frame as u64
     };
 
@@ -338,14 +351,23 @@ extern "C" fn trampoline() -> ! {
 
 /// Low-level context switch: save the six callee-saved registers (the
 /// caller-saved ones are, by the C calling convention, already dead by the
-/// time a function call happens) and the current `rsp` into `*prev_rsp`,
-/// then load `next_rsp` and pop the next task's saved registers. Ported in
-/// spirit from `restart()`/`save()` in `kernel/mpx386.s`, minus the
-/// trap-frame handling those deal with and we don't need yet (no user mode,
-/// no interrupts landing mid-task).
+/// time a function call happens), RFLAGS, and the current `rsp` into
+/// `*prev_rsp`, then load `next_rsp` and restore the next task's saved
+/// registers and flags. Ported in spirit from `restart()`/`save()` in
+/// `kernel/mpx386.s`, minus the trap-frame handling those deal with and we
+/// don't need (no user mode yet -- see `rust/README.md`).
+///
+/// Saving RFLAGS is what makes it sound to call this (via `reschedule`)
+/// from *inside* the timer interrupt handler, not just from ordinary task
+/// code: entering an interrupt handler through an interrupt gate clears
+/// the interrupt flag, and without saving/restoring it per task here, that
+/// disabled state would leak into whichever task got switched to and stay
+/// disabled system-wide -- interrupts, having disabled themselves, would
+/// never fire again to re-enable anything.
 #[unsafe(naked)]
 unsafe extern "C" fn switch_to(prev_rsp: *mut u64, next_rsp: u64) {
     core::arch::naked_asm!(
+        "pushfq",
         "push rbx",
         "push rbp",
         "push r12",
@@ -360,15 +382,18 @@ unsafe extern "C" fn switch_to(prev_rsp: *mut u64, next_rsp: u64) {
         "pop r12",
         "pop rbp",
         "pop rbx",
+        "popfq",
         "ret",
     )
 }
 
 /// Switch away from the current task if a higher-priority (or, at equal
 /// priority, differently-queued) one is now runnable. Called at the end of
-/// every blocking IPC operation in `crate::ipc`, standing in for the
-/// unconditional "did `next_ptr` change?" check that real MINIX makes on
-/// every single trap return (see the module doc comment).
+/// every IPC operation and from the timer interrupt handler, standing in
+/// for the unconditional "did `next_ptr` change?" check that real MINIX
+/// makes on every single trap return (see the module doc comment). Safe to
+/// call from either ordinary task code or from inside an interrupt
+/// handler; see `switch_to`'s doc comment for why.
 pub fn reschedule() {
     let switch: Option<(*mut u64, u64)> = with_scheduler(|sched| {
         let next = match sched.next_ptr {
@@ -402,12 +427,11 @@ pub fn uptime_ticks() -> u64 {
 }
 
 /// Called from the timer interrupt handler (`crate::interrupts`) on every
-/// PIT tick. Ported from `kernel/clock.c`'s `clock_handler` plus the
-/// quantum-expiry half of `do_clocktick`: advance the uptime counter, and
-/// if the running task is preemptible, charge it a tick and, once its
-/// quantum is used up, reorder it to the back of its ready queue. See the
-/// module doc comment for what this does *not* yet do (force an immediate
-/// switch away from the interrupted task).
+/// PIT tick, immediately followed there by `reschedule()`. Ported from
+/// `kernel/clock.c`'s `clock_handler` plus the quantum-expiry half of
+/// `do_clocktick`: advance the uptime counter, and if the running task is
+/// preemptible, charge it a tick and, once its quantum is used up, reorder
+/// it to the back of its ready queue -- for `reschedule()` to then act on.
 pub fn clock_tick() {
     with_scheduler(|sched| {
         sched.ticks += 1;
@@ -441,10 +465,14 @@ pub fn yield_now() {
 
 /// `mini_send()`: send `m` from the running task to `dst`. Ported from
 /// `kernel/proc.c`. If `dst` is already blocked in `mini_receive` waiting
-/// for this message, it's delivered immediately and this returns without
-/// switching away. Otherwise the caller blocks (dequeuing itself and
-/// queuing onto `dst`'s `caller_q`) and does not return until `dst` (or a
-/// third party, via `mini_receive`) has picked the message up.
+/// for this message, it's delivered immediately; otherwise the caller
+/// blocks (dequeuing itself and queuing onto `dst`'s `caller_q`) until
+/// `dst` (or a third party, via `mini_receive`) has picked the message up.
+/// Either way, `reschedule()` gets a chance to run at the end: if the
+/// caller itself just blocked, this is what actually switches away; if
+/// delivery was immediate and woke a *higher-priority* `dst`, this
+/// preempts to it right away instead of leaving it queued until some
+/// later, unrelated reschedule point.
 ///
 /// Simplification: the C version detects a SEND/SEND cycle and returns
 /// `ELOCKED` so the caller can recover. Nothing here has a way to report
@@ -454,7 +482,7 @@ pub fn yield_now() {
 /// trigger this; revisit once real servers can.
 pub fn mini_send(dst: i32, m: &Message) {
     let dst_idx = com::slot(dst);
-    let blocked = with_scheduler(|sched| {
+    with_scheduler(|sched| {
         let caller = sched.current;
 
         let mut xp = dst_idx;
@@ -481,7 +509,7 @@ pub fn mini_send(dst: i32, m: &Message) {
             if sched.procs[dst_idx].rts_flags == 0 {
                 sched.enqueue(dst_idx);
             }
-            return false;
+            return;
         }
 
         // Destination isn't waiting for this. Block: dequeue the caller,
@@ -503,13 +531,10 @@ pub fn mini_send(dst: i32, m: &Message) {
                 sched.procs[cur].q_link = Some(caller);
             }
         }
-        true
     });
-    if blocked {
-        // When this returns, some later mini_receive/mini_notify has
-        // already copied `*m` out and cleared our SENDING flag.
-        reschedule();
-    }
+    // If we just blocked, this is what switches away; if delivery was
+    // immediate, this only switches if it woke a higher-priority task.
+    reschedule();
 }
 
 /// `mini_receive()`: get a message addressed (or, for `ANY`, addressed to
@@ -565,19 +590,22 @@ pub fn mini_receive(src: i32) -> Message {
         sched.procs[caller].rts_flags |= rts::RECEIVING;
         Outcome::Blocked
     });
+    // Same reasoning as mini_send: switches away if we just blocked, or
+    // preempts to a newly-woken higher-priority sender if delivery was
+    // immediate, or does nothing.
+    reschedule();
     match outcome {
         Outcome::Ready(msg) => msg,
-        Outcome::Blocked => {
-            reschedule();
-            placeholder
-        }
+        Outcome::Blocked => placeholder,
     }
 }
 
 /// `mini_notify()`: a lightweight, fire-and-forget send used for kernel
 /// events (alarms, interrupts). Ported from `kernel/proc.c`; see
 /// `mini_receive`'s doc comment for the one respect (no pending-bitmap)
-/// in which this port is simpler than the original.
+/// in which this port is simpler than the original. The caller never
+/// blocks here, but still calls `reschedule()` afterwards in case this
+/// just woke a higher-priority task -- same reasoning as `mini_send`.
 pub fn mini_notify(dst: i32, m_type: i32) {
     let dst_idx = com::slot(dst);
     with_scheduler(|sched| {
@@ -597,6 +625,7 @@ pub fn mini_notify(dst: i32, m_type: i32) {
             }
         }
     });
+    reschedule();
 }
 
 /// Hand off from the bootstrap context (`kernel_main`'s own stack, set up

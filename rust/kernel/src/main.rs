@@ -3,15 +3,13 @@
 //! This is the Rust port's `kernel/main.c` equivalent: it boots, sets up
 //! the GDT/IDT so CPU faults are reported instead of triple-faulting
 //! (`crate::gdt`, `crate::interrupts`), programs the PIC/PIT and enables
-//! interrupts so the timer starts driving real quantum accounting
-//! (`crate::pic`, `crate::pit`, `crate::proc::clock_tick`), prints the boot
+//! interrupts so the timer starts driving real, asynchronously-preemptive
+//! scheduling (`crate::pic`, `crate::pit`, `crate::proc`), prints the boot
 //! image (the process table MINIX would load into memory at this point),
 //! spawns the kernel tasks (`crate::proc`), and hands off to the scheduler
 //! -- just as `kernel/main.c` ends by calling `restart()`. There is no
-//! user-mode and no MMU-based address-space isolation yet, and the timer
-//! interrupt does not yet force a switch away from a task that never
-//! blocks or yields on its own — see `rust/README.md` for what's
-//! implemented versus planned.
+//! user-mode and no MMU-based address-space isolation yet — see
+//! `rust/README.md` for what's implemented versus planned.
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
@@ -45,10 +43,6 @@ fn kernel_main(_boot_info: &'static BootInfo) -> ! {
     x86_64::instructions::interrupts::int3();
     serial_println!("survived breakpoint exception");
 
-    pic::init();
-    pit::init();
-    x86_64::instructions::interrupts::enable();
-    serial_println!("PIC remapped, PIT programmed for {} Hz, interrupts enabled", pit::HZ);
     serial_println!();
 
     serial_println!("boot image:");
@@ -57,24 +51,38 @@ fn kernel_main(_boot_info: &'static BootInfo) -> ! {
     }
     serial_println!();
 
+    // Tasks must be spawned (and so enqueued as ready) before interrupts
+    // are enabled: the timer can start firing as soon as the PIT is
+    // programmed, and its handler calls `reschedule()` unconditionally
+    // (see `proc.rs`'s module doc comment) -- with no task enqueued yet,
+    // there would be nothing for it to pick.
     spawn_tasks();
-    serial_println!("tasks spawned, handing off to the scheduler");
+    serial_println!("tasks spawned");
+
+    pic::init();
+    pit::init();
+    x86_64::instructions::interrupts::enable();
+    serial_println!("PIC remapped, PIT programmed for {} Hz, interrupts enabled", pit::HZ);
+    serial_println!("handing off to the scheduler");
     serial_println!();
     proc::start()
 }
 
 /// Spawn the kernel tasks. `IDLE` and `CLOCK` are real kernel tasks, same
-/// as in the boot image; `pm`/`fs` don't exist as real servers yet (there's
-/// no user mode to run them in -- see `rust/README.md`), so their process
-/// table slots run a small stand-in body instead, purely to exercise
-/// blocking `send`/`receive` and the scheduler end to end before the real
-/// servers exist. Priorities, quantum sizes, and preemptibility match
+/// as in the boot image; `pm`/`fs`/`rs`/`memory` don't exist as real
+/// servers yet (there's no user mode to run them in -- see
+/// `rust/README.md`), so their process table slots run small stand-in
+/// bodies instead: `pm`/`fs` exercise blocking `send`/`receive`, and
+/// `rs`/`memory` (as `busy_task_a`/`busy_task_b`) exercise asynchronous
+/// preemption. Priorities, quantum sizes, and preemptibility match
 /// `kernel/table.c`'s image entries (`IDL_F`/`TSK_F`/`SRV_F` flags).
 fn spawn_tasks() {
     proc::spawn(com::IDLE, "IDLE", idle_task, proc::IDLE_Q, 8, true);
     proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false);
     proc::spawn(com::PM_PROC_NR, "pm (demo)", demo_pm_task, 3, 32, true);
     proc::spawn(com::FS_PROC_NR, "fs (demo)", demo_fs_task, 4, 32, true);
+    proc::spawn(com::RS_PROC_NR, "rs (demo)", busy_task_a, 6, 16, true);
+    proc::spawn(com::MEM_PROC_NR, "memory (demo)", busy_task_b, 6, 16, true);
 }
 
 /// Real MINIX's idle task just halts, waking on the next interrupt; ported
@@ -136,6 +144,41 @@ fn demo_fs_task() -> ! {
     serial_println!("[fs] demo finished, blocking for good");
     ipc::receive(com::ANY); // nothing left to receive; parks fs so idle can run
     unreachable!("nothing sends to fs once the demo is done");
+}
+
+/// Both proofs of asynchronous preemption: a tight, CPU-bound loop with no
+/// `yield_now()` or IPC call anywhere in it. `busy_task_a` and
+/// `busy_task_b` share a priority queue (see `spawn_tasks`), so the only
+/// way both ever get to run is the timer interrupt forcibly reordering the
+/// ready queue and switching away once each one's quantum is used up
+/// (`proc::clock_tick` + `proc::reschedule`, called from
+/// `crate::interrupts::timer_interrupt_handler`) -- with the previous
+/// milestone's purely-cooperative scheduler, whichever of these ran first
+/// would simply never yield the CPU to the other.
+fn busy_task_a() -> ! {
+    busy_loop("rs")
+}
+
+fn busy_task_b() -> ! {
+    busy_loop("memory")
+}
+
+fn busy_loop(tag: &str) -> ! {
+    let start = proc::uptime_ticks();
+    let mut n: u64 = 0;
+    loop {
+        n = n.wrapping_add(1);
+        if n % 4_000_000 == 0 {
+            let now = proc::uptime_ticks();
+            serial_println!("[{}] still spinning, n={} uptime={}", tag, n, now);
+            if now >= start + 30 {
+                break;
+            }
+        }
+    }
+    serial_println!("[{}] demo finished, blocking for good", tag);
+    ipc::receive(com::ANY); // nothing left to receive; parks this task so idle can run
+    unreachable!("nothing sends to {} once the demo is done", tag);
 }
 
 pub fn halt_loop() -> ! {
