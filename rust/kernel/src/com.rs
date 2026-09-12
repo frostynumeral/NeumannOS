@@ -27,12 +27,13 @@ pub const HARDWARE: i32 = KERNEL;
 pub const NR_TASKS: usize = 4;
 
 /// User-space servers and drivers that make up the rest of the boot image.
-/// None of these are real, independent processes yet -- no user mode, no
-/// address-space isolation (see `rust/README.md`) -- but `crate::proc`
-/// temporarily schedules a couple of these slots with stand-in bodies to
-/// exercise the scheduler and IPC end to end; the numbers are reserved so
-/// that code can be written against the final shape of the system before
-/// the real servers exist.
+/// None of these are the *real* servers yet -- `crate::proc` temporarily
+/// schedules these slots with stand-in bodies to exercise the scheduler
+/// and IPC end to end, and only `DRVR_PROC_NR` (as
+/// `crate::usermode::ring3_task_entry`) actually runs in ring 3 with its
+/// own address space so far (see `rust/README.md`); the rest still share
+/// the kernel's. The numbers are reserved so that code can be written
+/// against the final shape of the system before the real servers exist.
 pub const PM_PROC_NR: i32 = 0;
 pub const FS_PROC_NR: i32 = 1;
 pub const RS_PROC_NR: i32 = 2;
