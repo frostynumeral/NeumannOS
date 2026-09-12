@@ -139,6 +139,32 @@ external contract.
   returns `None`, proving the mapping really is private and not merely
   inaccessible-by-privilege-level.
 
+### A real bug found and fixed by a multi-agent review
+
+A workflow-based review (five independent reviewers each reading a
+different slice of `rust/kernel/src`, every finding then re-verified from
+scratch by an independent skeptic before being trusted) surfaced a genuine
+race condition in `proc::reschedule`/`start`, found independently by three
+of the five reviewers and confirmed by three separate verifiers: the
+scheduler-lock-guarded part of the switch (`with_scheduler`, which sets
+`sched.current = next`) released the lock -- and, for an ordinary
+task-level caller, re-enabled interrupts -- *before* `switch_to` had
+actually performed the low-level stack/`CR3` swap. A timer tick landing in
+that gap ran `clock_tick` against a `sched.current` that didn't yet match
+who was physically executing; if that expired the (wrong) task's quantum
+and changed `next_ptr` again, the nested `reschedule` the timer handler
+calls would `switch_to` using the not-yet-switched-to task's process-table
+slot as the "outgoing" side -- overwriting its saved `rsp` with the real
+outgoing task's live stack pointer and permanently corrupting it. Fixed by
+disabling interrupts for the whole decide-and-switch sequence (not just
+the lock-guarded part) and restoring them explicitly on resume, rather
+than relying on `switch_to`'s own saved `RFLAGS` (see `reschedule`'s doc
+comment for the full explanation). The same review also caught real
+duplication between `reschedule`/`start` (now factored into
+`Scheduler::cr3_for`) and a stale doc comment in `com.rs`; a fourth
+finding (a `PAGE_SIZE` constant duplicating an existing named constant in
+`usermode.rs`) was checked and correctly refuted as not a live bug.
+
 ### Known simplifications in the scheduler/IPC/timer port
 
 - **Preemption latency for a newly-woken task is bounded by one timer

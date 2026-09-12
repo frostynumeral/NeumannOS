@@ -45,7 +45,7 @@
 
 use core::ptr;
 use spin::Mutex;
-use x86_64::instructions::interrupts::without_interrupts;
+use x86_64::instructions::interrupts::{are_enabled, disable, enable, without_interrupts};
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::PhysFrame;
 use x86_64::VirtAddr;
@@ -290,6 +290,15 @@ impl Scheduler {
     fn pick_proc(&mut self) {
         self.next_ptr = self.rdy_head.iter().find_map(|h| *h);
     }
+
+    /// The `(PhysFrame, Cr3Flags)` to load into `CR3` for `idx`: its own
+    /// address space if it has one (`Proc::cr3`), or the kernel's default
+    /// otherwise. Shared by `reschedule`/`start` so the selection rule only
+    /// has one place to get right (and one place to update, if it ever
+    /// needs to stop just copying `kernel_cr3`'s flags verbatim).
+    fn cr3_for(&self, idx: usize) -> (PhysFrame, Cr3Flags) {
+        self.procs[idx].cr3.map_or(self.kernel_cr3, |frame| (frame, self.kernel_cr3.1))
+    }
 }
 
 lazy_static::lazy_static! {
@@ -435,7 +444,28 @@ unsafe extern "C" fn switch_to(prev_rsp: *mut u64, next_rsp: u64) {
 /// makes on every single trap return (see the module doc comment). Safe to
 /// call from either ordinary task code or from inside an interrupt
 /// handler; see `switch_to`'s doc comment for why.
+///
+/// Interrupts are disabled for the *entire* decide-and-switch sequence
+/// below, not just the scheduler-lock-guarded part inside `with_scheduler`.
+/// This closes a real race a review found: with only the lock guarded,
+/// `sched.current` was updated (and the lock released, re-enabling
+/// interrupts for an ordinary task-level caller) *before* `switch_to` had
+/// actually performed the low-level stack/CR3 swap. A timer tick landing
+/// in that gap would run `clock_tick` against a `sched.current` that
+/// didn't yet match who was physically executing, and if that expired a
+/// quantum and changed `next_ptr` again, the nested `reschedule` call the
+/// timer handler makes would call `switch_to` using the *not-yet-switched-
+/// to* task's slot as the "outgoing" side -- overwriting its saved `rsp`
+/// with the real outgoing task's live stack pointer and permanently
+/// corrupting it. Keeping interrupts off across the whole sequence (and
+/// restoring them explicitly on resume, below, rather than relying on
+/// `switch_to`'s own saved `RFLAGS` -- those reflect whichever *other*
+/// task is being switched *to*, not this call's caller) removes the gap
+/// entirely.
 pub fn reschedule() {
+    let interrupts_were_enabled = are_enabled();
+    disable();
+
     let switch: Option<(usize, *mut u64, u64, PhysFrame, Cr3Flags)> = with_scheduler(|sched| {
         let next = match sched.next_ptr {
             Some(n) => n,
@@ -449,11 +479,10 @@ pub fn reschedule() {
         unsafe { NEXT_ENTRY = sched.procs[next].entry };
         let prev_ptr: *mut u64 = &mut sched.procs[prev].rsp;
         let next_rsp = sched.procs[next].rsp;
-        let (next_cr3, next_cr3_flags) = sched.procs[next].cr3.map_or(sched.kernel_cr3, |frame| {
-            (frame, sched.kernel_cr3.1)
-        });
+        let (next_cr3, next_cr3_flags) = sched.cr3_for(next);
         Some((next, prev_ptr, next_rsp, next_cr3, next_cr3_flags))
     });
+
     if let Some((next, prev_ptr, next_rsp, next_cr3, next_cr3_flags)) = switch {
         // Before the switch, not after: if `next` is already in ring 3 (or
         // gets there right after resuming), the CPU needs to find *its*
@@ -462,6 +491,13 @@ pub fn reschedule() {
         gdt::set_rsp0(VirtAddr::new(stack_top(next)));
         unsafe { Cr3::write(next_cr3, next_cr3_flags) };
         unsafe { switch_to(prev_ptr, next_rsp) };
+        // Resumed -- possibly much later, on this exact stack, once
+        // something switches back to whichever task this call belonged to.
+        // Falls through to the restore below, same as the no-switch case.
+    }
+
+    if interrupts_were_enabled {
+        enable();
     }
 }
 
@@ -682,15 +718,19 @@ pub fn mini_notify(dst: i32, m_type: i32) {
 /// by the bootloader) to the first ready task. Equivalent to `main()`
 /// calling `restart()` at the end of `kernel/main.c` -- like there, this
 /// never returns: `kernel_main`'s stack is simply abandoned.
+///
+/// Interrupts are already enabled by the time `main.rs` calls this, so it
+/// needs the same protection `reschedule()` does (see its doc comment):
+/// disabled here for the whole decide-and-switch sequence, with no restore
+/// afterward needed since this call itself never resumes.
 pub fn start() -> ! {
+    disable();
     let (next, next_rsp, next_cr3, next_cr3_flags) = with_scheduler(|sched| {
         sched.pick_proc();
         let next = sched.next_ptr.expect("start(): no task was spawned");
         sched.current = next;
         unsafe { NEXT_ENTRY = sched.procs[next].entry };
-        let (next_cr3, next_cr3_flags) = sched.procs[next].cr3.map_or(sched.kernel_cr3, |frame| {
-            (frame, sched.kernel_cr3.1)
-        });
+        let (next_cr3, next_cr3_flags) = sched.cr3_for(next);
         (next, sched.procs[next].rsp, next_cr3, next_cr3_flags)
     });
     gdt::set_rsp0(VirtAddr::new(stack_top(next)));
