@@ -5,9 +5,12 @@
 # kernel and, once the alarm genuinely fires, resuming right here in
 # ring 3 -- then call SYS_WRITE_LINE with a pointer into this program's
 # own .data (proving a real cross-ring argument -- a pointer -- gets read
-# correctly), then SYS_BLOCK_FOREVER, which never returns. No libc, no
-# _start-time setup: the kernel's elf.rs loader jumps straight to _start
-# with nothing but a stack.
+# correctly). Then it goes one step further: SYS_FS_OPEN a real file and
+# SYS_FS_WRITE a message to it -- a genuine ring 3 -> syscall -> IPC ->
+# fs round trip, not just a kernel-internal call -- before finally
+# SYS_BLOCK_FOREVER, which never returns. No libc, no _start-time setup:
+# the kernel's elf.rs loader jumps straight to _start with nothing but a
+# stack.
 #
 # Built into hello.elf (checked in alongside this file, since the kernel
 # build has no cross toolchain wired in yet to assemble this
@@ -47,6 +50,21 @@ _start:
     mov $2, %eax        # SYS_WRITE_LINE (crate::syscall::SYS_WRITE_LINE)
     int $0x80
 
+    # Open a real file via fs (rdi=path ptr, rsi=path len); SYS_FS_OPEN
+    # returns the new file descriptor in rax.
+    lea path(%rip), %rdi
+    mov $path_len, %esi
+    mov $6, %eax        # SYS_FS_OPEN (crate::syscall::SYS_FS_OPEN)
+    int $0x80
+    mov %rax, %r8       # stash the fd -- rax is about to be overwritten
+
+    # Write file_message to that fd (rdi=fd, rsi=buf ptr, rdx=len).
+    mov %r8, %rdi
+    lea file_message(%rip), %rsi
+    mov $file_message_len, %edx
+    mov $7, %eax        # SYS_FS_WRITE (crate::syscall::SYS_FS_WRITE)
+    int $0x80
+
     mov $3, %eax        # SYS_BLOCK_FOREVER (crate::syscall::SYS_BLOCK_FOREVER)
     int $0x80
     # unreachable: SYS_BLOCK_FOREVER's handler never returns.
@@ -58,3 +76,9 @@ counter:
 message:
     .ascii "hello from the ELF-loaded ring-3 task, after waiting for a real alarm!"
 message_len = . - message
+path:
+    .ascii "/from_ring3.txt"
+path_len = . - path
+file_message:
+    .ascii "written from ring 3 via a real syscall, IPC, and fs!"
+file_message_len = . - file_message

@@ -13,16 +13,27 @@
 //! task's own loop in `main.rs`); the free functions below are the
 //! client-side stubs a caller like `pm` uses to talk to it, mirroring the
 //! shape of `crate::calls`' kernel-call wrappers even though these go
-//! over a real IPC round trip rather than a direct call.
+//! over a real IPC round trip rather than a direct call. Every stub sets
+//! the request's `source` to `proc::current_proc_nr()` -- the *real*
+//! caller, not a hardcoded one -- since `fs` addresses its reply using
+//! that field (`serve`, below): a caller who lied about it (or, before
+//! this was fixed, a fixed `PM_PROC_NR` regardless of who actually
+//! called) would have its reply delivered to the wrong mailbox.
 //!
-//! Known simplification, shared with `crate::calls`: `fs` and its callers
-//! all still run in the kernel's own address space (see `rust/README.md`),
-//! so request/reply args carry raw pointers valid in that one shared
-//! space directly, rather than needing a `sys_vircopy`-style
-//! cross-address-space copy the way a real, isolated `fs` server would.
+//! Known simplification, shared with `crate::calls`: request/reply args
+//! carry raw pointers, valid only in whichever address space happens to
+//! be active when they're actually dereferenced -- fine when `fs` and its
+//! caller share the kernel's own address space (true of every *kernel*
+//! caller, like `pm`), but not when the caller has its own, separate
+//! address space (a ring-3 task -- see `crate::syscall`'s
+//! `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ`, which route around this by
+//! copying through a kernel-stack buffer *before* handing anything to
+//! these stubs, rather than `fs` needing a `sys_vircopy`-style
+//! cross-address-space copy of its own).
 
 use crate::com;
 use crate::ipc::{self, Message};
+use crate::proc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -256,7 +267,7 @@ pub fn open(name: &str) -> i64 {
     let reply = ipc::send_receive(
         com::FS_PROC_NR,
         Message {
-            source: com::PM_PROC_NR,
+            source: proc::current_proc_nr(),
             m_type: FS_OPEN,
             args: [name.as_ptr() as i64, name.len() as i64, 0, 0],
         },
@@ -272,7 +283,7 @@ pub fn mkdir(path: &str) -> i64 {
     let reply = ipc::send_receive(
         com::FS_PROC_NR,
         Message {
-            source: com::PM_PROC_NR,
+            source: proc::current_proc_nr(),
             m_type: FS_MKDIR,
             args: [path.as_ptr() as i64, path.len() as i64, 0, 0],
         },
@@ -287,7 +298,7 @@ pub fn write(fd: i64, data: &[u8]) -> i64 {
     let reply = ipc::send_receive(
         com::FS_PROC_NR,
         Message {
-            source: com::PM_PROC_NR,
+            source: proc::current_proc_nr(),
             m_type: FS_WRITE,
             args: [fd, data.as_ptr() as i64, data.len() as i64, 0],
         },
@@ -302,7 +313,7 @@ pub fn read(fd: i64, buf: &mut [u8]) -> i64 {
     let reply = ipc::send_receive(
         com::FS_PROC_NR,
         Message {
-            source: com::PM_PROC_NR,
+            source: proc::current_proc_nr(),
             m_type: FS_READ,
             args: [fd, buf.as_mut_ptr() as i64, buf.len() as i64, 0],
         },
