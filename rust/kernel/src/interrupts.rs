@@ -21,10 +21,12 @@
 //! `kernel/table.c`'s `SYS_VECTOR` (the software-interrupt gate user-mode
 //! processes trap into the kernel through) -- see `crate::usermode` for
 //! the other half (getting *into* ring 3 in the first place). It doesn't
-//! implement any real call yet; it exists to prove the round trip works.
+//! implement any real call yet; it exists to prove repeated ring-3-to-
+//! ring-0-and-back round trips work for a real, schedulable task.
 
 use crate::gdt;
 use crate::pic;
+use core::sync::atomic::{AtomicU32, Ordering};
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use x86_64::PrivilegeLevel;
@@ -117,27 +119,43 @@ extern "x86-interrupt" fn double_fault_handler(
     );
 }
 
+/// How many times the ring-3 demo task's `int 0x80` loop gets to actually
+/// resume ring 3 before this handler ends the demo instead. A real
+/// dispatch (once there's more than one caller, or real call numbers to
+/// distinguish) would replace this whole counter-based scheme; for now it
+/// exists purely to keep `usermode::USER_CODE`'s hand-assembly to a
+/// trivial two-instruction loop instead of encoding a counter in machine
+/// code by hand.
+static SYSCALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
 extern "x86-interrupt" fn syscall_handler(frame: InterruptStackFrame) {
     // Printing `frame.code_segment` here is the actual proof this all
     // works: it's only reachable via the CPU's own privilege-transition
     // machinery, so an RPL of 3 in it is the CPU itself confirming the
     // interrupted code was genuinely running in ring 3 -- not something
     // `crate::usermode` merely asserts.
+    let count = SYSCALL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
     crate::serial_println!(
-        "[syscall] reached from {:?} (CS index {})",
+        "[syscall] iteration {} from {:?} (CS index {}, proc {})",
+        count,
         frame.code_segment.rpl(),
-        frame.code_segment.index()
+        frame.code_segment.index(),
+        crate::proc::current_proc_nr(),
     );
-    // There's only one caller of this gate right now (crate::usermode's
-    // one-shot demo), so unlike every other handler in this file, this one
-    // never falls through to the compiler-generated `iretq` that would
-    // resume ring 3: it abandons that side entirely and jumps back into
-    // `usermode::demo`'s caller instead, as if the whole ring-3 excursion
-    // had been an ordinary function call. See `usermode::resume_kernel`'s
-    // doc comment. Once real user-mode processes exist and make repeated,
-    // varied syscalls, this will need to become a real dispatch that
-    // usually *does* just return to resume ring 3.
-    unsafe { crate::usermode::resume_kernel() }
+    if count >= 5 {
+        crate::serial_println!("[syscall] ring-3 demo finished, blocking for good");
+        // Parks this task for good, same as every other demo task in
+        // main.rs ends: nothing ever sends to it again. Falling through
+        // below (which would resume ring 3 via the compiler-generated
+        // `iretq`) never happens once this triggers.
+        crate::ipc::receive(crate::com::ANY);
+    }
+    // Otherwise: return normally, which resumes ring 3 right after this
+    // task's `int` instruction -- ordinary, repeatable trap entry/exit,
+    // not a one-shot trick. In between resuming here and the next `int
+    // 0x80`, this task's own dedicated RSP0 (`crate::gdt::set_rsp0`,
+    // updated by `proc::reschedule` on every switch) is what lets it also
+    // be safely, asynchronously preempted by the timer while in ring 3.
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {

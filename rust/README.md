@@ -5,10 +5,11 @@ this repository (see the top-level `README.md` for the original C
 codebase's history). It is a **starting skeleton**, not a finished port: a
 real microkernel, its servers (`pm`, `fs`, `rs`, ...), and its drivers are a
 multi-month undertaking on their own. What's here boots in QEMU, sets up
-exception handling and a heap, proves it can run code in ring 3, schedules
-kernel tasks with real, asynchronously preemptive hardware-timer-driven
-quantum accounting, and exercises blocking message-passing IPC between
-them — enough to build the rest of the system on top of.
+exception handling and a heap, schedules kernel tasks with real,
+asynchronously preemptive hardware-timer-driven quantum accounting
+(including a task that runs in ring 3), and exercises blocking
+message-passing IPC between them — enough to build the rest of the system
+on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -83,33 +84,43 @@ external contract.
   spaces) starts to apply.
 - `src/gdt.rs` also now sets up user-mode (ring 3) code/data segments and
   a TSS `RSP0` (the stack the CPU switches to automatically on *any*
-  ring-3-to-ring-0 transition); `src/interrupts.rs` adds a
-  ring-3-callable `int 0x80` gate (`SYSCALL_VECTOR`); and
-  `src/usermode.rs` uses both to prove the whole ring-3 transition
-  mechanism actually works: map a code and a stack page with
-  `USER_ACCESSIBLE`, build a synthetic `iretq` frame, jump to CPL 3, and
-  have the ring-3 code trap back in via `int 0x80` -- confirmed genuine
-  by printing the CPU-captured `CS` selector's RPL from inside the
-  handler. This is deliberately *not* wired into `crate::proc`'s
-  scheduler as a real task yet: doing that safely needs each task to have
-  its *own* `RSP0` (updated on every switch), since with one shared
-  `RSP0`, two tasks both spending time in ring 3 could clobber each
-  other's state the moment either faulted or was preempted. So instead it
-  runs once, early in `main.rs`, before the timer/scheduler exist, and
-  returns to ordinary kernel code when done (see `usermode.rs`'s module
-  doc comment for the register-save trick that makes a plain function
-  call behave like a full ring-3 round trip).
+  ring-3-to-ring-0 transition) -- `set_rsp0`, called from `crate::proc` on
+  every task switch (see below), points it at whichever task is now
+  current's *own* dedicated kernel stack, which is what makes it safe for
+  more than one task to spend time in ring 3.
+- `src/interrupts.rs` adds a ring-3-callable `int 0x80` gate
+  (`SYSCALL_VECTOR`); its handler prints the CPU-captured `CS` selector's
+  RPL, which is what actually proves a caller was in ring 3 -- not
+  something the kernel side merely asserts.
+- `src/usermode.rs` uses both to run a real, scheduler-integrated ring-3
+  task: map a code and a stack page with `USER_ACCESSIBLE` (without which
+  the CPU refuses to execute or touch them at CPL 3 at all -- a `#PF`, not
+  a `#GP`), then jump to CPL 3 from an ordinary `crate::proc` task body.
+  The ring-3 code loops `int 0x80`, trapping into the kernel and back
+  repeatedly -- ordinary, repeatable trap entry/exit, not a one-shot
+  trick -- and can be asynchronously preempted by the timer while in ring
+  3 exactly like any other task, same as `crate::proc`'s `reschedule` is
+  what makes `gdt::set_rsp0` get called on every switch.
+- `src/proc.rs`'s `reschedule`/`start` call `gdt::set_rsp0` on every
+  switch, pointing the TSS at whichever task just became current's own
+  dedicated kernel stack (the same one `crate::proc::stack_top` already
+  used to build that task's initial `switch_to` frame). This is what
+  makes running ring-3 code as a real task safe: with one shared `RSP0`,
+  two tasks both spending time in ring 3 could clobber each other's saved
+  state the moment either faulted or was preempted.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
-  and the heap, runs the one-shot ring-3 demo, spawns the kernel tasks,
+  and the heap, maps the ring-3 demo task's pages, spawns the kernel tasks,
   programs the PIC/PIT and enables interrupts, and hands off to the
   scheduler. Spawns `IDLE` and `CLOCK` as real kernel tasks (same as the
-  boot image), plus temporary stand-in bodies in the `pm`/`fs`/`rs`/`memory`
-  process table slots: `pm`/`fs` ping-pong three blocking messages back and
-  forth (exercising the rendezvous IPC), and `rs`/`memory` each spin in a
-  tight, CPU-bound loop with no `yield_now()`/IPC call anywhere in it
-  (proving the timer interrupt truly preempts a task asynchronously,
-  mid-loop, rather than only ever switching at cooperative checkpoints).
+  boot image), plus temporary stand-in bodies in the
+  `pm`/`fs`/`rs`/`memory`/`driver` process table slots: `pm`/`fs`
+  ping-pong three blocking messages back and forth (exercising the
+  rendezvous IPC), `rs`/`memory` each spin in a tight, CPU-bound loop with
+  no `yield_now()`/IPC call anywhere in it (proving the timer interrupt
+  truly preempts a task asynchronously, mid-loop, rather than only ever
+  switching at cooperative checkpoints), and `driver` runs the ring-3 demo
+  task described above.
 
 ### Known simplifications in the scheduler/IPC/timer port
 
@@ -132,21 +143,20 @@ external contract.
 - **SEND/SEND deadlock panics** instead of returning `ELOCKED`: there's no
   error-propagating IPC API yet for a caller to recover with.
 
-### Known simplifications in the ring-3 demo
+### Known simplifications in the ring-3 task
 
-- **One-shot, not a real process.** `usermode::demo` proves the CPU
-  mechanism (segments, `RSP0`, the `iretq`/`int 0x80` round trip) but
-  isn't a schedulable task: it runs once, before the timer/scheduler
-  start, and abandons the ring-3 side on its first syscall rather than
-  letting it run indefinitely under preemption. See `usermode.rs`'s module
-  doc comment for exactly why (one shared `RSP0` isn't safe for more than
-  one task to spend time in ring 3 under).
 - **No real syscall dispatch.** `SYSCALL_VECTOR`'s handler always performs
-  the same "return to kernel" action regardless of which register values
-  the caller set up; there's no argument-passing convention or call-number
-  dispatch yet, since there's nothing to call.
+  the same fixed action (count the call, print, and eventually block the
+  caller for good) regardless of which register values the caller set up;
+  there's no argument-passing convention or call-number dispatch yet,
+  since there's nothing to call. The fixed iteration count
+  (`interrupts::SYSCALL_COUNT`) exists purely so `usermode::USER_CODE`'s
+  hand-assembly can stay a trivial two-instruction loop instead of needing
+  a counter encoded by hand.
 - **Shares the kernel's address space** rather than getting its own page
-  table -- the actual "isolation" part of the next roadmap item.
+  table -- the actual "isolation" part of the next roadmap item. Right
+  now a bug in this task's code could still corrupt kernel memory or any
+  other task's; a page table boundary is what would actually prevent that.
 
 ## What's not implemented yet (roadmap)
 
@@ -171,18 +181,16 @@ Roughly in the order the original kernel needs them:
    `src/allocator.rs`).
 6. ~~**Prove the ring-3 transition mechanism**~~ — done (`src/usermode.rs`,
    plus the user segments/`RSP0`/`SYSCALL_VECTOR` additions to `src/gdt.rs`
-   /`src/interrupts.rs`). See "known simplifications" above for the real
-   work still ahead: this isn't a schedulable process yet, just a proof the
-   CPU mechanism works.
-7. **Per-task `RSP0` and scheduler-integrated user-mode tasks**: give each
-   `proc::Proc` its own dedicated ring-0 stack and have `reschedule()`
-   update the TSS's `privilege_stack_table[0]` on every switch, so a task
-   can safely spend time in ring 3 and be asynchronously preempted (or
-   fault) there like any other task -- closing the gap `usermode.rs`
-   documents.
+   /`src/interrupts.rs`).
+7. ~~**Per-task `RSP0` and scheduler-integrated user-mode tasks**~~ — done.
+   `proc::reschedule`/`start` call `gdt::set_rsp0` on every switch; the
+   ring-3 demo task now runs as an ordinary, asynchronously-preemptible
+   `crate::proc` task making repeated `int 0x80` round trips, rather than
+   a one-shot excursion. See "known simplifications" above for what's
+   still fixed/hardcoded about it.
 8. **Per-process page tables** for real address-space isolation -- right
-   now everything (including the `pm`/`fs`/`rs`/`memory` stand-ins and the
-   ring-3 demo) shares one address space.
+   now everything (including the `pm`/`fs`/`rs`/`memory`/`driver`
+   stand-ins) shares one address space.
 9. **Kernel calls** (`kernel/system.c`, `kernel/system/do_*.c`) — the
    privileged operations servers need (`sys_vircopy`, `sys_setalarm`, etc.).
 10. **The servers themselves**: `pm` (process manager), `fs` (file system),
@@ -233,14 +241,14 @@ qemu-system-x86_64 -m 256 -drive format=raw,file=target/x86_64-unknown-none/debu
 and does the same thing, though without the explicit `-m 256` -- pass it
 via `QEMU_ARGS` if the default memory size turns out too small for the
 heap plus everything else once more of this grows). Expected output on
-COM1: a heap self-test (`Box`/`Vec` both actually work), a ring-3 round
-trip (`[syscall] reached from Ring3 ...`, printed from inside the syscall
+COM1: a heap self-test (`Box`/`Vec` both actually work), the boot image
+table, the `pm`/`fs` demo tasks ping-ponging three messages back and
+forth (blocking `send`/`receive`), five ring-3 round trips
+(`[syscall] iteration N from Ring3 ...`, printed from inside the syscall
 handler using the CPU-captured selector -- not something the kernel side
-merely claims), the boot image table, `CLOCK` reporting a handful of real
-PIT ticks it observed while waiting, the `pm`/`fs` demo tasks ping-ponging
-three messages back and forth (blocking `send`/`receive`), the
-`rs`/`memory` demo tasks trading off every quantum purely because the
-timer forces it (asynchronous preemption -- watch `memory`'s counter
-resume from exactly where it left off after `rs` gets a turn), and
-finally `IDLE` reporting that it's halting (with the accumulated tick
-count) once everything else has blocked.
+merely claims) before that task blocks for good, the `rs`/`memory` demo
+tasks trading off every quantum purely because the timer forces it
+(asynchronous preemption -- watch `memory`'s counter resume from exactly
+where it left off after `rs` gets a turn), and finally `IDLE` reporting
+that it's halting (with the accumulated tick count) once everything else
+has blocked.
