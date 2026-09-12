@@ -1,5 +1,5 @@
-//! CPU exception handling, plus the one hardware interrupt this port
-//! currently handles (the timer).
+//! CPU exception handling, plus the hardware interrupts this port
+//! currently handles (the timer, and the PS/2 keyboard).
 //!
 //! The exception handlers are a Rust equivalent of `kernel/exception.c`.
 //! The original `exception()` function is a single dispatcher indexed by
@@ -15,7 +15,8 @@
 //!
 //! `timer_interrupt_handler` is the IRQ0 handler `crate::pic`/`crate::pit`
 //! set up, standing in for the `hwint00`/`clock_handler` pair in
-//! `kernel/mpx386.s`/`kernel/clock.c`.
+//! `kernel/mpx386.s`/`kernel/clock.c`. `keyboard_interrupt_handler` is the
+//! IRQ1 handler, reading and translating scancodes via `crate::keyboard`.
 //!
 //! `syscall_handler`, at `SYSCALL_VECTOR`, is a first, minimal analogue of
 //! `kernel/table.c`'s `SYS_VECTOR` (the software-interrupt gate user-mode
@@ -52,6 +53,7 @@ lazy_static! {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
         idt[pic::IRQ0_VECTOR].set_handler_fn(timer_interrupt_handler);
+        idt[pic::IRQ0_VECTOR + 1].set_handler_fn(keyboard_interrupt_handler);
         // DPL 3: unlike every other gate here, ring-3 code (crate::usermode)
         // must be allowed to reach this one with a plain `int` instruction.
         // Every other vector keeps the default DPL 0, so user-mode code
@@ -180,4 +182,19 @@ extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
     // whichever task was running when this tick fired. See
     // `proc::switch_to`'s doc comment for what makes that sound.
     crate::proc::reschedule();
+}
+
+/// IRQ1 (keyboard): read the scancode the controller just latched, print
+/// its ASCII translation (if `crate::keyboard`'s table has one), and
+/// acknowledge. No task is woken here yet -- there's no real `tty`/line-
+/// discipline layer to hand this to (see `rust/README.md`'s roadmap) --
+/// so this is currently just proof the IRQ genuinely fires per keypress,
+/// asynchronously, the same way `timer_interrupt_handler` proves IRQ0
+/// does.
+extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame) {
+    let scancode = crate::keyboard::read_scancode();
+    if let Some(ascii) = crate::keyboard::translate(scancode) {
+        crate::serial_println!("[kbd] key: {:?} (scancode {:#04x})", ascii as char, scancode);
+    }
+    pic::end_of_interrupt(1);
 }

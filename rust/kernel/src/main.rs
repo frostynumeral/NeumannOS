@@ -30,6 +30,7 @@ mod fs;
 mod gdt;
 mod interrupts;
 mod ipc;
+mod keyboard;
 mod memory;
 mod pic;
 mod pit;
