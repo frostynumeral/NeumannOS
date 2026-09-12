@@ -128,6 +128,11 @@ pub struct Proc {
     /// `start` load this (or the kernel's own, if `None`) into `CR3`
     /// whenever this task becomes current.
     cr3: Option<PhysFrame>,
+    /// The tick (`Scheduler::ticks`) at which this task's watchdog alarm
+    /// (`sys_setalarm`, `crate::calls`) should fire, if one is pending.
+    /// Analogous to `kernel/clock.c`'s per-process alarm timer, minus the
+    /// sorted-queue optimization (see `clock_tick`'s doc comment).
+    alarm: Option<u64>,
 }
 
 fn never_spawned() -> ! {
@@ -159,6 +164,7 @@ impl Proc {
             messbuf: ptr::null_mut(),
             entry: never_spawned,
             cr3: None,
+            alarm: None,
         }
     }
 
@@ -299,6 +305,31 @@ impl Scheduler {
     fn cr3_for(&self, idx: usize) -> (PhysFrame, Cr3Flags) {
         self.procs[idx].cr3.map_or(self.kernel_cr3, |frame| (frame, self.kernel_cr3.1))
     }
+
+    /// Deliver a notification (`m_type`, appearing to come from
+    /// `src_proc_nr`) to `dst_idx` if it's currently blocked in
+    /// `mini_receive` waiting for one; returns whether it was delivered.
+    /// The core of `mini_notify`, factored out so `clock_tick` -- which is
+    /// already inside `with_scheduler` when it wants to deliver a
+    /// `SYN_ALARM` -- can call it directly instead of going back through
+    /// the public, re-locking `mini_notify` (which would deadlock on
+    /// `SCHEDULER`, a non-reentrant lock).
+    fn try_deliver_notification(&mut self, dst_idx: usize, src_proc_nr: i32, m_type: i32) -> bool {
+        let dst_receiving =
+            self.procs[dst_idx].rts_flags & (rts::RECEIVING | rts::SENDING) == rts::RECEIVING;
+        let accepted = dst_receiving
+            && (self.procs[dst_idx].get_from == com::ANY
+                || self.procs[dst_idx].get_from == src_proc_nr);
+        if accepted {
+            let msg = Message { source: src_proc_nr, m_type, args: [0; 4] };
+            unsafe { *self.procs[dst_idx].messbuf = msg };
+            self.procs[dst_idx].rts_flags &= !rts::RECEIVING;
+            if self.procs[dst_idx].rts_flags == 0 {
+                self.enqueue(dst_idx);
+            }
+        }
+        accepted
+    }
 }
 
 lazy_static::lazy_static! {
@@ -379,6 +410,7 @@ pub fn spawn(
             messbuf: ptr::null_mut(),
             entry,
             cr3: address_space,
+            alarm: None,
         };
         sched.enqueue(idx);
     });
@@ -512,23 +544,60 @@ pub fn uptime_ticks() -> u64 {
     with_scheduler(|sched| sched.ticks)
 }
 
+/// The `(PhysFrame, Cr3Flags)` `proc_nr`'s address space is rooted at --
+/// its own (`Proc::cr3`), or the kernel's default if it doesn't have one.
+/// For `crate::calls::sys_vircopy` to translate a virtual address in some
+/// *other* process's address space via `crate::memory::page_table_for`.
+pub fn cr3_of(proc_nr: i32) -> (PhysFrame, Cr3Flags) {
+    let idx = com::slot(proc_nr);
+    with_scheduler(|sched| sched.cr3_for(idx))
+}
+
+/// `sys_setalarm()`: ask to be sent a `SYN_ALARM` notification once
+/// `delay_ticks` real timer ticks have elapsed. Ported from
+/// `kernel/system/do_setalarm.c`; `clock_tick` is what actually notices
+/// the deadline and delivers it (`kernel/clock.c`'s `do_clocktick`).
+/// Setting a new alarm replaces any pending one for this task, same as
+/// the C version's single-watchdog-per-process model.
+pub fn set_alarm(delay_ticks: u64) {
+    with_scheduler(|sched| {
+        let idx = sched.current;
+        sched.procs[idx].alarm = Some(sched.ticks + delay_ticks);
+    });
+}
+
 /// Called from the timer interrupt handler (`crate::interrupts`) on every
 /// PIT tick, immediately followed there by `reschedule()`. Ported from
-/// `kernel/clock.c`'s `clock_handler` plus the quantum-expiry half of
-/// `do_clocktick`: advance the uptime counter, and if the running task is
-/// preemptible, charge it a tick and, once its quantum is used up, reorder
-/// it to the back of its ready queue -- for `reschedule()` to then act on.
+/// `kernel/clock.c`'s `clock_handler` plus `do_clocktick`: advance the
+/// uptime counter; if the running task is preemptible, charge it a tick
+/// and, once its quantum is used up, reorder it to the back of its ready
+/// queue (for `reschedule()` to then act on); and check every task's
+/// watchdog alarm (`sys_setalarm`, `crate::calls`), delivering `SYN_ALARM`
+/// to any that just expired.
+///
+/// Simplification: real MINIX keeps a sorted timer queue and only checks
+/// `next_timeout <= realtime`; this scans every process table slot every
+/// tick instead. Fine at `NR_PROCS` scale (a dozen-ish slots); would want
+/// the sorted-queue approach if this port ever supports many more tasks.
 pub fn clock_tick() {
     with_scheduler(|sched| {
         sched.ticks += 1;
+        let now = sched.ticks;
+
         let idx = sched.current;
-        if idx == BOOTSTRAP || !sched.procs[idx].preemptible {
-            return;
+        if idx != BOOTSTRAP && sched.procs[idx].preemptible {
+            sched.procs[idx].ticks_left -= 1;
+            if sched.procs[idx].ticks_left <= 0 {
+                sched.dequeue(idx);
+                sched.enqueue(idx);
+            }
         }
-        sched.procs[idx].ticks_left -= 1;
-        if sched.procs[idx].ticks_left <= 0 {
-            sched.dequeue(idx);
-            sched.enqueue(idx);
+
+        for i in 0..NR_PROCS {
+            if sched.procs[i].alarm.is_some_and(|target| now >= target) {
+                sched.procs[i].alarm = None;
+                sched.try_deliver_notification(i, com::CLOCK, com::SYN_ALARM);
+            }
         }
     });
 }
@@ -696,20 +765,7 @@ pub fn mini_notify(dst: i32, m_type: i32) {
     let dst_idx = com::slot(dst);
     with_scheduler(|sched| {
         let caller_proc_nr = sched.procs[sched.current].proc_nr;
-
-        let dst_receiving =
-            sched.procs[dst_idx].rts_flags & (rts::RECEIVING | rts::SENDING) == rts::RECEIVING;
-        let accepted = dst_receiving
-            && (sched.procs[dst_idx].get_from == com::ANY
-                || sched.procs[dst_idx].get_from == caller_proc_nr);
-        if accepted {
-            let msg = Message { source: caller_proc_nr, m_type, args: [0; 4] };
-            unsafe { *sched.procs[dst_idx].messbuf = msg };
-            sched.procs[dst_idx].rts_flags &= !rts::RECEIVING;
-            if sched.procs[dst_idx].rts_flags == 0 {
-                sched.enqueue(dst_idx);
-            }
-        }
+        sched.try_deliver_notification(dst_idx, caller_proc_nr, m_type);
     });
     reschedule();
 }

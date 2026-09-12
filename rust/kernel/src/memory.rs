@@ -20,8 +20,18 @@
 //! address space" part is what this module adds).
 
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
-use x86_64::structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{
+    FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB, Translate,
+};
 use x86_64::{PhysAddr, VirtAddr};
+
+/// The offset physical memory is mapped at, captured once by `init` so
+/// later code (`page_table_for`, `copy_between_address_spaces`) can build
+/// an `OffsetPageTable` over *any* address space's PML4, not just the
+/// active one, without every caller having to thread the offset through.
+/// Written once, at boot, before any other CPU-visible state depends on
+/// it; read-only after.
+static mut PHYSICAL_MEMORY_OFFSET: u64 = 0;
 
 /// Build an `OffsetPageTable` over the page table the bootloader already
 /// installed (it maps the kernel plus, thanks to the `map_physical_memory`
@@ -34,8 +44,13 @@ use x86_64::{PhysAddr, VirtAddr};
 /// at `physical_memory_offset`, and must call this only once (aliasing a
 /// `&mut PageTable` twice is undefined behavior).
 pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    PHYSICAL_MEMORY_OFFSET = physical_memory_offset.as_u64();
     let level_4_table = active_level_4_table(physical_memory_offset);
     OffsetPageTable::new(level_4_table, physical_memory_offset)
+}
+
+fn physical_memory_offset() -> VirtAddr {
+    VirtAddr::new(unsafe { PHYSICAL_MEMORY_OFFSET })
 }
 
 unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
@@ -79,6 +94,77 @@ pub fn new_address_space(
         let table = &mut *new_ptr;
         (new_frame, OffsetPageTable::new(table, physical_memory_offset))
     }
+}
+
+/// Build a *read-only-in-spirit* `OffsetPageTable` over `pml4_frame`,
+/// whether or not it's the currently-active one. Used to translate a
+/// virtual address in some *other* process's address space without
+/// switching `CR3` to it -- exactly the job `sys_vircopy`
+/// (`crate::calls`) needs, and the same job `kernel/system/do_copy.c`'s
+/// `virtual_copy()` does for MINIX's segment-based addressing instead.
+///
+/// # Safety
+/// `pml4_frame` must be a frame previously returned by `new_address_space`
+/// (or the frame `Cr3::read()` reports), so that it's actually a valid,
+/// currently-allocated PML4. Callers must not hold this and separately
+/// mutate the same address space's page tables at once (single-core, no
+/// real aliasing risk today, but the same caveat `new_address_space` has).
+unsafe fn page_table_for(pml4_frame: PhysFrame) -> OffsetPageTable<'static> {
+    let offset = physical_memory_offset();
+    let ptr: *mut PageTable = (offset + pml4_frame.start_address().as_u64()).as_mut_ptr();
+    OffsetPageTable::new(&mut *ptr, offset)
+}
+
+/// Copy `len` bytes from `src_addr` in the address space rooted at
+/// `src_pml4` to `dst_addr` in the one rooted at `dst_pml4`, without ever
+/// switching `CR3`: both ends are reached through the physical-memory
+/// window instead. Ported in spirit from `kernel/system/do_copy.c`'s
+/// `SYS_VIRCOPY` (`virtual_copy()`), which does the equivalent translate-
+/// then-copy for MINIX's segment-based addresses; see `crate::calls` for
+/// the process-number-based wrapper this backs.
+///
+/// Walks a page at a time so a copy that crosses a page boundary in
+/// either address space still works, same as `virtual_copy` handles a
+/// copy crossing a segment boundary.
+pub fn copy_between_address_spaces(
+    src_pml4: PhysFrame,
+    src_addr: VirtAddr,
+    dst_pml4: PhysFrame,
+    dst_addr: VirtAddr,
+    len: usize,
+) -> Result<(), CopyError> {
+    let src_table = unsafe { page_table_for(src_pml4) };
+    let dst_table = unsafe { page_table_for(dst_pml4) };
+    let offset = physical_memory_offset();
+
+    let mut remaining = len;
+    let mut src = src_addr;
+    let mut dst = dst_addr;
+    while remaining > 0 {
+        let src_phys = src_table.translate_addr(src).ok_or(CopyError::SrcNotMapped)?;
+        let dst_phys = dst_table.translate_addr(dst).ok_or(CopyError::DstNotMapped)?;
+
+        let src_room = 4096 - (src.as_u64() as usize % 4096);
+        let dst_room = 4096 - (dst.as_u64() as usize % 4096);
+        let chunk = remaining.min(src_room).min(dst_room);
+
+        unsafe {
+            let src_ptr: *const u8 = (offset + src_phys.as_u64()).as_ptr();
+            let dst_ptr: *mut u8 = (offset + dst_phys.as_u64()).as_mut_ptr();
+            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, chunk);
+        }
+
+        remaining -= chunk;
+        src += chunk as u64;
+        dst += chunk as u64;
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum CopyError {
+    SrcNotMapped,
+    DstNotMapped,
 }
 
 /// Hands out physical frames from the regions the bootloader's memory map

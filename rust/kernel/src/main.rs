@@ -23,6 +23,7 @@
 extern crate alloc;
 
 mod allocator;
+mod calls;
 mod com;
 mod gdt;
 mod interrupts;
@@ -161,26 +162,60 @@ fn idle_task() -> ! {
     halt_loop()
 }
 
-/// Stand-in for `kernel/clock.c`'s clock task. Real MINIX blocks in
-/// `receive(HARDWARE)` and is woken by a `notify` from the timer interrupt
-/// handler once a watchdog expires or a quantum runs out
-/// (`do_clocktick`/`lock_notify`); this port's timer handler
-/// (`proc::clock_tick`) doesn't drive that notification yet (see
-/// `rust/README.md`), so instead this polls `proc::uptime_ticks()` --
-/// which the timer interrupt *does* genuinely advance in the background --
-/// to prove real hardware ticks are arriving before settling down.
-/// Deliberately blocks for good afterwards rather than looping forever:
-/// `CLOCK` is not preemptible (matching `TSK_F`, no `PREEMPTIBLE` bit --
-/// see `spawn_tasks`), so a non-blocking loop here would monopolize the
-/// highest-priority queue and starve every other task permanently.
+/// Stand-in for `kernel/clock.c`'s clock task. Now much closer to the real
+/// thing than earlier milestones' version: it calls `sys_setalarm`
+/// (`crate::calls`) and blocks in `receive`, exactly like real MINIX's
+/// `while (TRUE) { receive(HARDWARE, &m); ...; }` waiting on
+/// `do_clocktick`'s `lock_notify`, instead of polling
+/// `proc::uptime_ticks()` in a spin-yield loop. `crate::proc::clock_tick`
+/// is what actually notices the deadline and delivers the `SYN_ALARM`
+/// that wakes this up.
+///
+/// Also demonstrates `sys_vircopy` (see `vircopy_demo` below) before
+/// settling down, since `CLOCK` is a convenient, deterministic place to
+/// run it: the ring-3 task's code page is populated in `kernel_main`
+/// before any task ever runs, so this works regardless of scheduling
+/// order, without needing to coordinate with that task directly.
 fn clock_task() -> ! {
-    let start = proc::uptime_ticks();
-    while proc::uptime_ticks() < start + 3 {
-        proc::yield_now();
-    }
-    serial_println!("[clock] {} real PIT ticks observed since boot", proc::uptime_ticks());
-    ipc::receive(com::ANY); // never actually sent to in this demo; parks CLOCK for good
+    calls::sys_setalarm(3);
+    let notif = ipc::receive(com::CLOCK);
+    assert_eq!(notif.m_type, calls::SYN_ALARM, "expected a SYN_ALARM notification");
+    serial_println!(
+        "[clock] woken by a real SYN_ALARM notification (m_type {:#x}) after {} real PIT ticks",
+        notif.m_type,
+        proc::uptime_ticks()
+    );
+
+    vircopy_demo();
+
+    ipc::receive(com::ANY); // nothing left to receive; parks CLOCK for good
     unreachable!("nothing sends to CLOCK in this demo");
+}
+
+/// Proves `sys_vircopy` (`crate::calls`) genuinely translates through a
+/// *different* process's page table rather than the currently-active one:
+/// reads the ring-3 demo task's code page back out of its own, private
+/// address space (built in `kernel_main`) into a local kernel buffer, and
+/// checks the bytes match what `usermode::create_address_space` wrote
+/// there. `CLOCK` runs entirely in the kernel's own address space, so this
+/// is a genuine cross-address-space copy, not a same-space one in
+/// disguise.
+fn vircopy_demo() {
+    let mut buf = [0u8; usermode::USER_CODE.len()];
+    calls::sys_vircopy(
+        com::DRVR_PROC_NR,
+        x86_64::VirtAddr::new(usermode::USER_CODE_ADDR),
+        com::CLOCK,
+        x86_64::VirtAddr::new(buf.as_mut_ptr() as u64),
+        buf.len(),
+    )
+    .expect("sys_vircopy failed");
+    serial_println!(
+        "[clock] sys_vircopy read back {:?} from the ring-3 task's own address space (expected {:?})",
+        buf,
+        usermode::USER_CODE
+    );
+    assert_eq!(buf, usermode::USER_CODE, "sys_vircopy returned the wrong bytes");
 }
 
 /// Temporary stand-in for the `pm` server (see `spawn_tasks`): proves
