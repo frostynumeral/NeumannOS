@@ -46,6 +46,8 @@
 use core::ptr;
 use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
+use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::structures::paging::PhysFrame;
 use x86_64::VirtAddr;
 
 use crate::com;
@@ -105,15 +107,27 @@ pub struct Proc {
     /// `p_sendto`: destination this process is blocked trying to `SEND` to.
     send_to: i32,
     /// `p_messbuf`: pointer to the caller's own message buffer. Sound
-    /// because everything in this port shares one address space and a
-    /// blocked process's stack frame (and thus this pointer's target)
-    /// stays alive, untouched, for exactly as long as it remains blocked.
+    /// because IPC always happens in kernel context (even for a ring-3
+    /// task, `mini_send`/`mini_receive` only ever run from inside a trap
+    /// handler), where every task's memory is visible regardless of whose
+    /// `cr3` happens to be loaded (`new_address_space` clones the
+    /// kernel's mappings into every task-private table -- see
+    /// `crate::memory`) -- and a blocked process's stack frame (and thus
+    /// this pointer's target) stays alive, untouched, for exactly as long
+    /// as it remains blocked.
     messbuf: *mut Message,
     /// This task's entry point. Not part of `struct proc` in the C kernel
     /// (there, `p_reg.pc` -- the saved instruction pointer -- serves the
     /// same purpose once execution is underway); kept separately here so
     /// `trampoline` can find it the first time this task is switched to.
     entry: fn() -> !,
+    /// This task's own address space, if it has one distinct from the
+    /// kernel's (`crate::memory::new_address_space`) -- `None` for every
+    /// task so far except the ring-3 demo (`crate::usermode`), which is
+    /// the only one with anything private to isolate. `reschedule`/
+    /// `start` load this (or the kernel's own, if `None`) into `CR3`
+    /// whenever this task becomes current.
+    cr3: Option<PhysFrame>,
 }
 
 fn never_spawned() -> ! {
@@ -144,6 +158,7 @@ impl Proc {
             send_to: com::NONE,
             messbuf: ptr::null_mut(),
             entry: never_spawned,
+            cr3: None,
         }
     }
 
@@ -188,6 +203,10 @@ struct Scheduler {
     prev_for_penalty: Option<usize>,
     /// `realtime`: ticks elapsed since the timer was programmed.
     ticks: u64,
+    /// The kernel's own address space (whatever was active when this was
+    /// first read, before any task ever gets its own -- see
+    /// `Proc::cr3`), loaded whenever the current task doesn't have one.
+    kernel_cr3: (PhysFrame, Cr3Flags),
 }
 
 impl Scheduler {
@@ -282,6 +301,7 @@ lazy_static::lazy_static! {
         next_ptr: None,
         prev_for_penalty: None,
         ticks: 0,
+        kernel_cr3: Cr3::read(),
     });
 }
 
@@ -297,7 +317,11 @@ fn with_scheduler<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
 /// first time lands in `trampoline` (see below), and enqueue it as ready.
 /// Standalone equivalent of an image-table entry in `kernel/table.c` plus
 /// the register initialization `kernel/main.c` does for each boot-image
-/// process before the first `restart()`.
+/// process before the first `restart()`. `address_space` is `None` for a
+/// task that runs in the kernel's own address space (every task so far
+/// except the ring-3 demo -- see `Proc::cr3`), or
+/// `Some(`the PML4 frame `crate::memory::new_address_space` returned`)`
+/// for one that needs its own.
 pub fn spawn(
     proc_nr: i32,
     name: &'static str,
@@ -305,6 +329,7 @@ pub fn spawn(
     priority: u8,
     quantum: i32,
     preemptible: bool,
+    address_space: Option<PhysFrame>,
 ) {
     let idx = com::slot(proc_nr);
     // Build the initial stack frame that `switch_to`'s epilogue will pop:
@@ -344,6 +369,7 @@ pub fn spawn(
             send_to: com::NONE,
             messbuf: ptr::null_mut(),
             entry,
+            cr3: address_space,
         };
         sched.enqueue(idx);
     });
@@ -410,7 +436,7 @@ unsafe extern "C" fn switch_to(prev_rsp: *mut u64, next_rsp: u64) {
 /// call from either ordinary task code or from inside an interrupt
 /// handler; see `switch_to`'s doc comment for why.
 pub fn reschedule() {
-    let switch: Option<(usize, *mut u64, u64)> = with_scheduler(|sched| {
+    let switch: Option<(usize, *mut u64, u64, PhysFrame, Cr3Flags)> = with_scheduler(|sched| {
         let next = match sched.next_ptr {
             Some(n) => n,
             None => panic!("reschedule(): no runnable process (not even IDLE?)"),
@@ -423,13 +449,18 @@ pub fn reschedule() {
         unsafe { NEXT_ENTRY = sched.procs[next].entry };
         let prev_ptr: *mut u64 = &mut sched.procs[prev].rsp;
         let next_rsp = sched.procs[next].rsp;
-        Some((next, prev_ptr, next_rsp))
+        let (next_cr3, next_cr3_flags) = sched.procs[next].cr3.map_or(sched.kernel_cr3, |frame| {
+            (frame, sched.kernel_cr3.1)
+        });
+        Some((next, prev_ptr, next_rsp, next_cr3, next_cr3_flags))
     });
-    if let Some((next, prev_ptr, next_rsp)) = switch {
+    if let Some((next, prev_ptr, next_rsp, next_cr3, next_cr3_flags)) = switch {
         // Before the switch, not after: if `next` is already in ring 3 (or
         // gets there right after resuming), the CPU needs to find *its*
-        // RSP0 in place the moment a trap lands, not the outgoing task's.
+        // RSP0 (and its own address space) in place the moment a trap
+        // lands, not the outgoing task's.
         gdt::set_rsp0(VirtAddr::new(stack_top(next)));
+        unsafe { Cr3::write(next_cr3, next_cr3_flags) };
         unsafe { switch_to(prev_ptr, next_rsp) };
     }
 }
@@ -652,14 +683,18 @@ pub fn mini_notify(dst: i32, m_type: i32) {
 /// calling `restart()` at the end of `kernel/main.c` -- like there, this
 /// never returns: `kernel_main`'s stack is simply abandoned.
 pub fn start() -> ! {
-    let (next, next_rsp) = with_scheduler(|sched| {
+    let (next, next_rsp, next_cr3, next_cr3_flags) = with_scheduler(|sched| {
         sched.pick_proc();
         let next = sched.next_ptr.expect("start(): no task was spawned");
         sched.current = next;
         unsafe { NEXT_ENTRY = sched.procs[next].entry };
-        (next, sched.procs[next].rsp)
+        let (next_cr3, next_cr3_flags) = sched.procs[next].cr3.map_or(sched.kernel_cr3, |frame| {
+            (frame, sched.kernel_cr3.1)
+        });
+        (next, sched.procs[next].rsp, next_cr3, next_cr3_flags)
     });
     gdt::set_rsp0(VirtAddr::new(stack_top(next)));
+    unsafe { Cr3::write(next_cr3, next_cr3_flags) };
     let mut discarded: u64 = 0;
     unsafe { switch_to(&mut discarded, next_rsp) };
     unreachable!("switch_to into the first task must not return to the bootstrap context");
