@@ -54,3 +54,16 @@ pub fn receive(src: i32) -> Message {
 pub fn notify(dst: i32, m_type: i32) {
     proc::mini_notify(dst, m_type);
 }
+
+/// Analogous to `SENDREC`: `send` a request to `dst`, then `receive` its
+/// reply, matching the "call a server, block for its answer" pattern
+/// every server client (`crate::fs`'s `open`/`read`/`write` client stubs,
+/// for one) uses. Real MINIX implements this as one kernel call so a
+/// send/receive pair can't be interleaved with an unrelated message from
+/// someone else; this port just does the two blocking steps back to
+/// back, which is equivalent as long as `dst` only ever replies to the
+/// most recent request it received -- true for every current server.
+pub fn send_receive(dst: i32, msg: Message) -> Message {
+    send(dst, msg);
+    receive(dst)
+}

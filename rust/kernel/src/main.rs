@@ -25,6 +25,7 @@ extern crate alloc;
 mod allocator;
 mod calls;
 mod com;
+mod fs;
 mod gdt;
 mod interrupts;
 mod ipc;
@@ -251,10 +252,47 @@ fn demo_pm_task() -> ! {
     }
 
     fork_demo();
+    fs_rw_demo();
 
     serial_println!("[pm] demo finished, blocking for good");
     ipc::receive(com::ANY); // nothing left to receive; parks pm so idle can run
     unreachable!("nothing sends to pm once the demo is done");
+}
+
+/// Proves `fs` (see `spawn_tasks`, now `fs::InMemoryFs::serve` instead of
+/// a ping-pong stand-in) genuinely serves open/write/read requests over
+/// IPC, backed by real in-memory storage rather than just echoing back
+/// whatever it was sent: opens a file, writes to it, reopens it fresh
+/// (a distinct file descriptor, its own cursor starting at 0) and reads
+/// the bytes back, checking they round-trip -- then reads once more past
+/// end of file and checks that comes back empty rather than repeating
+/// data or blocking forever.
+fn fs_rw_demo() {
+    let written = b"hello from pm, stored in fs";
+
+    let write_fd = fs::open("/hello.txt");
+    assert!(write_fd >= 0, "fs::open failed: {}", write_fd);
+    let n = fs::write(write_fd, written);
+    serial_println!("[pm] wrote {} bytes to /hello.txt via fs (fd {})", n, write_fd);
+    assert_eq!(n, written.len() as i64, "fs::write didn't accept the whole buffer");
+
+    let read_fd = fs::open("/hello.txt");
+    assert!(read_fd >= 0, "fs::open (reopen) failed: {}", read_fd);
+    assert_ne!(read_fd, write_fd, "reopening the same file should hand back a fresh descriptor");
+    let mut buf = [0u8; 64];
+    let n = fs::read(read_fd, &mut buf);
+    assert_eq!(n, written.len() as i64, "fs::read returned the wrong length");
+    let round_tripped = &buf[..n as usize];
+    serial_println!(
+        "[pm] read back {:?} from fs (expected {:?})",
+        core::str::from_utf8(round_tripped).unwrap_or("<invalid utf8>"),
+        core::str::from_utf8(written).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(round_tripped, written, "fs did not return the bytes that were written");
+
+    let n = fs::read(read_fd, &mut buf);
+    serial_println!("[pm] read past end of file returned {} bytes (expected 0)", n);
+    assert_eq!(n, 0, "reading past end of file should return 0, not repeat data or error");
 }
 
 /// Proves `sys_fork` (`crate::calls`) gives the child a genuinely
@@ -337,8 +375,12 @@ fn forked_child_task() -> ! {
     unreachable!("nothing sends to init in this demo");
 }
 
-/// Temporary stand-in for the `fs` server (see `spawn_tasks`): the other
-/// half of the `demo_pm_task` ping/pong.
+/// `fs` (see `spawn_tasks`): still starts with the same ping/pong
+/// `demo_pm_task` opens with (proving plain blocking `send`/`receive`
+/// still works), then becomes a real file server -- an
+/// `fs::InMemoryFs` that genuinely stores and serves open/read/write
+/// requests over IPC (`fs_rw_demo`), rather than a stand-in that only
+/// ever echoes a fixed reply.
 fn demo_fs_task() -> ! {
     for _ in 0..3 {
         let ping = ipc::receive(com::PM_PROC_NR);
@@ -348,9 +390,8 @@ fn demo_fs_task() -> ! {
             ipc::Message { source: com::FS_PROC_NR, m_type: 200, args: [ping.args[0] + 100, 0, 0, 0] },
         );
     }
-    serial_println!("[fs] demo finished, blocking for good");
-    ipc::receive(com::ANY); // nothing left to receive; parks fs so idle can run
-    unreachable!("nothing sends to fs once the demo is done");
+    serial_println!("[fs] ping/pong done, now serving real open/read/write requests");
+    fs::InMemoryFs::new().serve()
 }
 
 /// Both proofs of asynchronous preemption: a tight, CPU-bound loop with no

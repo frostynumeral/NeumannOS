@@ -14,7 +14,9 @@ its first real kernel calls (a genuine cross-address-space `sys_vircopy`;
 it polling), and can `sys_fork` a real child process with a *deep-copied*,
 independent address space (verified by writing to the child's copy and
 confirming the parent's is untouched, not just aliasing the same physical
-memory) — enough to build the rest of the system on top of.
+memory), and now a real `fs` server backing genuine open/read/write
+requests with an in-memory filesystem over IPC (not a fixed-reply
+stand-in) — enough to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -38,6 +40,9 @@ external contract.
   MINIX's `SEND`/`RECEIVE`/`NOTIFY` kernel calls. These genuinely block now
   (see `src/proc.rs`): a `send`/`receive` that can't complete immediately
   context-switches to another runnable task instead of returning an error.
+  Also `send_receive`, standing in for `SENDREC`: `send` a request then
+  `receive` its reply, the "call a server, block for the answer" pattern
+  every server client (`src/fs.rs`'s `open`/`read`/`write` stubs) uses.
 - `src/proc.rs` — the process table and scheduler, ported from
   `kernel/proc.h`/`kernel/proc.c`: `NR_SCHED_QUEUES` priority-ordered ready
   queues, `enqueue`/`dequeue`/`sched`/`pick_proc`, and the rendezvous IPC
@@ -162,6 +167,20 @@ external contract.
   (`proc::spawn`) -- bundling what real MINIX splits into a kernel call
   (duplicate the memory) and a separate scheduling step, since nothing in
   this port needs them separated yet.
+- `src/fs.rs` — a real, in-memory file server, replacing `fs`'s ping-pong
+  stand-in. No single C file to port: real `servers/fs` is a whole
+  subsystem (`open.c`/`read.c`/`write.c`/`path.c`, an inode/block-cache
+  layer over a real block device) this port has no device driver or
+  on-disk layout to back yet, so this is the minimal slice of its
+  *external behavior* -- an open/read/write request-reply protocol over
+  `crate::ipc`, backing files that live in heap-allocated `Vec<u8>`s
+  instead of on disk. `InMemoryFs::serve` is the server loop (`receive`
+  from anyone, dispatch on `m_type`, `send` a reply), mirroring
+  `servers/fs/main.c`'s `while (TRUE) { get_work(); ...; reply(...); }`
+  shape; `open`/`write`/`read` are client-side stubs (using `ipc`'s new
+  `send_receive`) that any task can call to talk to it, mirroring
+  `src/calls.rs`'s kernel-call wrappers in shape even though these cross
+  a real IPC round trip rather than a direct function call.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
   and the heap, builds the ring-3 demo task's address space and maps its
@@ -170,11 +189,16 @@ external contract.
   real kernel tasks (same as the boot image), plus temporary stand-in
   bodies in the `pm`/`fs`/`rs`/`memory`/`driver` process table slots:
   `pm`/`fs` ping-pong three blocking messages back and forth (exercising
-  the rendezvous IPC) -- `pm` also `sys_fork`s the ring-3 task's code page
-  into a brand new `init` process afterward, then overwrites *just the
-  child's copy* with a canary value and reads back both copies to prove
-  they've genuinely diverged, not aliased the same physical page -- and
-  `rs`/`memory` each spin in a tight, CPU-bound loop with no
+  the rendezvous IPC), after which `fs` becomes a real file server
+  (`fs::InMemoryFs::serve`) and `pm` exercises it: opens a file, writes to
+  it, reopens it fresh (a distinct file descriptor with its own cursor)
+  and reads the bytes back, checking they round-trip, then reads once
+  more past end of file and checks that comes back empty. `pm` also
+  `sys_fork`s the ring-3 task's code page into a brand new `init` process,
+  then overwrites *just the child's copy* with a canary value and reads
+  back both copies to prove they've genuinely diverged, not aliased the
+  same physical page -- and `rs`/`memory` each spin in a tight, CPU-bound
+  loop with no
   `yield_now()`/IPC call anywhere in it (proving the timer interrupt truly
   preempts a task asynchronously, mid-loop, rather than only ever
   switching at cooperative checkpoints). `driver` runs the ring-3 demo task
@@ -310,6 +334,32 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   only `next_timeout <= realtime` like `kernel/clock.c` does. Fine at
   `NR_PROCS` scale; would need the sorted-queue approach at real scale.
 
+### Known simplifications in `fs`
+
+- **No real filesystem hierarchy.** Files are looked up by an exact-match
+  flat name (no directories, no `/`-separated path resolution -- see
+  `servers/fs/path.c`'s `lookup()` for what the real thing does), and
+  there's no `unlink`/`stat`/permissions/inode-number concept at all yet.
+- **No cross-address-space copy.** Request/reply args carry raw pointers
+  valid in the caller's address space directly, since `fs` and every
+  current caller (`pm`) still share the kernel's own address space (see
+  "known simplifications in the ring-3 task" above); a real, isolated
+  `fs` server would need a `sys_vircopy`-style copy for every buffer, the
+  same way `sys_vircopy` itself does for `sys_fork`'d tasks.
+- **`open` always creates**, and there's no `close`: a file descriptor is
+  never freed once allocated (`InMemoryFs::open`'s slot table only ever
+  grows), and repeated opens of the same name return independent
+  descriptors with independent cursors rather than sharing or refusing
+  based on any open-file-table policy.
+- **In-memory only.** There's no backing device, so nothing here survives
+  a reboot -- there's no block layer, block cache, or on-disk layout at
+  all (`kernel/kernel.h`'s device abstractions, `servers/fs`'s
+  buffer cache), just a `Vec<(String, Vec<u8>)>` that lives as long as
+  the kernel does.
+- **No error variety.** Every failure (`EBADF` alone) covers "bad
+  descriptor" and "unrecognized request" both; real `fs` distinguishes
+  many more `errno` values (`ENOENT`, `EACCES`, `ENOSPC`, ...).
+
 ## What's not implemented yet (roadmap)
 
 Roughly in the order the original kernel needs them:
@@ -359,17 +409,21 @@ Roughly in the order the original kernel needs them:
 10. **The servers themselves**: `pm` (process manager), `fs` (file system),
     `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
     order, matching `servers/` and `drivers/` in the C tree -- replacing the
-    temporary stand-ins in `main.rs`. Two slices done: `proc::spawn` is
+    temporary stand-ins in `main.rs`. Three slices done: `proc::spawn` is
     proven safe to call from an already-running task, not just
     `kernel_main`'s boot-time setup (`clock_task` dynamically spawns `log`
-    at runtime); and `sys_fork` gives a task a real way to create a child
-    with its own independent memory (`pm`'s `init` demo) -- the two
-    primitives real `rs`/`pm` actually need. Still missing: a real `rs`
-    that decides *what* to start and *why* (crash detection/restart
-    policy, `servers/rs/manager.c`), full POSIX fork/exec semantics (the
-    child resuming from the parent's exact call site, and loading a
-    program image rather than starting at a fixed entry point), and a real
-    filesystem for `fs`.
+    at runtime); `sys_fork` gives a task a real way to create a child with
+    its own independent memory (`pm`'s `init` demo); and `fs` (`src/fs.rs`)
+    is now a real, in-memory file server answering genuine open/read/write
+    requests over IPC, not a fixed-reply stand-in (`pm`'s open/write/reopen/
+    read/read-past-EOF demo). Still missing: a real `rs` that decides
+    *what* to start and *why* (crash detection/restart policy,
+    `servers/rs/manager.c`), full POSIX fork/exec semantics (the child
+    resuming from the parent's exact call site, and loading a program
+    image rather than starting at a fixed entry point), and `fs` growing
+    a real directory hierarchy, cross-address-space copies, and a backing
+    store (see "known simplifications in `fs`" above) rather than a flat,
+    in-memory, single-address-space file table.
 11. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 
 ## Building
@@ -418,7 +472,11 @@ COM1: a heap self-test (`Box`/`Vec` both actually work), an isolation
 self-test (the ring-3 demo's code page translates to `None` through the
 kernel's own page table -- it only exists in that task's private address
 space), the boot image table, the `pm`/`fs` demo tasks ping-ponging three
-messages back and forth (blocking `send`/`receive`) followed by `pm`
+messages back and forth (blocking `send`/`receive`), after which `fs`
+becomes a real file server and `pm` opens a file, writes to it, reopens it
+fresh, reads the bytes back (checking they round-trip through actual
+in-memory storage, not a fixed echo), and reads once more past end of
+file (checking that returns `0` instead of repeating data), then `pm`
 `sys_fork`ing a real child (`init`) and proving its copy of the ring-3
 task's code page has genuinely diverged (a canary written to the child's
 copy doesn't show up in the original), five ring-3 round
