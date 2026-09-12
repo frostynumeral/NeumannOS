@@ -37,6 +37,7 @@ mod proc;
 mod serial;
 mod table;
 mod usermode;
+mod vga;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -62,6 +63,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("survived breakpoint exception");
 
     let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+
+    // Draw the LCARS-style demo panel as early as possible: it only
+    // needs the physical-memory window the bootloader's own
+    // `map_physical_memory` feature already set up (see vga.rs), not
+    // paging/heap/scheduler setup below, so it stays visible on screen
+    // even if something later in boot panics.
+    vga::init_palette();
+    vga::draw_demo_panel(vga::framebuffer(phys_mem_offset));
+    serial_println!("vga: painted the LCARS demo panel (mode 13h, 320x200)");
+
     let mut mapper = unsafe { memory::init(phys_mem_offset) };
     unsafe { memory::init_frame_allocator(&boot_info.memory_map) };
     allocator::init_heap(&mut mapper).expect("heap initialization failed");
