@@ -5,13 +5,18 @@
 //! The original `exception()` function is a single dispatcher indexed by
 //! vector number: for a fault in a user process it converts the fault into
 //! a POSIX signal (`SIGFPE`, `SIGSEGV`, ...) delivered to that process; for
-//! a fault in a kernel task it panics. This port has no user processes or
-//! signals yet (see `rust/README.md`), so every handler here takes the
-//! "kernel task" branch: report the fault and halt. What's new compared to
-//! the C version is the double-fault handler, which needs its own
-//! dedicated stack (set up in `crate::gdt`) purely so that a fault *while
-//! already faulting* — e.g. a kernel stack overflow — is reported instead
-//! of silently triple-faulting the CPU and resetting the machine.
+//! a fault in a kernel task it panics. This port has no signals yet (see
+//! `rust/README.md`), so a fault in a *ring-3* task instead goes straight
+//! to `crate::proc::kill` (`recover_or_halt`, below) -- the same
+//! "stop scheduling it, tell `RS`" primitive real MINIX ultimately drives
+//! through a signal and `PM`'s exit path, collapsed into one direct call.
+//! A fault in a kernel task still takes the original "report and halt"
+//! branch: kernel code is trusted, so a bug in it means the kernel's own
+//! state might already be corrupted. What's new compared to the C
+//! version is the double-fault handler, which needs its own dedicated
+//! stack (set up in `crate::gdt`) purely so that a fault *while already
+//! faulting* — e.g. a kernel stack overflow — is reported instead of
+//! silently triple-faulting the CPU and resetting the machine.
 //!
 //! `timer_interrupt_handler` is the IRQ0 handler `crate::pic`/`crate::pit`
 //! set up, standing in for the `hwint00`/`clock_handler` pair in
@@ -73,8 +78,33 @@ pub fn init_idt() {
     IDT.load();
 }
 
+/// Shared tail for every CPU-exception handler below that can recover
+/// from a *ring-3* fault: kill the faulting task and switch away
+/// (`crate::proc::kill`/`reschedule`) -- this port's stand-in for real
+/// MINIX turning the fault into a fatal signal for that one process
+/// (`kernel/exception.c`) instead of taking down the whole machine. A
+/// fault in *kernel*-trusted code (RPL 0 -- every kernel task, and every
+/// stand-in server body that still shares the kernel's own address
+/// space) still halts everything: kernel code is trusted, so a bug in it
+/// means the kernel's own state might already be corrupted, and
+/// continuing (even by "just" killing one task) isn't safe. After
+/// `kill()`, `reschedule()` is guaranteed to actually switch away (the
+/// just-killed task can never be `next_ptr` again), so this call site
+/// never really "returns" the way the halting branch never does either --
+/// the compiler just can't see that statically.
+fn recover_or_halt(frame: &InterruptStackFrame, description: &str) {
+    if frame.code_segment.rpl() == PrivilegeLevel::Ring3 {
+        let proc_nr = crate::proc::current_proc_nr();
+        crate::proc::kill(proc_nr, description);
+        crate::proc::reschedule();
+    } else {
+        crate::halt_loop();
+    }
+}
+
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
     crate::serial_println!("EXCEPTION: DIVIDE ERROR\n{:#?}", frame);
+    recover_or_halt(&frame, "divide error");
 }
 
 extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
@@ -83,7 +113,7 @@ extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
     crate::serial_println!("EXCEPTION: INVALID OPCODE\n{:#?}", frame);
-    crate::halt_loop();
+    recover_or_halt(&frame, "invalid opcode");
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(
@@ -95,7 +125,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(
         error_code,
         frame
     );
-    crate::halt_loop();
+    recover_or_halt(&frame, "general protection fault");
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -108,7 +138,7 @@ extern "x86-interrupt" fn page_fault_handler(
         error_code,
         frame
     );
-    crate::halt_loop();
+    recover_or_halt(&frame, "page fault");
 }
 
 extern "x86-interrupt" fn double_fault_handler(

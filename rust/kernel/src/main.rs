@@ -35,6 +35,7 @@ mod memory;
 mod pic;
 mod pit;
 mod proc;
+mod rs;
 mod serial;
 mod syscall;
 mod table;
@@ -143,18 +144,22 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 }
 
 /// Spawn the kernel tasks. `IDLE` and `CLOCK` are real kernel tasks, same
-/// as in the boot image; `pm`/`rs`/`memory`/`driver` don't exist as real
+/// as in the boot image; `pm`/`memory`/`driver` don't exist as real
 /// servers yet (see `rust/README.md`), so their process table slots run
 /// small stand-in bodies instead: `pm` exercises blocking `send`/
-/// `receive` (and now real IPC-served file I/O via `fs`), `rs`/`memory`
-/// (as `busy_task_a`/`busy_task_b`) exercise asynchronous preemption, and
-/// `driver` (as `usermode::ring3_task_entry`) runs in its own address
-/// space (`ring3_address_space`, built in `kernel_main`) -- one of two
-/// tasks here that isn't sharing the kernel's. `fs` is now a real,
-/// in-memory file server (`fs::InMemoryFs::serve`). `tty` (as
-/// `elf::task_entry`) is the other task with its own address space
-/// (`elf_address_space`): a real ELF binary (`elf::HELLO_ELF`), loaded
-/// and run in ring 3 rather than a hand-assembled demo. Priorities,
+/// `receive` (and now real IPC-served file I/O via `fs`), `memory` (as
+/// `busy_task`) exercises asynchronous preemption, and `driver` (as
+/// `usermode::ring3_task_entry`) runs in its own address space
+/// (`ring3_address_space`, built in `kernel_main`) -- one of three tasks
+/// here that isn't sharing the kernel's. `fs` is now a real, in-memory
+/// file server (`fs::InMemoryFs::serve`). `tty` (as `elf::task_entry`)
+/// is another task with its own address space (`elf_address_space`): a
+/// real ELF binary (`elf::HELLO_ELF`), loaded and run in ring 3 rather
+/// than a hand-assembled demo. `rs` is now a real reincarnation server
+/// (`rs::task`), monitoring `flaky` (`rs::spawn_flaky`, the third and
+/// last ring-3 task here) -- a service that crashes the instant it runs
+/// (on purpose, via `ud2`), letting `rs` prove it can restart a dead
+/// process rather than the whole machine going down with it. Priorities,
 /// quantum sizes, and preemptibility match `kernel/table.c`'s image
 /// entries (`IDL_F`/`TSK_F`/`SRV_F` flags) where a real counterpart
 /// exists.
@@ -163,8 +168,16 @@ fn spawn_tasks(ring3_address_space: PhysFrame, elf_address_space: PhysFrame) {
     proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false, None);
     proc::spawn(com::PM_PROC_NR, "pm (demo)", demo_pm_task, 3, 32, true, None);
     proc::spawn(com::FS_PROC_NR, "fs (demo)", demo_fs_task, 4, 32, true, None);
-    proc::spawn(com::RS_PROC_NR, "rs (demo)", busy_task_a, 6, 16, true, None);
-    proc::spawn(com::MEM_PROC_NR, "memory (demo)", busy_task_b, 6, 16, true, None);
+    // Priority 5, one step above the other demo tasks (6): `rs` needs to
+    // already be blocked in `ipc::receive` before `flaky` gets a chance to
+    // crash, since `proc::kill`'s notification to `RS` is fire-and-forget,
+    // exactly like every other notification in this port (see "known
+    // simplifications" in rust/README.md) -- silently dropped if `RS`
+    // isn't receiving yet. A strictly higher priority guarantees `rs`
+    // gets the CPU (and reaches that first blocking `receive`) before any
+    // priority-6 task, including `flaky`, regardless of spawn order.
+    proc::spawn(com::RS_PROC_NR, "rs", rs::task, 5, 16, true, None);
+    proc::spawn(com::MEM_PROC_NR, "memory (demo)", busy_task, 6, 16, true, None);
     proc::spawn(
         com::DRVR_PROC_NR,
         "driver (ring3 demo)",
@@ -183,6 +196,7 @@ fn spawn_tasks(ring3_address_space: PhysFrame, elf_address_space: PhysFrame) {
         true,
         Some(elf_address_space),
     );
+    rs::spawn_flaky();
 }
 
 /// Real MINIX's idle task just halts, waking on the next interrupt; ported
@@ -506,20 +520,21 @@ fn demo_fs_task() -> ! {
     fs::InMemoryFs::new().serve()
 }
 
-/// Both proofs of asynchronous preemption: a tight, CPU-bound loop with no
-/// `yield_now()` or IPC call anywhere in it. `busy_task_a` and
-/// `busy_task_b` share a priority queue (see `spawn_tasks`), so the only
-/// way both ever get to run is the timer interrupt forcibly reordering the
-/// ready queue and switching away once each one's quantum is used up
-/// (`proc::clock_tick` + `proc::reschedule`, called from
-/// `crate::interrupts::timer_interrupt_handler`) -- with the previous
-/// milestone's purely-cooperative scheduler, whichever of these ran first
-/// would simply never yield the CPU to the other.
-fn busy_task_a() -> ! {
-    busy_loop("rs")
-}
-
-fn busy_task_b() -> ! {
+/// Proof of asynchronous preemption: a tight, CPU-bound loop with no
+/// `yield_now()` or IPC call anywhere in it, spun forever until its own
+/// timeout. The only way this ever gets interrupted at all is the timer
+/// forcibly reordering the ready queue and switching away once its
+/// quantum is used up (`proc::clock_tick` + `proc::reschedule`, called
+/// from `crate::interrupts::timer_interrupt_handler`) -- with the
+/// previous milestone's purely-cooperative scheduler, this would simply
+/// never yield the CPU to anything else. (An earlier version of this
+/// demo paired two of these -- `rs` and `memory` -- sharing a priority
+/// queue, so their forced trade-off was visible in the log; `rs` has
+/// since become a real task (`rs::task`), so `memory` now demonstrates
+/// this alone -- its counter still resumes from exactly where it left
+/// off after every other runnable task, including `rs`'s restart
+/// activity, gets its turn.)
+fn busy_task() -> ! {
     busy_loop("memory")
 }
 

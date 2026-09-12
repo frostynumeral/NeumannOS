@@ -27,4 +27,5 @@ pub static BOOT_IMAGE: [BootImageEntry; NR_BOOT_PROCS] = [
     BootImageEntry { proc_nr: LOG_PROC_NR, name: "log" },
     BootImageEntry { proc_nr: DRVR_PROC_NR, name: "driver" },
     BootImageEntry { proc_nr: INIT_PROC_NR, name: "init" },
+    BootImageEntry { proc_nr: FLAKY_PROC_NR, name: "flaky" },
 ];

@@ -42,8 +42,12 @@ pub const LOG_PROC_NR: i32 = 4;
 pub const TTY_PROC_NR: i32 = 5;
 pub const DRVR_PROC_NR: i32 = 6;
 pub const INIT_PROC_NR: i32 = 7;
+/// `crate::rs`'s demo service: a real ring-3 task whose only instruction
+/// deterministically crashes it, so `rs`'s restart policy has something
+/// real to prove itself against.
+pub const FLAKY_PROC_NR: i32 = 8;
 
-pub const NR_BOOT_PROCS: usize = NR_TASKS + INIT_PROC_NR as usize + 1;
+pub const NR_BOOT_PROCS: usize = NR_TASKS + FLAKY_PROC_NR as usize + 1;
 
 /// Map a process number to a dense array index, for the process table
 /// (`crate::proc`) and the IPC mailboxes it used to have on its own
@@ -64,3 +68,36 @@ pub const fn notify_from(p_nr: i32) -> i32 {
 pub const SYN_ALARM: i32 = notify_from(CLOCK);
 pub const SYS_SIG: i32 = notify_from(SYSTEM);
 pub const HARD_INT: i32 = notify_from(HARDWARE);
+
+/// Marker bit for "a process died" notifications (`crate::proc::kill`).
+/// No real MINIX message type is quite this: `kernel/proc.c`'s
+/// `cause_sig`/PM's exit path deliver a real signal or exit status, not a
+/// bare notification, and this port has neither yet (see `crate::rs`'s
+/// doc comment). The low bits carry the dead process's *slot* (`slot`),
+/// not its process number, so `RS` learns *which* process died without
+/// needing a separate payload/args field -- `proc_died`/`proc_died_slot`
+/// are the encode/decode pair.
+pub const PROC_DIED: i32 = 0x4000;
+
+pub const fn proc_died(p_nr: i32) -> i32 {
+    PROC_DIED | slot(p_nr) as i32
+}
+
+/// Decode a `proc_died` notification's `m_type` back to a slot index, or
+/// `None` if it isn't one (every other notification type in this file
+/// uses the `NOTIFY_MESSAGE` (`0x1000`) bit instead, so the two never
+/// collide).
+pub const fn proc_died_slot(m_type: i32) -> Option<usize> {
+    if m_type & PROC_DIED != 0 {
+        Some((m_type & !PROC_DIED) as usize)
+    } else {
+        None
+    }
+}
+
+/// The inverse of `slot`: which process number lives in a given process-
+/// table index. Only `crate::rs` needs this so far, to turn a
+/// `proc_died_slot` result back into a real process number.
+pub const fn proc_nr_of_slot(slot: usize) -> i32 {
+    slot as i32 - NR_TASKS as i32
+}
