@@ -46,8 +46,10 @@
 use core::ptr;
 use spin::Mutex;
 use x86_64::instructions::interrupts::without_interrupts;
+use x86_64::VirtAddr;
 
 use crate::com;
+use crate::gdt;
 use crate::ipc::Message;
 
 pub const NR_SCHED_QUEUES: usize = 16;
@@ -157,6 +159,21 @@ impl Proc {
 #[repr(align(16))]
 struct Stacks([[u8; STACK_SIZE]; NR_PROCS]);
 static mut STACKS: Stacks = Stacks([[0; STACK_SIZE]; NR_PROCS]);
+
+/// The fixed top of `idx`'s dedicated kernel stack. Used both as the base
+/// a freshly spawned task's initial stack frame is built downward from
+/// (`spawn`) and, unchanged for that task's whole lifetime, as the value
+/// `crate::gdt::set_rsp0` needs whenever this task becomes current
+/// (`reschedule`, `start`): the CPU should always find an empty stack here
+/// to push a trap frame onto, which holds because a task that has entered
+/// ring 3 (`crate::usermode`) never touches its own kernel stack again
+/// until a trap brings it back.
+fn stack_top(idx: usize) -> u64 {
+    unsafe {
+        let stack = ptr::addr_of_mut!(STACKS.0[idx]);
+        (stack as *mut u8).add(STACK_SIZE) as u64
+    }
+}
 
 struct Scheduler {
     procs: [Proc; NR_PROCS],
@@ -296,9 +313,7 @@ pub fn spawn(
     // jump to -- landing in `trampoline` on this task's own stack for the
     // very first time it runs.
     let rsp = unsafe {
-        let stack = ptr::addr_of_mut!(STACKS.0[idx]);
-        let top = (stack as *mut u8).add(STACK_SIZE);
-        let frame = (top as usize & !0xf) as *mut u64; // 16-byte align
+        let frame = (stack_top(idx) as usize & !0xf) as *mut u64; // 16-byte align
         let frame = frame.sub(8);
         frame.add(0).write(0); // r15
         frame.add(1).write(0); // r14
@@ -395,7 +410,7 @@ unsafe extern "C" fn switch_to(prev_rsp: *mut u64, next_rsp: u64) {
 /// call from either ordinary task code or from inside an interrupt
 /// handler; see `switch_to`'s doc comment for why.
 pub fn reschedule() {
-    let switch: Option<(*mut u64, u64)> = with_scheduler(|sched| {
+    let switch: Option<(usize, *mut u64, u64)> = with_scheduler(|sched| {
         let next = match sched.next_ptr {
             Some(n) => n,
             None => panic!("reschedule(): no runnable process (not even IDLE?)"),
@@ -408,9 +423,13 @@ pub fn reschedule() {
         unsafe { NEXT_ENTRY = sched.procs[next].entry };
         let prev_ptr: *mut u64 = &mut sched.procs[prev].rsp;
         let next_rsp = sched.procs[next].rsp;
-        Some((prev_ptr, next_rsp))
+        Some((next, prev_ptr, next_rsp))
     });
-    if let Some((prev_ptr, next_rsp)) = switch {
+    if let Some((next, prev_ptr, next_rsp)) = switch {
+        // Before the switch, not after: if `next` is already in ring 3 (or
+        // gets there right after resuming), the CPU needs to find *its*
+        // RSP0 in place the moment a trap lands, not the outgoing task's.
+        gdt::set_rsp0(VirtAddr::new(stack_top(next)));
         unsafe { switch_to(prev_ptr, next_rsp) };
     }
 }
@@ -633,13 +652,14 @@ pub fn mini_notify(dst: i32, m_type: i32) {
 /// calling `restart()` at the end of `kernel/main.c` -- like there, this
 /// never returns: `kernel_main`'s stack is simply abandoned.
 pub fn start() -> ! {
-    let next_rsp = with_scheduler(|sched| {
+    let (next, next_rsp) = with_scheduler(|sched| {
         sched.pick_proc();
         let next = sched.next_ptr.expect("start(): no task was spawned");
         sched.current = next;
         unsafe { NEXT_ENTRY = sched.procs[next].entry };
-        sched.procs[next].rsp
+        (next, sched.procs[next].rsp)
     });
+    gdt::set_rsp0(VirtAddr::new(stack_top(next)));
     let mut discarded: u64 = 0;
     unsafe { switch_to(&mut discarded, next_rsp) };
     unreachable!("switch_to into the first task must not return to the bootstrap context");

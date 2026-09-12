@@ -3,17 +3,17 @@
 //! This is the Rust port's `kernel/main.c` equivalent: it boots, sets up
 //! the GDT/IDT so CPU faults are reported instead of triple-faulting
 //! (`crate::gdt`, `crate::interrupts`), sets up paging and a heap
-//! allocator (`crate::memory`, `crate::allocator`), proves a one-shot ring
-//! 3 round trip works (`crate::usermode`), programs the PIC/PIT and
-//! enables interrupts so the timer starts driving real,
-//! asynchronously-preemptive scheduling (`crate::pic`, `crate::pit`,
-//! `crate::proc`), prints the boot image (the process table MINIX would
-//! load into memory at this point), spawns the kernel tasks
-//! (`crate::proc`), and hands off to the scheduler -- just as
-//! `kernel/main.c` ends by calling `restart()`. There is no per-process
-//! address-space isolation, and the ring-3 demo isn't yet a real,
-//! schedulable user-mode process — see `rust/README.md` for what's
-//! implemented versus planned.
+//! allocator (`crate::memory`, `crate::allocator`), maps the ring-3 demo
+//! task's pages (`crate::usermode`), spawns the kernel tasks
+//! (`crate::proc`) -- including that ring-3 task, which can now be
+//! asynchronously preempted and take repeated traps like any other task,
+//! since each task has its own dedicated `RSP0` (`crate::gdt::set_rsp0`) --
+//! programs the PIC/PIT and enables interrupts so the timer starts driving
+//! real, asynchronously-preemptive scheduling, prints the boot image (the
+//! process table MINIX would load into memory at this point), and hands
+//! off to the scheduler -- just as `kernel/main.c` ends by calling
+//! `restart()`. There is no per-process address-space isolation yet — see
+//! `rust/README.md` for what's implemented versus planned.
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
@@ -81,12 +81,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     drop(boxed);
     drop(vec);
 
-    // Self-test: a one-shot round trip to ring 3 and back (see
-    // usermode.rs for why this isn't yet a real, schedulable user
-    // process). Runs before the timer/scheduler exist, precisely so there
-    // is no risk of it being asynchronously preempted mid-excursion.
-    usermode::demo(&mut mapper, &mut frame_allocator);
-    serial_println!("returned from ring 3 to kernel_main");
+    // Map the ring-3 demo task's code/stack pages now, while `mapper`/
+    // `frame_allocator` are handy; the task itself (spawned below) does
+    // the actual jump to ring 3 once the scheduler runs it.
+    usermode::map_demo_pages(&mut mapper, &mut frame_allocator);
     serial_println!();
 
     serial_println!("boot image:");
@@ -113,13 +111,15 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 }
 
 /// Spawn the kernel tasks. `IDLE` and `CLOCK` are real kernel tasks, same
-/// as in the boot image; `pm`/`fs`/`rs`/`memory` don't exist as real
-/// servers yet (there's no user mode to run them in -- see
-/// `rust/README.md`), so their process table slots run small stand-in
-/// bodies instead: `pm`/`fs` exercise blocking `send`/`receive`, and
+/// as in the boot image; `pm`/`fs`/`rs`/`memory`/`driver` don't exist as
+/// real servers yet (there's no per-process address space to run them in
+/// -- see `rust/README.md`), so their process table slots run small
+/// stand-in bodies instead: `pm`/`fs` exercise blocking `send`/`receive`,
 /// `rs`/`memory` (as `busy_task_a`/`busy_task_b`) exercise asynchronous
-/// preemption. Priorities, quantum sizes, and preemptibility match
-/// `kernel/table.c`'s image entries (`IDL_F`/`TSK_F`/`SRV_F` flags).
+/// preemption, and `driver` (as `usermode::ring3_task_entry`) exercises a
+/// real, scheduler-integrated ring-3 task. Priorities, quantum sizes, and
+/// preemptibility match `kernel/table.c`'s image entries
+/// (`IDL_F`/`TSK_F`/`SRV_F` flags).
 fn spawn_tasks() {
     proc::spawn(com::IDLE, "IDLE", idle_task, proc::IDLE_Q, 8, true);
     proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false);
@@ -127,6 +127,7 @@ fn spawn_tasks() {
     proc::spawn(com::FS_PROC_NR, "fs (demo)", demo_fs_task, 4, 32, true);
     proc::spawn(com::RS_PROC_NR, "rs (demo)", busy_task_a, 6, 16, true);
     proc::spawn(com::MEM_PROC_NR, "memory (demo)", busy_task_b, 6, 16, true);
+    proc::spawn(com::DRVR_PROC_NR, "driver (ring3 demo)", usermode::ring3_task_entry, 6, 16, true);
 }
 
 /// Real MINIX's idle task just halts, waking on the next interrupt; ported
