@@ -8,7 +8,17 @@ To acquire the CD-ROM ISO, you could
 
 - either purchase the book
 - or go to [minix3.org](http://minix3.org) and [download the ISO](http://download.minix3.org/iso/minix-3.1.0-book.iso.bz2)
- 
+
+# License
+
+This repository has two separately-licensed parts. The MINIX 3.1.0 C source
+tree above is covered by the top-level `LICENSE` file (Prentice Hall's
+original BSD-style license) and must keep that notice as-is. The `rust/`
+directory is a new, from-scratch Rust rewrite of the same architecture, not
+a derivative of the C code, and is dual-licensed under your choice of
+`rust/LICENSE-MIT` or `rust/LICENSE-APACHE` — see `rust/README.md` for
+details.
+
 # How
 
 You can install minix3 in Bochs or QEMU. But I found that the networking works out-of-the-box in the latest QEMU. Here are the steps.
