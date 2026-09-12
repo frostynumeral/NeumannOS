@@ -43,6 +43,13 @@ bitmasks, or `PUBLIC`/`PRIVATE` macros — each subsystem is rebuilt in
 idiomatic, type-safe Rust (enums, `Result`, ownership) around the same
 external contract.
 
+**License:** unlike the MINIX C tree this directory ports (top-level
+`LICENSE`, Prentice Hall's original BSD-style license), this Rust port is
+new code and is dual-licensed under your choice of the
+[MIT license](LICENSE-MIT) or the
+[Apache License, Version 2.0](LICENSE-APACHE) — the convention most of
+the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
+
 ## What's implemented
 
 - `src/com.rs` — process numbers and notification types, ported from
