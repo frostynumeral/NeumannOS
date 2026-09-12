@@ -44,8 +44,12 @@ MINIX's signature self-healing behavior. The syscall ABI now also reaches
 `fs` for real: a ring-3 task opens and writes a real file over a genuine
 `int 0x80` -> syscall dispatch -> IPC -> `fs` round trip, verified by
 reading the same file back through a completely independent, kernel-side
-path afterward — enough
-to build the rest of the system on top of.
+path afterward. The keyboard now drives a real line discipline too: typed
+characters build up a line in `crate::keyboard`, and pressing Enter wakes
+a real, scheduled `console` task (not just a direct function call) that
+writes the completed line to a real file via `fs` — a keypress now
+reaches a real process doing real IPC, not just `vga::select_button` —
+enough to build the rest of the system on top of.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -347,10 +351,25 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `timer_interrupt_handler` is for IRQ0, including waking the CPU from
   `IDLE`'s `hlt` the instant a key is pressed. Digit keys `1`-`4` go
   further: `keyboard_interrupt_handler` maps them to `vga::select_button`,
-  so pressing one visibly highlights the matching panel button -- the
-  first real input-to-output loop in this port (`crate::keyboard` driving
-  a `crate::vga` redraw), not just proof the input side works in
-  isolation.
+  so pressing one visibly highlights the matching panel button -- an
+  input-to-output loop, but still a direct function call from the
+  interrupt handler, not a real input event delivered to a process.
+  `keyboard.rs` now also has a real line discipline on top: `on_char`
+  (called for every translated character) appends to a shared `LINE`
+  buffer, and a newline marks it ready and `crate::ipc::notify`s
+  `console_task` -- the same interrupt-handler-notifies-a-real-task shape
+  `crate::proc::clock_tick` already uses for `SYN_ALARM`, just triggered
+  by a keypress. `keyboard_interrupt_handler` now sends the IRQ's EOI
+  *before* calling `on_char` (which can trigger that reschedule), mirroring
+  `timer_interrupt_handler`'s own EOI-before-switch ordering. `console_task`
+  (`com::CONSOLE_PROC_NR`, a new process slot) blocks in `ipc::receive`,
+  takes the completed line, and appends it to a real file
+  (`/console.log`) via `crate::fs` -- a keypress now drives a real,
+  scheduled task doing real IPC, not just `vga::select_button`. Verified
+  interactively via QEMU's QMP `send-key`, sent well after boot (with
+  `IDLE` already halted): typing `h`, `i`, `ret` and then `w`, `o`, `r`,
+  `l`, `d`, `ret` produces `[console] received line: "hi"` and
+  `[console] received line: "world"` as two distinct lines.
 - `src/rs.rs` — a real reincarnation server, replacing `rs`'s busy-loop
   stand-in. Ported in spirit from `servers/rs/manager.c`'s crash-handling
   path -- real MINIX gets there via `PM` noticing a process's unexpected
@@ -397,6 +416,10 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   reaches its first blocking `receive` before `flaky` ever gets a chance
   to crash -- `proc::kill`'s notification to `RS` is fire-and-forget, like
   every other notification in this port, so it would otherwise be a race.
+  `console` (`keyboard::console_task`, see `src/keyboard.rs` above) is
+  spawned at the same priority as `rs`: it just blocks in `receive`
+  immediately, waiting for `on_char`'s notification, so unlike `flaky`
+  there's nothing for it to race against.
   `driver` runs the ring-3 demo task
   described above (three real `SYS_GET_UPTIME` syscalls, then
   `SYS_BLOCK_FOREVER`), and `tty` runs `elf::task_entry` (`elf::load`
@@ -670,13 +693,33 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   extended keys (arrows, the right-hand Ctrl/Alt, ...), or PS/2
   controller configuration beyond what the BIOS/QEMU already leaves in
   place at boot.
-- **Only digit keys `1`-`4` do anything beyond a serial print** (they
-  pick a `vga::select_button` index); every other translated character
-  is still just logged. There's no keyboard buffer, no line discipline,
-  and no `tty` server/IPC message to deliver a keypress to (see
-  `rust/README.md`'s roadmap) -- `select_button` is a direct function
-  call from the interrupt handler, not a real input event delivered to a
-  process the way a real driver would.
+- **Digit keys `1`-`4` still bypass IPC entirely**: `select_button` is a
+  direct function call from the interrupt handler, unlike `on_char`'s
+  real notify-a-task path. Two different keys of the same keypress take
+  two genuinely different routes to their effect, which is a little
+  inconsistent, if harmless (both are legitimate ways a keypress can have
+  an effect; this port just hasn't unified them).
+- **`console_task` is not a real `tty`/line discipline.** There's no
+  echo (the typed character isn't drawn anywhere -- only the *effect*,
+  the completed line reaching `fs`, is observable), no editing
+  (backspace, cursor movement), no notion of multiple terminals/sessions,
+  and no real `DEV_READ`/`DEV_WRITE` device-driver protocol -- it talks
+  to `crate::fs` directly, standing in for a real `tty` server this port
+  doesn't have (see `rust/README.md`'s roadmap). `LINE_CAPACITY` (`64`)
+  is a hard cutoff with no overflow signal: a character typed past it is
+  silently dropped.
+- **One shared, un-timestamped line buffer.** `LINE` holds exactly one
+  pending line; `on_char` keeps accumulating into it even before
+  `console_task` has taken the previous completed one (simple
+  typeahead), but there's no queue of *multiple* completed lines --  if
+  `console_task` somehow fell behind by more than one full line (it
+  doesn't, in practice, since it does no work slow enough to matter),
+  a still-unread completed line would simply be overwritten.
+- **`/console.log` is opened once, for the task's whole lifetime**, and
+  every line is appended through that same descriptor -- correct, but
+  only because `crate::fs` has no explicit "append" mode to fall back on
+  (see "known simplifications in `fs`" above); re-opening on every line
+  would silently overwrite from the start each time instead.
 
 ### Known simplifications in `rs`/crash recovery
 
@@ -816,7 +859,7 @@ Roughly in the order the original kernel needs them:
     missing (a higher-resolution/color-depth mode, a real layout/windowing
     system, input handling, double buffering) before this is a UI rather
     than a static image.
-14. ~~**Real keyboard input**~~ — started (`src/keyboard.rs`): IRQ1
+14. ~~**Real keyboard input**~~ — done (`src/keyboard.rs`): IRQ1
     unmasked, a real PS/2 scancode read off port `0x60` and translated to
     ASCII (unshifted alphanumeric/punctuation only), proven asynchronous
     and hardware-driven -- it wakes the CPU from `IDLE`'s `hlt` the
@@ -825,11 +868,17 @@ Roughly in the order the original kernel needs them:
     `vga::select_button`, so a keypress visibly changes the framebuffer
     (a real, if minimal, input-to-output loop) -- verified headlessly via
     QMP `send-key` followed by a `screendump` showing the matching
-    button's highlight frame move. See "known simplifications in the
-    keyboard driver" above for what's missing (modifier-key state,
-    extended scancodes, and -- the big one -- anything that reaches a
-    real process instead of calling straight into `crate::vga`, since
-    there's no `tty` server or line discipline yet).
+    button's highlight frame move. A real line discipline sits on top
+    now too: every translated character feeds a shared line buffer, and
+    a newline notifies `console_task`, a real scheduled task that writes
+    the completed line to a real file via `fs` -- the "big one" gap this
+    item used to cite (anything reaching a real process, not just calling
+    straight into `crate::vga`) is closed, verified interactively by
+    typing `"hi"` and `"world"` (each terminated with Enter) well after
+    boot, once `IDLE` had already halted. See "known simplifications in
+    the keyboard driver" above for what's still missing (modifier-key
+    state, extended scancodes, echo/editing, and a real `tty` server this
+    port's `console_task` stands in for by talking to `fs` directly).
 15. ~~**A real syscall ABI**~~ — done (`src/syscall.rs`). Replaced
     `usermode`'s old fixed-action, count-and-cut-off `int 0x80` handler
     with genuine call-number/register dispatch: a hand-written naked trap
@@ -929,7 +978,11 @@ immediately back-to-back can (and, observed once during development,
 did) capture the frame from just before the highlight was painted. The
 resulting image should show a white rounded-rect frame behind the
 button matching the digit pressed (button `N` for digit `N`), and
-nowhere else. Expected output on COM1: a line confirming the LCARS demo panel
+nowhere else. The line discipline can be exercised the same way: send a
+sequence of letter `qcode`s followed by `"ret"` (e.g. `"h"`, `"i"`,
+`"ret"`), and COM1 should print `[console] received line: "hi"` --
+this too works well after boot, once `IDLE` has already halted.
+Expected output on COM1: a line confirming the LCARS demo panel
 was painted (`vga: painted the LCARS demo panel ...`, printed as early as
 possible -- before paging/heap/scheduler setup -- so the panel is on
 screen even if something later panics), a heap self-test (`Box`/`Vec` both actually work), an isolation
