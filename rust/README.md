@@ -162,6 +162,12 @@ external contract.
   ring-3 task's code page back out of *its* address space into a local
   buffer, proving the copy really goes through a different process's page
   table (`CLOCK` itself never leaves the kernel's own address space).
+  `CLOCK` then dynamically spawns a brand new task (`log`) at runtime --
+  with the scheduler already running other tasks, not during
+  `kernel_main`'s boot-time setup -- proving `proc::spawn` works as a
+  genuine "start a new process now" primitive: the actual thing real `rs`
+  needs to bring services up on demand, which is why "the servers
+  themselves" (the next roadmap item) needed this first.
   Also runs an isolation self-test right after building that address
   space: translating the ring-3 code page's address through the
   *kernel's own* page table returns `None`, proving the mapping really is
@@ -311,7 +317,15 @@ Roughly in the order the original kernel needs them:
 10. **The servers themselves**: `pm` (process manager), `fs` (file system),
     `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
     order, matching `servers/` and `drivers/` in the C tree -- replacing the
-    temporary stand-ins in `main.rs`.
+    temporary stand-ins in `main.rs`. First slice done: `proc::spawn` is
+    now proven safe to call from an already-running task, not just
+    `kernel_main`'s boot-time setup (`clock_task` dynamically spawns `log`
+    at runtime) -- the actual primitive real `rs` needs to bring services
+    up on demand. Still missing: a real `rs` that decides *what* to start
+    and *why* (crash detection/restart policy, `servers/rs/manager.c`),
+    and everything `pm`/`fs` actually need to do their jobs (process
+    creation with copy-on-fork-like semantics rather than a fixed
+    `fn() -> !` entry point, and a real filesystem, respectively).
 11. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 
 ## Building
@@ -367,9 +381,11 @@ kernel side merely claims) before that task blocks for good, `CLOCK`
 waking from a real `sys_setalarm`-driven `SYN_ALARM` notification and then
 using `sys_vircopy` to read the ring-3 task's code bytes back out of its
 own address space (proving a genuine cross-address-space copy, since
-`CLOCK` never leaves the kernel's), the `rs`/`memory` demo tasks trading
-off every quantum purely because the timer forces it (asynchronous
-preemption -- watch `memory`'s counter resume from exactly where it left
-off after `rs` gets a turn), and finally `IDLE` reporting that it's
-halting (with the accumulated tick count) once everything else has
-blocked.
+`CLOCK` never leaves the kernel's), then dynamically spawning a brand new
+`log` task at runtime (watch it appear interleaved with `memory`'s output,
+proof the scheduler was already running other tasks when it showed up),
+the `rs`/`memory` demo tasks trading off every quantum purely because the
+timer forces it (asynchronous preemption -- watch `memory`'s counter
+resume from exactly where it left off after `rs` gets a turn), and finally
+`IDLE` reporting that it's halting (with the accumulated tick count) once
+everything else has blocked.

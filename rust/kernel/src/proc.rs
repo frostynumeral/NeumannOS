@@ -362,6 +362,16 @@ fn with_scheduler<R>(f: impl FnOnce(&mut Scheduler) -> R) -> R {
 /// except the ring-3 demo -- see `Proc::cr3`), or
 /// `Some(`the PML4 frame `crate::memory::new_address_space` returned`)`
 /// for one that needs its own.
+///
+/// Unlike `kernel/main.c`'s boot-image setup, which only ever runs once
+/// before `restart()`, nothing here requires `idx` to be free *because*
+/// the scheduler hasn't started yet -- `with_scheduler` makes this just as
+/// safe to call from an already-running task as from `kernel_main`, which
+/// is the actual point: real `rs` brings services up on demand at
+/// runtime, not only at boot, and this is the primitive that needs.
+/// `main.rs`'s `clock_task` demonstrates exactly that: it calls `spawn`
+/// for a brand new process table slot after the scheduler is already
+/// running other tasks.
 pub fn spawn(
     proc_nr: i32,
     name: &'static str,

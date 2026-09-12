@@ -175,7 +175,11 @@ fn idle_task() -> ! {
 /// settling down, since `CLOCK` is a convenient, deterministic place to
 /// run it: the ring-3 task's code page is populated in `kernel_main`
 /// before any task ever runs, so this works regardless of scheduling
-/// order, without needing to coordinate with that task directly.
+/// order, without needing to coordinate with that task directly. Then
+/// demonstrates the other real-servers prerequisite this milestone adds:
+/// dynamically spawning a brand new task (`log`) at runtime, with the
+/// scheduler already running other tasks -- the primitive real `rs`
+/// (starting services on demand, not just at boot) actually needs.
 fn clock_task() -> ! {
     calls::sys_setalarm(3);
     let notif = ipc::receive(com::CLOCK);
@@ -188,8 +192,25 @@ fn clock_task() -> ! {
 
     vircopy_demo();
 
+    serial_println!("[clock] dynamically spawning a new task (log) at runtime");
+    proc::spawn(com::LOG_PROC_NR, "log (dynamic)", dynamic_log_task, 5, 24, true, None);
+
     ipc::receive(com::ANY); // nothing left to receive; parks CLOCK for good
     unreachable!("nothing sends to CLOCK in this demo");
+}
+
+/// Spawned at runtime by `clock_task`, well after `kernel_main` has handed
+/// off to the scheduler and other tasks are already running -- proving
+/// `proc::spawn` genuinely works as a dynamic "start a new process now"
+/// primitive, not just as boot-time setup.
+fn dynamic_log_task() -> ! {
+    serial_println!(
+        "[log] dynamically spawned at runtime (proc_nr {}, uptime {} ticks)",
+        proc::current_proc_nr(),
+        proc::uptime_ticks()
+    );
+    ipc::receive(com::ANY); // nothing left to receive; parks log for good
+    unreachable!("nothing sends to log in this demo");
 }
 
 /// Proves `sys_vircopy` (`crate::calls`) genuinely translates through a
