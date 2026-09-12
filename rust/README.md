@@ -239,10 +239,18 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   instead of on disk. `InMemoryFs::serve` is the server loop (`receive`
   from anyone, dispatch on `m_type`, `send` a reply), mirroring
   `servers/fs/main.c`'s `while (TRUE) { get_work(); ...; reply(...); }`
-  shape; `open`/`write`/`read` are client-side stubs (using `ipc`'s new
-  `send_receive`) that any task can call to talk to it, mirroring
-  `src/calls.rs`'s kernel-call wrappers in shape even though these cross
-  a real IPC round trip rather than a direct function call.
+  shape; `open`/`write`/`read`/`mkdir` are client-side stubs (using
+  `ipc`'s new `send_receive`) that any task can call to talk to it,
+  mirroring `src/calls.rs`'s kernel-call wrappers in shape even though
+  these cross a real IPC round trip rather than a direct function call.
+  `InMemoryFs` also now enforces a real directory hierarchy, not just a
+  flat, exact-match namespace: `directories` is a flat list of known
+  directory paths (the root, `"/"`, always is, implicitly), and
+  `open_path`/`mkdir` both check a path's parent the way real
+  `servers/fs/path.c`'s `lookup()` does -- `ENOENT` if the parent doesn't
+  exist, `ENOTDIR` if it exists but is a file, `EISDIR` if the path
+  itself is a directory being opened as a file, `EEXIST` if `mkdir`
+  targets a path that already exists.
 - `src/elf.rs` — a minimal ELF64 loader. No direct MINIX C equivalent:
   2005-era MINIX 3.1 loads a program via `execve`'s a.out-format path
   (`servers/pm/exec.c`), not ELF; this is a step up from
@@ -501,10 +509,13 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in `fs`
 
-- **No real filesystem hierarchy.** Files are looked up by an exact-match
-  flat name (no directories, no `/`-separated path resolution -- see
-  `servers/fs/path.c`'s `lookup()` for what the real thing does), and
-  there's no `unlink`/`stat`/permissions/inode-number concept at all yet.
+- **A real but shallow directory hierarchy.** `mkdir`/`open` check a
+  path's immediate parent (`ENOENT`/`ENOTDIR`/`EISDIR`/`EEXIST`, see the
+  `src/fs.rs` bullet above), but there's still no `readdir`/listing, no
+  `unlink`/`rmdir`, no `stat`/permissions/inode-number concept, and no
+  relative paths or `.`/`..` -- every path is a full, absolute string
+  compared exactly, not a real walk through directory-entry blocks the
+  way `servers/fs/path.c`'s `lookup()` does.
 - **No cross-address-space copy.** Request/reply args carry raw pointers
   valid in the caller's address space directly, since `fs` and every
   current caller (`pm`) still share the kernel's own address space (see
@@ -521,9 +532,11 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   all (`kernel/kernel.h`'s device abstractions, `servers/fs`'s
   buffer cache), just a `Vec<(String, Vec<u8>)>` that lives as long as
   the kernel does.
-- **No error variety.** Every failure (`EBADF` alone) covers "bad
-  descriptor" and "unrecognized request" both; real `fs` distinguishes
-  many more `errno` values (`ENOENT`, `EACCES`, `ENOSPC`, ...).
+- **Still missing some error variety.** `FS_READ`/`FS_WRITE` only ever
+  return `EBADF` for any failure (bad descriptor and unrecognized
+  request alike); there's still no `EACCES`, `ENOSPC`, or a distinct
+  error for a `read`/`write` on a directory's own descriptor (not
+  possible yet, since directories can't be `open`ed at all).
 
 ### Known simplifications in the ELF loader
 
@@ -667,14 +680,17 @@ Roughly in the order the original kernel needs them:
     its own independent memory (`pm`'s `init` demo); and `fs` (`src/fs.rs`)
     is now a real, in-memory file server answering genuine open/read/write
     requests over IPC, not a fixed-reply stand-in (`pm`'s open/write/reopen/
-    read/read-past-EOF demo). Still missing: a real `rs` that decides
-    *what* to start and *why* (crash detection/restart policy,
-    `servers/rs/manager.c`), full POSIX fork/exec semantics (the child
-    resuming from the parent's exact call site, and using the ELF loader
-    above to load a program image instead of starting at a fixed entry
-    point), and `fs` growing a real directory hierarchy, cross-address-space
-    copies, and a backing store (see "known simplifications in `fs`" above)
-    rather than a flat, in-memory, single-address-space file table.
+    read/read-past-EOF demo), with a real (if shallow) directory hierarchy
+    on top (`mkdir`, and `open` enforcing `ENOENT`/`ENOTDIR`/`EISDIR`/
+    `EEXIST` against a path's parent -- `pm`'s directory demo). Still
+    missing: a real `rs` that decides *what* to start and *why* (crash
+    detection/restart policy, `servers/rs/manager.c`), full POSIX
+    fork/exec semantics (the child resuming from the parent's exact call
+    site, and using the ELF loader above to load a program image instead
+    of starting at a fixed entry point), and `fs` growing `readdir`,
+    cross-address-space copies, and a real backing store (see "known
+    simplifications in `fs`" above) rather than a flat, in-memory,
+    single-address-space file/directory table.
 12. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
 13. ~~**Real graphics output**~~ — started (`src/vga.rs`): VGA mode 13h
     (320x200, 256-color), a real palette (VGA DAC ports) and a real
@@ -803,7 +819,13 @@ messages back and forth (blocking `send`/`receive`), after which `fs`
 becomes a real file server and `pm` opens a file, writes to it, reopens it
 fresh, reads the bytes back (checking they round-trip through actual
 in-memory storage, not a fixed echo), and reads once more past end of
-file (checking that returns `0` instead of repeating data), then `pm`
+file (checking that returns `0` instead of repeating data), then exercises
+the directory hierarchy: opening a path under a directory that doesn't
+exist yet fails with `ENOENT`, `mkdir`ing that directory succeeds,
+`mkdir`ing it again fails with `EEXIST`, opening the directory itself as
+a file fails with `EISDIR`, opening a path under the now-existing
+directory succeeds, and opening a path under an ordinary *file* (not a
+directory) fails with `ENOTDIR`, then `pm`
 `sys_fork`ing a real child (`init`) and proving its copy of the ring-3
 task's code page has genuinely diverged (a canary written to the child's
 copy doesn't show up in the original), `driver` (the hand-assembled demo)

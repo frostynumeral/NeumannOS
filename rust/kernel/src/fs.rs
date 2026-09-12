@@ -29,40 +29,115 @@ use alloc::vec::Vec;
 pub const FS_OPEN: i32 = 300;
 pub const FS_READ: i32 = 301;
 pub const FS_WRITE: i32 = 302;
+pub const FS_MKDIR: i32 = 303;
 
 /// Reply `args[0]`: a negative POSIX-style error code on failure, mirroring
 /// how real MINIX servers reply with `-EFOO` in the message body rather
-/// than a separate status channel. Success replies are always `>= 0`
-/// (a byte count, or a file descriptor).
+/// than a separate status channel (matching the real `errno` numbers,
+/// unlike `crate::syscall`'s single `u64::MAX` sentinel). Success replies
+/// are always `>= 0` (a byte count, or a file descriptor).
+pub const ENOENT: i64 = -2;
 pub const EBADF: i64 = -9;
+pub const EEXIST: i64 = -17;
+pub const ENOTDIR: i64 = -20;
+pub const EISDIR: i64 = -21;
+pub const EINVAL: i64 = -22;
 
 struct OpenFile {
     file_index: usize,
     position: usize,
 }
 
-/// The server-side state: a flat table of named files and a table of open
-/// file descriptors pointing into it. Deliberately not `Mutex`-protected
-/// like `crate::memory`'s `GlobalFrameAllocator` -- unlike a kernel call
-/// any task can invoke directly, this is only ever touched by the single
+/// The server-side state: a flat table of named files, a list of known
+/// directory paths, and a table of open file descriptors pointing into
+/// the file table. Deliberately not `Mutex`-protected like
+/// `crate::memory`'s `GlobalFrameAllocator` -- unlike a kernel call any
+/// task can invoke directly, this is only ever touched by the single
 /// task running `InMemoryFs::serve`, the same way real `fs`'s in-memory
 /// tables are only touched by the `fs` process itself.
+///
+/// Directories are just a flat `Vec<String>` of full paths that are
+/// known to be directories (the root, `"/"`, always is, implicitly, and
+/// is never itself stored) -- not a real tree (`servers/fs`'s inodes plus
+/// directory-entry blocks). Good enough to support real, multi-level
+/// paths and the usual POSIX "parent must exist and be a directory"
+/// checks (`path_lookup`'s job in real `servers/fs/path.c`) without
+/// needing an actual on-disk (or in-memory-block) directory format.
 pub struct InMemoryFs {
     files: Vec<(String, Vec<u8>)>,
+    directories: Vec<String>,
     open: Vec<Option<OpenFile>>,
 }
 
 impl InMemoryFs {
     pub fn new() -> Self {
-        InMemoryFs { files: Vec::new(), open: Vec::new() }
+        InMemoryFs { files: Vec::new(), directories: Vec::new(), open: Vec::new() }
     }
 
-    fn find_or_create(&mut self, name: &str) -> usize {
-        if let Some(i) = self.files.iter().position(|(existing, _)| existing == name) {
-            return i;
+    fn is_dir(&self, path: &str) -> bool {
+        path == "/" || self.directories.iter().any(|d| d == path)
+    }
+
+    fn is_file(&self, path: &str) -> bool {
+        self.files.iter().any(|(existing, _)| existing == path)
+    }
+
+    /// The directory a path's last component lives in: everything before
+    /// the final `/`, or `"/"` itself for a top-level path like
+    /// `"/hello.txt"`. Assumes `path` starts with `/` (checked by every
+    /// caller before reaching here).
+    fn parent_dir(path: &str) -> &str {
+        match path.rfind('/') {
+            Some(0) => "/",
+            Some(idx) => &path[..idx],
+            None => "/",
         }
-        self.files.push((String::from(name), Vec::new()));
-        self.files.len() - 1
+    }
+
+    /// Create directory `path`, mirroring `mkdir()`'s usual rules: the
+    /// parent must already exist and be a directory, and `path` itself
+    /// must not already exist as either a file or a directory.
+    fn mkdir(&mut self, path: &str) -> i64 {
+        if !path.starts_with('/') || path == "/" {
+            return EINVAL;
+        }
+        let parent = Self::parent_dir(path);
+        if self.is_file(parent) {
+            return ENOTDIR;
+        }
+        if !self.is_dir(parent) {
+            return ENOENT;
+        }
+        if self.is_dir(path) || self.is_file(path) {
+            return EEXIST;
+        }
+        self.directories.push(String::from(path));
+        0
+    }
+
+    /// Resolve `path` to a file-table index for `open`, creating it if it
+    /// doesn't exist yet -- but only after the same parent-directory
+    /// checks `mkdir` makes, so a caller can't `open("/missing/x")` or
+    /// `open("/a_file/x")` and have it silently succeed.
+    fn open_path(&mut self, path: &str) -> Result<usize, i64> {
+        if !path.starts_with('/') {
+            return Err(EINVAL);
+        }
+        if self.is_dir(path) {
+            return Err(EISDIR);
+        }
+        let parent = Self::parent_dir(path);
+        if self.is_file(parent) {
+            return Err(ENOTDIR);
+        }
+        if !self.is_dir(parent) {
+            return Err(ENOENT);
+        }
+        if let Some(i) = self.files.iter().position(|(existing, _)| existing == path) {
+            return Ok(i);
+        }
+        self.files.push((String::from(path), Vec::new()));
+        Ok(self.files.len() - 1)
     }
 
     fn alloc_fd(&mut self, open_file: OpenFile) -> usize {
@@ -93,9 +168,24 @@ impl InMemoryFs {
                 let name = unsafe {
                     core::str::from_utf8(core::slice::from_raw_parts(name_ptr, name_len)).unwrap_or("")
                 };
-                let file_index = self.find_or_create(name);
-                let fd = self.alloc_fd(OpenFile { file_index, position: 0 });
-                Message { source, m_type: FS_OPEN, args: [fd as i64, 0, 0, 0] }
+                let result = match self.open_path(name) {
+                    Ok(file_index) => {
+                        let fd = self.alloc_fd(OpenFile { file_index, position: 0 });
+                        fd as i64
+                    }
+                    Err(err) => err,
+                };
+                Message { source, m_type: FS_OPEN, args: [result, 0, 0, 0] }
+            }
+            FS_MKDIR => {
+                let name_ptr = req.args[0] as *const u8;
+                let name_len = req.args[1] as usize;
+                // Safety: see FS_OPEN above.
+                let name = unsafe {
+                    core::str::from_utf8(core::slice::from_raw_parts(name_ptr, name_len)).unwrap_or("")
+                };
+                let result = self.mkdir(name);
+                Message { source, m_type: FS_MKDIR, args: [result, 0, 0, 0] }
             }
             FS_WRITE => {
                 let fd = req.args[0] as usize;
@@ -156,10 +246,12 @@ impl InMemoryFs {
 }
 
 /// Client-side stub: open (creating if necessary) the file named `name`,
-/// returning a file descriptor. Mirrors `crate::calls`' kernel-call
-/// wrappers in shape, even though this is a real IPC round trip rather
-/// than a direct function call -- `fs` is a separate task, reached only
-/// through `crate::ipc`.
+/// returning a file descriptor, or a negative error (`ENOENT` if some
+/// parent directory doesn't exist, `ENOTDIR` if one exists but isn't a
+/// directory, `EISDIR` if `name` itself is a directory). Mirrors
+/// `crate::calls`' kernel-call wrappers in shape, even though this is a
+/// real IPC round trip rather than a direct function call -- `fs` is a
+/// separate task, reached only through `crate::ipc`.
 pub fn open(name: &str) -> i64 {
     let reply = ipc::send_receive(
         com::FS_PROC_NR,
@@ -167,6 +259,22 @@ pub fn open(name: &str) -> i64 {
             source: com::PM_PROC_NR,
             m_type: FS_OPEN,
             args: [name.as_ptr() as i64, name.len() as i64, 0, 0],
+        },
+    );
+    reply.args[0]
+}
+
+/// Client-side stub: create directory `path`. Returns `0` on success, or
+/// a negative error (`ENOENT`/`ENOTDIR` for the same parent-directory
+/// reasons as `open`, `EEXIST` if `path` already exists as either a file
+/// or a directory).
+pub fn mkdir(path: &str) -> i64 {
+    let reply = ipc::send_receive(
+        com::FS_PROC_NR,
+        Message {
+            source: com::PM_PROC_NR,
+            m_type: FS_MKDIR,
+            args: [path.as_ptr() as i64, path.len() as i64, 0, 0],
         },
     );
     reply.args[0]

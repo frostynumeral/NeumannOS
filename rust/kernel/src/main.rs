@@ -335,7 +335,9 @@ fn demo_pm_task() -> ! {
 /// (a distinct file descriptor, its own cursor starting at 0) and reads
 /// the bytes back, checking they round-trip -- then reads once more past
 /// end of file and checks that comes back empty rather than repeating
-/// data or blocking forever.
+/// data or blocking forever. Then exercises the real directory hierarchy
+/// (`fs_directory_demo`): a path can't be opened until its parent
+/// directory actually exists.
 fn fs_rw_demo() {
     let written = b"hello from pm, stored in fs";
 
@@ -362,6 +364,47 @@ fn fs_rw_demo() {
     let n = fs::read(read_fd, &mut buf);
     serial_println!("[pm] read past end of file returned {} bytes (expected 0)", n);
     assert_eq!(n, 0, "reading past end of file should return 0, not repeat data or error");
+
+    fs_directory_demo();
+}
+
+/// Proves `fs`'s directory hierarchy (`fs::InMemoryFs::mkdir`/`open_path`)
+/// enforces the usual POSIX parent-directory rules, not just a flat,
+/// exact-match namespace: a path under a directory that doesn't exist yet
+/// is rejected (`ENOENT`), creating that directory makes the same open
+/// succeed, creating it again fails (`EEXIST`), and a path that treats an
+/// ordinary file as if it were a directory is rejected (`ENOTDIR`).
+fn fs_directory_demo() {
+    let missing = fs::open("/logs/today.txt");
+    serial_println!("[pm] fs::open(\"/logs/today.txt\") before mkdir -> {} (expected ENOENT)", missing);
+    assert_eq!(missing, fs::ENOENT, "opening a path under a nonexistent directory should fail with ENOENT");
+
+    let made = fs::mkdir("/logs");
+    serial_println!("[pm] fs::mkdir(\"/logs\") -> {} (expected 0)", made);
+    assert_eq!(made, 0, "mkdir on a fresh path under an existing parent (\"/\") should succeed");
+
+    let again = fs::mkdir("/logs");
+    serial_println!("[pm] fs::mkdir(\"/logs\") again -> {} (expected EEXIST)", again);
+    assert_eq!(again, fs::EEXIST, "mkdir on an already-existing path should fail with EEXIST");
+
+    let as_dir = fs::open("/logs");
+    serial_println!("[pm] fs::open(\"/logs\") (a directory) -> {} (expected EISDIR)", as_dir);
+    assert_eq!(as_dir, fs::EISDIR, "opening a directory as if it were a file should fail with EISDIR");
+
+    let fd = fs::open("/logs/today.txt");
+    serial_println!("[pm] fs::open(\"/logs/today.txt\") after mkdir -> fd {} (expected >= 0)", fd);
+    assert!(fd >= 0, "opening a path under a directory that now exists should succeed");
+
+    let under_file = fs::open("/hello.txt/nested.txt");
+    serial_println!(
+        "[pm] fs::open(\"/hello.txt/nested.txt\") (parent is a file, not a directory) -> {} (expected ENOTDIR)",
+        under_file
+    );
+    assert_eq!(
+        under_file,
+        fs::ENOTDIR,
+        "opening a path under an existing *file* should fail with ENOTDIR, not silently succeed"
+    );
 }
 
 /// Proves `sys_fork` (`crate::calls`) gives the child a genuinely
