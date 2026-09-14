@@ -392,6 +392,13 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   reasoning `crate::fs`'s `SYS_FS_*` calls already rely on. Only one
   pending reader is tracked at a time (a known simplification, below);
   fine for this port's one caller (`tty`, see `user/hello.s`).
+  A completed line is also checked for a `"run <name>"` command
+  (`dispatch_run`): if it matches, `console_task` sends a real
+  `com::RS_LAUNCH_REQUEST` `send`/reply to `rs` asking it to launch that
+  service by name, and logs the reply code -- verified via QMP by typing
+  `"run hello"`, which produces `[rs] launch request for "hello" -> 0`
+  and a second, independent instance of the ELF-loaded task running under
+  its own process number (see the `src/rs.rs` bullet below).
 - `src/rs.rs` — a real reincarnation server, replacing `rs`'s busy-loop
   stand-in. Ported in spirit from `servers/rs/manager.c`'s crash-handling
   path -- real MINIX gets there via `PM` noticing a process's unexpected
@@ -412,6 +419,25 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   so it crashes the instant it runs, deterministically, giving the
   crash-isolation/restart pipeline something real (and reproducible) to
   prove itself against.
+  `rs` now also has a real (if minimal, one-entry) service table
+  (`SERVICES`), generalizing the restart path beyond the hardcoded
+  `flaky` case: each entry names a real ELF binary seeded into `fs`
+  (`elf::HELLO_ELF` at `/bin/hello`, `main.rs`'s `seed_bin_hello`) and
+  loadable on demand (`elf::spawn_from_fs`) via a new
+  `com::RS_LAUNCH_REQUEST` message -- `crate::keyboard`'s console line
+  discipline is the only current sender, triggered by typing
+  `run <name>` (see the `src/keyboard.rs` bullet above). A launched
+  service is tracked the same way `flaky` is (a bounded restart count per
+  entry, `SERVICE_STATE`) and restarted with the same policy if it
+  crashes, not just relaunched fresh -- `task`'s death-notification
+  branch now looks a died process's `proc_nr` up in `SERVICES` instead of
+  only special-casing `FLAKY_PROC_NR`. Verified by typing `run hello` over
+  QMP well after boot: `[rs] launch request for "hello" -> 0`, followed by
+  a second, independent instance of the same ELF image (a distinct
+  process, `APP1_PROC_NR`) running its own full lifecycle (uptime
+  queries, a real alarm, `SYS_WRITE_LINE`, `fs` open/write, then blocking
+  on its own `SYS_READ_LINE`) completely separately from `tty`'s
+  boot-time instance of that binary.
 - `src/serial.rs` + `src/main.rs` — boot entry point (via the `bootloader`
   crate): loads the GDT/IDT, runs a breakpoint self-test, sets up paging
   and the heap, builds the ring-3 demo task's and the ELF-loaded task's
@@ -763,17 +789,21 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in `rs`/crash recovery
 
-- **Only ring-3 faults recover; only `flaky` has a restart policy.** A
-  fault in kernel-trusted code (any kernel task, or any of the stand-in
-  server bodies that still share the kernel's own address space) still
-  halts the whole machine (see `crate::interrupts`'s doc comment for why
-  that's still the right call). Of processes that *can* fault safely,
-  `rs::task` only knows how to restart `FLAKY_PROC_NR`; a real
+- **Only ring-3 faults recover; `flaky` and the one-entry `SERVICES`
+  table are the only things with a restart policy.** A fault in
+  kernel-trusted code (any kernel task, or any of the stand-in server
+  bodies that still share the kernel's own address space) still halts the
+  whole machine (see `crate::interrupts`'s doc comment for why that's
+  still the right call). `rs::task` restarts `FLAKY_PROC_NR` (hardcoded
+  parameters, `rs::spawn_flaky`) and any process number found in
+  `SERVICES` (`crate::rs::SERVICES`, currently one entry: `hello`); a real
   `com::proc_died` for anything else is logged and then permanently
-  ignored -- there's no general "restart whatever died" policy, since
-  there's no real service table (`servers/rs/manager.c`'s `struct rproc`)
-  recording each service's startup parameters to restart *with*.
-  `rs::spawn_flaky`'s parameters are hardcoded for exactly this reason.
+  ignored. `SERVICES` is a real, if tiny, version of
+  `servers/rs/manager.c`'s `struct rproc` table -- unlike `flaky`'s
+  hardcoded parameters, entries are looked up and launched by name
+  (`rs::launch_service`) -- but it still has exactly one entry, populated
+  by a boot-time demo step (`main.rs`'s `seed_bin_hello`) rather than a
+  real installer, and nothing yet adds entries to it at runtime.
 - **The "a process died" notification is fire-and-forget**, like every
   other notification in this port (see "known simplifications in the
   scheduler/IPC/timer port" above) -- if `RS` isn't already blocked in
@@ -874,11 +904,13 @@ Roughly in the order the original kernel needs them:
     ring-3 process (`crate::proc::kill`, called from a CPU exception
     handler) and restarts it, up to a bounded number of times, exactly
     MINIX's signature self-healing behavior (`flaky`, a task that
-    deliberately crashes via `ud2` every time it runs). Still missing:
-    `rs` deciding *what* to start and *why* for services in general, not
-    just one hardcoded demo (a real service table, `servers/rs/manager.c`),
-    full POSIX fork/exec semantics (the child resuming from the parent's
-    exact call site, and using the ELF loader above to load a program
+    deliberately crashes via `ud2` every time it runs). `rs` now also has
+    a real (if minimal, one-entry) service table (`crate::rs::SERVICES`)
+    deciding what to start and restart by name rather than only a single
+    hardcoded demo, launchable on demand via a console `run <name>`
+    command (see the `src/rs.rs`/`src/keyboard.rs` bullets above). Still
+    missing: full POSIX fork/exec semantics (the child resuming from the
+    parent's exact call site, and using the ELF loader above to load a program
     image instead of starting at a fixed entry point), and `fs` growing
     `readdir` and a real backing store (see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
@@ -920,7 +952,9 @@ Roughly in the order the original kernel needs them:
     blocks for an entire line of real, human-timed keyboard input from
     inside its own trap, then writes what it received to a second file --
     verified end to end by typing `"neumann"` over QMP well after boot and
-    seeing it land in `/from_console.txt`, exactly as typed. See "known
+    seeing it land in `/from_console.txt`, exactly as typed. `console_task`'s
+    line discipline can now also dispatch a `"run <name>"` command to `rs`
+    (see item 11 above), not just log/echo the line. See "known
     simplifications in the keyboard driver" above for what's still missing
     (modifier-key state, extended scancodes, echo/editing, only one
     pending reader tracked at a time, and a real `tty` server this port's
@@ -1044,7 +1078,15 @@ shell waiting at a prompt, not a hang or a bug. Typing a line (e.g. `"n"`,
 QMP unblocks it: COM1 should show `[console] received line: "neumann"`,
 then `[syscall] proc 5: SYS_READ_LINE -> 7 bytes`, then `tty` opening
 and writing that same text to `/from_console.txt`, then finally its
-`SYS_BLOCK_FOREVER`.
+`SYS_BLOCK_FOREVER`. Typing `"run hello"` instead (`"r"`, `"u"`, `"n"`,
+`"spc"`, `"h"`, `"e"`, `"l"`, `"l"`, `"o"`, `"ret"`) exercises `rs`'s
+on-demand launch path: COM1 shows `[console] received line: "run hello"`,
+`[rs] launch request for "hello" -> 0`, `[console] run "hello" -> 0`,
+then a second, independent instance of the ELF-loaded task (a new
+process, `APP1_PROC_NR`) running through its own full lifecycle --
+`SYS_GET_UPTIME`, a real alarm, `SYS_WRITE_LINE`, `fs` open/write, and
+finally blocking on its own `SYS_READ_LINE` -- entirely separately from
+`tty`'s boot-time run of the same binary.
 Expected output on COM1: a line confirming the LCARS demo panel
 was painted (`vga: painted the LCARS demo panel ...`, printed as early as
 possible -- before paging/heap/scheduler setup -- so the panel is on
