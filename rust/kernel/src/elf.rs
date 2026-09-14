@@ -52,6 +52,16 @@ pub const COUNTER_ADDR: u64 = 0x_5555_5556_0000;
 /// `COUNTER_ADDR` is.
 pub const VIRCOPY_BUF_ADDR: u64 = 0x_5555_5556_00de;
 
+/// Where `user/hello.s`'s `err_result` lives -- `tty` stashes its
+/// deliberately-invalid second `SYS_VIRCOPY` call's return value here
+/// (an oversized `len`, expected to come back `crate::syscall::
+/// ERR_BAD_LENGTH`), for a kernel task to `sys_vircopy` back out and
+/// check afterward, proving the syscall ABI's distinct error codes
+/// actually reach a ring-3 caller's `rax`, not just that `dispatch`
+/// computes the right value internally. Read off the built `hello.elf`
+/// with `nm`, same reasoning as `VIRCOPY_BUF_ADDR`.
+pub const ERR_RESULT_ADDR: u64 = 0x_5555_5556_00fe;
+
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;

@@ -11,7 +11,13 @@
 # a *different* process's private memory (driver's own code page) straight
 # from ring 3, into this task's own vircopy_buf -- the same cross-address-
 # space copy crate::main's vircopy_demo already does kernel-side, now
-# reachable through the syscall ABI. Finally, SYS_READ_LINE:
+# reachable through the syscall ABI. Then a deliberately-invalid
+# SYS_VIRCOPY (an oversized len), to exercise the syscall ABI's distinct
+# error codes (crate::syscall's ERR_BAD_LENGTH/ERR_BAD_UTF8/
+# ERR_VIRCOPY_FAILED/ERR_UNKNOWN_CALL) rather than just a single
+# undifferentiated failure sentinel -- the returned code is stashed in
+# err_result for a kernel task to read back and check afterward, the same
+# way vircopy_buf's real copy is. Finally, SYS_READ_LINE:
 # this blocks for real, for as long as it takes a human (or a QMP
 # send-key script) to actually type a line and press Enter, then writes
 # whatever line arrives to a second file via SYS_FS_OPEN/SYS_FS_WRITE,
@@ -89,6 +95,17 @@ _start:
     mov $10, %eax             # SYS_VIRCOPY (crate::syscall::SYS_VIRCOPY)
     int $0x80
 
+    # Deliberately-invalid SYS_VIRCOPY: len (rcx) exceeds
+    # crate::syscall::MAX_VIRCOPY_LEN (256), so this should come back
+    # ERR_BAD_LENGTH rather than actually copying anything.
+    mov $6, %edi              # src_proc = DRVR_PROC_NR
+    mov $0x555555550000, %rsi # src_addr = usermode::USER_CODE_ADDR
+    lea vircopy_buf(%rip), %rdx
+    mov $9999, %ecx           # len -- deliberately too large
+    mov $10, %eax             # SYS_VIRCOPY
+    int $0x80
+    mov %rax, err_result(%rip)
+
     # Block for a real line of console input (rdi=buf ptr, rsi=max len).
     # Returns however many bytes were actually typed.
     lea line_buf(%rip), %rdi
@@ -135,3 +152,5 @@ line_buf:
 line_buf_cap = 64
 vircopy_buf:
     .skip 32
+err_result:
+    .quad 0
