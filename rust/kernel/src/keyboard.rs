@@ -236,14 +236,33 @@ pub fn read_line(ptr: u64, max_len: usize) -> i64 {
     reply.args[0]
 }
 
+/// Parse a completed line for a `"run <name>"` command and, if it matches,
+/// ask `crate::rs` to launch that service (`com::RS_LAUNCH_REQUEST` --
+/// real `send`/reply IPC, not a fire-and-forget notification), logging
+/// the result the same way every other console line already gets logged.
+/// This is the console's only command so far; anything else typed is
+/// still just logged verbatim, same as before this existed.
+fn dispatch_run(name: &str) {
+    let reply = ipc::send_receive(
+        com::RS_PROC_NR,
+        ipc::Message {
+            source: crate::proc::current_proc_nr(),
+            m_type: com::RS_LAUNCH_REQUEST,
+            args: [name.as_ptr() as i64, name.len() as i64, 0, 0],
+        },
+    );
+    serial_println!("[console] run {:?} -> {}", name, reply.args[0]);
+}
+
 /// `console`'s task body: a real, if minimal, line-oriented server.
 /// Every completed line (`on_char`'s `LINE_READY` notification) gets
 /// logged and appended to `/console.log` via `crate::fs` unconditionally
 /// (the original proof this task does real IPC, not just a direct
-/// function call like `crate::vga::select_button`); if some other task
-/// is also waiting for a line (`CONSOLE_READ_LINE`, from
-/// `crate::syscall`'s `SYS_READ_LINE`), that same line is delivered to
-/// them too, directly into the buffer their request pointed at
+/// function call like `crate::vga::select_button`); a `"run <name>"` line
+/// additionally asks `crate::rs` to launch that service (`dispatch_run`).
+/// If some other task is also waiting for a line (`CONSOLE_READ_LINE`,
+/// from `crate::syscall`'s `SYS_READ_LINE`), that same line is delivered
+/// to them too, directly into the buffer their request pointed at
 /// (`deliver_line`). A `CONSOLE_READ_LINE` request that arrives with no
 /// line buffered yet is remembered (`pending_reader`) rather than
 /// replied to immediately, and satisfied whenever the next line
@@ -279,13 +298,14 @@ pub fn console_task() -> ! {
 
         let Some((buf, len)) = take_line() else { continue };
         let line = &buf[..len];
-        serial_println!(
-            "[console] received line: {:?}",
-            core::str::from_utf8(line).unwrap_or("<invalid utf8>")
-        );
+        let text = core::str::from_utf8(line).unwrap_or("<invalid utf8>");
+        serial_println!("[console] received line: {:?}", text);
         if fd >= 0 {
             fs::write(fd, line);
             fs::write(fd, b"\n");
+        }
+        if let Some(name) = text.strip_prefix("run ") {
+            dispatch_run(name);
         }
         if let Some(reader) = pending_reader.take() {
             deliver_line(&reader, line);

@@ -49,8 +49,15 @@ pub const FLAKY_PROC_NR: i32 = 8;
 /// `crate::keyboard`'s real line-discipline consumer (`console_task`):
 /// blocks for a completed line, then writes it to `fs`.
 pub const CONSOLE_PROC_NR: i32 = 9;
+/// Reserved slot for `crate::rs`'s one runtime-launchable app
+/// (`crate::elf::spawn_from_fs`), started on demand via a
+/// `RS_LAUNCH_REQUEST` rather than at boot. A fixed, pre-reserved number
+/// rather than a dynamically allocated one, same reasoning as
+/// `FLAKY_PROC_NR`/`CONSOLE_PROC_NR`: there's no free-list/dynamic
+/// process-number allocator in this port yet.
+pub const APP1_PROC_NR: i32 = 10;
 
-pub const NR_BOOT_PROCS: usize = NR_TASKS + CONSOLE_PROC_NR as usize + 1;
+pub const NR_BOOT_PROCS: usize = NR_TASKS + APP1_PROC_NR as usize + 1;
 
 /// Map a process number to a dense array index, for the process table
 /// (`crate::proc`) and the IPC mailboxes it used to have on its own
@@ -104,3 +111,9 @@ pub const fn proc_died_slot(m_type: i32) -> Option<usize> {
 pub const fn proc_nr_of_slot(slot: usize) -> i32 {
     slot as i32 - NR_TASKS as i32
 }
+
+/// A real `send`/reply message type (not a fire-and-forget notification):
+/// `crate::keyboard`'s `console_task` sends this to `RS_PROC_NR` to ask it
+/// to launch a named service (`crate::rs`'s service table), mirroring
+/// `crate::keyboard`'s own `CONSOLE_READ_LINE` request/reply shape.
+pub const RS_LAUNCH_REQUEST: i32 = 401;
