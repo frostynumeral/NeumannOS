@@ -223,6 +223,7 @@ fn idle_task() -> ! {
     elf_counter_demo();
     fs_from_ring3_verify();
     vircopy_from_ring3_verify();
+    vircopy_error_from_ring3_verify();
     serial_println!("[idle] no other task is ready, halting (uptime: {} ticks)", proc::uptime_ticks());
     halt_loop()
 }
@@ -276,6 +277,38 @@ fn vircopy_from_ring3_verify() {
     assert_eq!(
         buf, usermode::USER_CODE,
         "tty's ring-3 SYS_VIRCOPY didn't actually copy driver's code page"
+    );
+}
+
+/// Proves the syscall ABI's distinct error codes (`crate::syscall`'s
+/// `ERR_BAD_LENGTH`/`ERR_BAD_UTF8`/`ERR_VIRCOPY_FAILED`/
+/// `ERR_UNKNOWN_CALL`) genuinely reach a ring-3 caller's `rax`, not just
+/// that `dispatch` computes the right value internally: `tty` makes a
+/// second, deliberately-invalid `SYS_VIRCOPY` call (an oversized `len`,
+/// `user/hello.s`) and stashes the raw return value in `err_result`
+/// (`elf::ERR_RESULT_ADDR`); this reads it back the same way
+/// `vircopy_from_ring3_verify` reads `vircopy_buf` and checks it's
+/// exactly `syscall::ERR_BAD_LENGTH`, not merely "some nonzero failure
+/// code."
+fn vircopy_error_from_ring3_verify() {
+    let mut buf = [0u8; 8];
+    calls::sys_vircopy(
+        com::TTY_PROC_NR,
+        x86_64::VirtAddr::new(elf::ERR_RESULT_ADDR),
+        com::IDLE,
+        x86_64::VirtAddr::new(buf.as_mut_ptr() as u64),
+        buf.len(),
+    )
+    .expect("sys_vircopy failed reading tty's err_result");
+    let result = u64::from_le_bytes(buf);
+    serial_println!(
+        "[idle] read back {:#x} from tty's own err_result (expected ERR_BAD_LENGTH {:#x})",
+        result,
+        syscall::ERR_BAD_LENGTH
+    );
+    assert_eq!(
+        result, syscall::ERR_BAD_LENGTH,
+        "tty's deliberately-invalid ring-3 SYS_VIRCOPY didn't come back ERR_BAD_LENGTH"
     );
 }
 

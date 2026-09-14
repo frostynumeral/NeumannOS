@@ -605,13 +605,24 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   mechanism works, not a real syscall surface.
 - **Four arguments, not a full calling convention.** Only `rdi`/`rsi`/
   `rdx`/`rcx` are read as arguments; a real syscall ABI (or MINIX's own
-  message-based one) would want more, plus a real error-reporting
-  convention (`dispatch` returns a single `ERROR: u64 = u64::MAX`
-  sentinel for every failure, rather than distinct negative `errno`-style
-  codes the way `crate::calls`/`crate::fs` already do for their own
-  calls -- `SYS_FS_*` do at least forward `fs`'s own real error codes
-  through unchanged, just without a *second*, syscall-level failure mode
-  of their own beyond `MAX_FS_BUF` truncation).
+  message-based one) would want more.
+- **A handful of distinct error codes, not a real `errno` set.**
+  `dispatch` used to return a single `ERROR: u64 = u64::MAX` sentinel for
+  every failure; it now returns one of four small negative-`i64`-as-`u64`
+  codes (`ERR_BAD_LENGTH`/`ERR_BAD_UTF8`/`ERR_VIRCOPY_FAILED`/
+  `ERR_UNKNOWN_CALL`, mirroring the convention `crate::calls`/`crate::fs`
+  already use for their own failures) -- one per *kind* of mistake this
+  dispatch layer itself detects, not one per underlying cause the way a
+  real `errno` would distinguish (e.g. every `SYS_VIRCOPY` failure from
+  `calls::sys_vircopy` itself, whatever the reason, collapses to the same
+  `ERR_VIRCOPY_FAILED`). Verified reaching a real ring-3 caller's `rax`,
+  not just computed correctly inside `dispatch`: `tty` deliberately makes
+  an invalid `SYS_VIRCOPY` call (`user/hello.s`) and a kernel task reads
+  its raw return value back out afterward, checking it's exactly
+  `ERR_BAD_LENGTH` (see `vircopy_error_from_ring3_verify` in
+  `src/main.rs`). `SYS_FS_*` separately forward `fs`'s own real error
+  codes through unchanged on top of these, since those are a distinct,
+  already-real-`errno`-shaped failure mode with no need for a stand-in.
 - **No validation beyond a length bound.** `SYS_WRITE_LINE`/`SYS_FS_*`
   check a length against `MAX_LINE_LEN`/`MAX_FS_BUF` before reading, but
   never check that a pointer actually points at memory the caller is
@@ -1022,10 +1033,16 @@ Roughly in the order the original kernel needs them:
     `SYS_VIRCOPY`, reading a range of `driver`'s own private memory
     straight from ring 3 into its own buffer, verified by `IDLE` reading
     that buffer back afterward with a second, independent `sys_vircopy`
-    call (see item 9 above). See "known simplifications in the syscall
-    ABI" above for what's not a real syscall surface yet (ten calls,
-    `sys_fork` still not reachable, a single `u64::MAX` error sentinel for
-    syscall-level failures instead of real error codes).
+    call (see item 9 above), then deliberately calls it again with an
+    invalid length to exercise the ABI's now-distinct error codes
+    (`ERR_BAD_LENGTH`/`ERR_BAD_UTF8`/`ERR_VIRCOPY_FAILED`/
+    `ERR_UNKNOWN_CALL`, replacing a single undifferentiated `u64::MAX`
+    sentinel), verified the same way -- a kernel task reads the raw
+    return value `tty` stashed back out and checks it's exactly
+    `ERR_BAD_LENGTH`. See "known simplifications in the syscall ABI"
+    above for what's not a real syscall surface yet (ten calls, `sys_fork`
+    still not reachable, one code per *kind* of dispatch-level mistake
+    rather than a real per-cause `errno` set).
 
 ## Building
 

@@ -12,19 +12,19 @@
 //! message-passing entry point from ring 3 yet, and building the real
 //! thing needs this register-level plumbing first regardless.
 //!
-//! Convention: call number in `rax`, up to three arguments in `rdi`,
-//! `rsi`, `rdx` (the first three System V integer-argument registers),
-//! return value in `rax`. `entry` is the actual `SYSCALL_VECTOR` IDT handler (installed
-//! via `Entry::set_handler_addr` in `crate::interrupts`, not
-//! `set_handler_fn` -- this needs full control over the trap frame that
-//! the `x86-interrupt` calling convention doesn't expose, namely the
-//! caller's original register values, not just the hardware-pushed
-//! `InterruptStackFrame`). It saves every general-purpose register the
-//! CPU didn't already save, calls `dispatch` with the caller's original
-//! `rax`/`rdi`/`rsi`, writes `dispatch`'s return value into the saved
-//! `rax` slot, restores everything else unchanged, and `iretq`s -- so a
-//! caller sees only its requested register (`rax`) change, exactly like
-//! a real syscall.
+//! Convention: call number in `rax`, up to four arguments in `rdi`,
+//! `rsi`, `rdx`, `rcx` (the first four System V integer-argument
+//! registers), return value in `rax`. `entry` is the actual
+//! `SYSCALL_VECTOR` IDT handler (installed via `Entry::set_handler_addr`
+//! in `crate::interrupts`, not `set_handler_fn` -- this needs full
+//! control over the trap frame that the `x86-interrupt` calling
+//! convention doesn't expose, namely the caller's original register
+//! values, not just the hardware-pushed `InterruptStackFrame`). It saves
+//! every general-purpose register the CPU didn't already save, calls
+//! `dispatch` with the caller's original `rax`/`rdi`/`rsi`/`rdx`/`rcx`,
+//! writes `dispatch`'s return value into the saved `rax` slot, restores
+//! everything else unchanged, and `iretq`s -- so a caller sees only its
+//! requested register (`rax`) change, exactly like a real syscall.
 //!
 //! Notably *not* implemented here: any cross-address-space copy for
 //! pointer arguments (`SYS_WRITE_LINE`'s `arg1`). That's safe to skip
@@ -123,14 +123,20 @@ const MAX_FS_BUF: usize = 256;
 /// address space (see the module doc comment).
 const MAX_LINE_LEN: u64 = 256;
 
-/// Sentinel error return: `SYS_WRITE_LINE` got a bad length or invalid
-/// UTF-8, or the call number wasn't recognized at all. Every real
-/// `SYS_*` return value here fits in far fewer bits, so this is
-/// unambiguous -- a rough stand-in for a real syscall ABI's negative
-/// `errno` convention (`crate::calls`' kernel calls already use actual
-/// negative-`i64` returns for this; this one stays unsigned since
-/// `SYS_GET_UPTIME`'s tick count has no natural sign to spare).
-pub const ERROR: u64 = u64::MAX;
+/// Syscall-level failure codes: small negative `i64` values reinterpreted
+/// as `u64` (two's complement, so still distinguishable from any real
+/// success value -- every real `SYS_*` return here fits in far fewer
+/// bits), mirroring the negative-`errno`-style convention
+/// `crate::calls`/`crate::fs` already use for their own failures, rather
+/// than a single undifferentiated sentinel. Still coarser than a real
+/// `errno` set (one code per *kind* of mistake this dispatch layer itself
+/// can detect, not one per underlying cause -- `SYS_FS_*` do at least
+/// forward `fs`'s own real error codes through unchanged on top of these,
+/// since those are a separate, already-real-`errno`-shaped failure mode).
+pub const ERR_BAD_LENGTH: u64 = (-1i64) as u64;
+pub const ERR_BAD_UTF8: u64 = (-2i64) as u64;
+pub const ERR_VIRCOPY_FAILED: u64 = (-3i64) as u64;
+pub const ERR_UNKNOWN_CALL: u64 = (-4i64) as u64;
 
 /// The actual dispatch, called by `entry` (via `core::arch::naked_asm!`'s
 /// `sym` operand) with the caller's original `rax` (as `call_num`),
@@ -146,7 +152,7 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
         }
         SYS_WRITE_LINE => {
             if arg2 > MAX_LINE_LEN {
-                return ERROR;
+                return ERR_BAD_LENGTH;
             }
             // Safety: see the module doc comment -- `dispatch` runs with
             // the caller's own address space still active (entering this
@@ -159,7 +165,7 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                     serial_println!("[syscall] proc {}: SYS_WRITE_LINE: {:?}", caller, s);
                     arg2
                 }
-                Err(_) => ERROR,
+                Err(_) => ERR_BAD_UTF8,
             }
         }
         SYS_BLOCK_FOREVER => {
@@ -210,7 +216,7 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
         }
         SYS_FS_OPEN => {
             if arg2 as usize > MAX_FS_BUF {
-                return ERROR;
+                return ERR_BAD_LENGTH;
             }
             // Safety: same reasoning as SYS_WRITE_LINE -- CR3 is still
             // the caller's own here.
@@ -223,14 +229,14 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                     serial_println!("[syscall] proc {}: SYS_FS_OPEN({:?}) -> {}", caller, path, result);
                     result as u64
                 }
-                Err(_) => ERROR,
+                Err(_) => ERR_BAD_UTF8,
             }
         }
         SYS_FS_WRITE => {
             let fd = arg1 as i64;
             let len = arg3 as usize;
             if len > MAX_FS_BUF {
-                return ERROR;
+                return ERR_BAD_LENGTH;
             }
             // Copy the caller's buffer into a local, kernel-mapped-
             // everywhere buffer *before* calling into crate::fs -- see
@@ -282,7 +288,7 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             let src_proc = arg1 as i32;
             let len = arg4 as usize;
             if len > MAX_VIRCOPY_LEN {
-                return ERROR;
+                return ERR_BAD_LENGTH;
             }
             // Safety: `local_ptr` (arg3) is never dereferenced here --
             // it's only handed to `calls::sys_vircopy`, which reaches it
@@ -300,12 +306,12 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                     );
                     0
                 }
-                Err(_) => ERROR,
+                Err(_) => ERR_VIRCOPY_FAILED,
             }
         }
         _ => {
             serial_println!("[syscall] proc {}: unknown call number {}", caller, call_num);
-            ERROR
+            ERR_UNKNOWN_CALL
         }
     }
 }
