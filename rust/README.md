@@ -252,7 +252,15 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   regardless of which `CR3` happens to be active. No privilege check
   gates which process a caller can read this way, unlike real MINIX's
   IPC-bitmask-gated kernel calls -- see "known simplifications in the
-  kernel calls" below), and `SYS_BLOCK_FOREVER` (calls
+  kernel calls" below), `SYS_FORK` (a fifth register, `r9`, carries
+  `frame_ptr` -- not a normal argument, but the address of the 15
+  registers `entry` just pushed for *this* trap, captured via `lea r9,
+  [rsp]` before the other `mov`s start reusing those registers for the
+  call to `dispatch`. Exposes `crate::calls::sys_fork_from_frame`, which
+  hands `proc::fork_current` a snapshot of that trap -- `rax` zeroed --
+  instead of a fixed entry point, so the new task resumes at the exact
+  ring-3 instruction its parent trapped from, not somewhere fixed; see the
+  `src/proc.rs` bullet below for how), and `SYS_BLOCK_FOREVER` (calls
   `ipc::receive(ANY)` directly from inside the trap, never returning --
   the same "nothing sends to this
   proc again" pattern every other demo task in `main.rs` ends with).
@@ -267,6 +275,23 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   other's saved state the moment either faulted or was preempted);
   per-task `CR3` is what makes that isolation *real* rather than just a
   CPU privilege level.
+  `src/proc.rs` also gains `fork_current` and its `TrapFrame` type,
+  `SYS_FORK`'s real counterpart to `spawn`: instead of the ordinary
+  single "six callee-saved registers + `RFLAGS` + a return address into
+  `trampoline`" frame every other task starts from, a forked child's
+  kernel stack gets *two* frames stacked back to back -- that same outer
+  `switch_to`-compatible one (pointing at a new `fork_child_resume` stub
+  instead of `trampoline`), immediately followed by a full `TrapFrame`
+  copy (`repr(C)`, laid out to exactly match what `crate::syscall::entry`
+  pushes/pops, so a raw pointer into a live trap can be read as one
+  directly) with `rax` zeroed. The first time the child is switched to,
+  `switch_to`'s ordinary `ret` lands in `fork_child_resume`, which pops
+  that inner frame and `iretq`s with it -- indistinguishable, from ring
+  3's side, from the parent's own trap returning normally, except `rax`
+  reads `0`. `fork_child_resume` deliberately duplicates `entry`'s own pop
+  sequence rather than jumping into it (naked functions have no
+  addressable internal label another function's `sym` can reach) --
+  a small, self-contained stub kept in sync with `entry`'s tail by hand.
 - `src/calls.rs` — the first kernel calls, ported from
   `kernel/system/do_copy.c` (`sys_vircopy`), `do_setalarm.c`
   (`sys_setalarm`), and `kernel/proc.c`'s `do_fork()` (`sys_fork`). Real
@@ -287,7 +312,12 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   (`memory::fork_address_space`), and spawns a task into it
   (`proc::spawn`) -- bundling what real MINIX splits into a kernel call
   (duplicate the memory) and a separate scheduling step, since nothing in
-  this port needs them separated yet.
+  this port needs them separated yet. `sys_fork_from_frame` is `sys_fork`'s
+  real-fork-semantics sibling: identical deep-copy step, but hands
+  `proc::fork_current` a `proc::TrapFrame` snapshot instead of a fixed
+  entry point (see the `src/proc.rs`/`src/syscall.rs` bullets above) --
+  reachable from ring 3 (`crate::syscall`'s `SYS_FORK`), unlike `sys_fork`
+  itself, which only `pm`'s own kernel-side demo calls.
 - `src/fs.rs` — a real, in-memory file server, replacing `fs`'s ping-pong
   stand-in. No single C file to port: real `servers/fs` is a whole
   subsystem (`open.c`/`read.c`/`write.c`/`path.c`, an inode/block-cache
@@ -487,18 +517,34 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   builds its address space in `kernel_main`, the same way `driver`'s is
   built) -- a real ELF64 binary (`user/hello.elf`) executing its own
   counter-increment/`SYS_GET_UPTIME` loop in ring 3 five times, then a real
-  `SYS_SET_ALARM`/`SYS_WAIT_ALARM` (genuinely blocking and later resuming
-  in ring 3), a `SYS_WRITE_LINE`, a real `SYS_FS_OPEN`/`SYS_FS_WRITE`
-  round trip to `fs` (opening `/from_ring3.txt` and writing a message to
-  it, all the way from ring 3), then a real `SYS_READ_LINE` -- blocking
-  for however long it takes a human to actually type a line -- followed
-  by a second `SYS_FS_OPEN`/`SYS_FS_WRITE` writing whatever line arrived
-  to `/from_console.txt`, and finally `SYS_BLOCK_FOREVER` -- see
+  `SYS_FORK`: `tty` forks itself into a genuine child process
+  (`com::FORK_CHILD_PROC_NR`) that resumes at that *exact* point too,
+  diverging only in `SYS_FORK`'s own return value -- the parent (seeing
+  its child's nonzero `proc_nr`) falls through to continue the sequence
+  below unchanged, while the child (seeing `0`) writes a canary into its
+  own copy of `vircopy_buf` and a distinguishing message to
+  `/from_fork_child.txt` via its own, separately-scheduled
+  `SYS_FS_OPEN`/`SYS_FS_WRITE`, then blocks for good, never touching
+  `SET_ALARM`/`READ_LINE` (see `src/proc.rs`/`src/syscall.rs` below for
+  how the child's resumption actually works, and `fork_child_verify` in
+  `src/main.rs` for how both the canary and the file get checked back).
+  The parent continues with a real `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
+  (genuinely blocking and later resuming in ring 3), a `SYS_WRITE_LINE`, a
+  real `SYS_FS_OPEN`/`SYS_FS_WRITE` round trip to `fs` (opening
+  `/from_ring3.txt` and writing a message to it, all the way from ring 3),
+  a real `SYS_VIRCOPY` reading a range of `driver`'s own private memory
+  straight from ring 3 (see `src/syscall.rs` below), a second,
+  deliberately-invalid `SYS_VIRCOPY` exercising the ABI's distinct error
+  codes, then a real `SYS_READ_LINE` -- blocking for however long it
+  takes a human to actually type a line -- followed by a second
+  `SYS_FS_OPEN`/`SYS_FS_WRITE` writing whatever line arrived to
+  `/from_console.txt`, and finally `SYS_BLOCK_FOREVER` -- see
   `src/syscall.rs` below for what each of those actually does. `IDLE`
-  (below) reads `/from_ring3.txt` back afterward to confirm the content
-  genuinely landed in `fs`; `/from_console.txt` needs a human (or a QMP
-  `send-key` script) to actually type something first, so nothing reads
-  it back automatically -- see the "Running" section. `CLOCK` now genuinely
+  (below) reads `/from_ring3.txt` and `/from_fork_child.txt` back
+  afterward to confirm the content genuinely landed in `fs`;
+  `/from_console.txt` needs a human (or a QMP `send-key` script) to
+  actually type something first, so nothing reads it back automatically --
+  see the "Running" section. `CLOCK` now genuinely
   calls `sys_setalarm` and blocks in `receive` -- exactly real MINIX's
   `while (TRUE) receive(HARDWARE, &m)` -- instead of polling
   `uptime_ticks()`, and also exercises `sys_vircopy`: reading the ring-3
@@ -595,25 +641,30 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Ten calls exist**, and only `SYS_SET_ALARM`/`SYS_WAIT_ALARM`/
-  `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ`/`SYS_READ_LINE`/`SYS_VIRCOPY`
-  reach real server/kernel-call logic (`sys_fork` still isn't reachable
-  from ring 3 at all). Real enough to write a genuine ring-3 program
-  against (a demo user program can now get the time, print, sleep, do
-  real file I/O, block for real keyboard input, and read another
-  process's memory), but still a hand-picked set proving the dispatch
-  mechanism works, not a real syscall surface.
-- **Four arguments, not a full calling convention.** Only `rdi`/`rsi`/
-  `rdx`/`rcx` are read as arguments; a real syscall ABI (or MINIX's own
-  message-based one) would want more.
+- **Eleven calls exist**, and all but the unrecognized-call-number
+  fallback reach real server/kernel-call logic, including `SYS_FORK` now
+  (see the `src/syscall.rs`/`src/proc.rs` bullets above). Real enough to
+  write a genuine ring-3 program against (a demo user program can now get
+  the time, print, sleep, do real file I/O, block for real keyboard
+  input, read another process's memory, and fork itself), but still a
+  hand-picked set proving the dispatch mechanism works, not a real
+  syscall surface.
+- **Five arguments, not a full calling convention.** `rdi`/`rsi`/`rdx`/
+  `rcx` carry the four ordinary caller-supplied arguments; `r9` carries a
+  fifth, `SYS_FORK`-only one (`frame_ptr`, not something a caller passes
+  intentionally -- see the `src/syscall.rs` bullet above) that isn't part
+  of the ABI a normal call sees. A real syscall ABI (or MINIX's own
+  message-based one) would want a real, uniform argument convention
+  instead of one call quietly reaching around it.
 - **A handful of distinct error codes, not a real `errno` set.**
   `dispatch` used to return a single `ERROR: u64 = u64::MAX` sentinel for
-  every failure; it now returns one of four small negative-`i64`-as-`u64`
+  every failure; it now returns one of five small negative-`i64`-as-`u64`
   codes (`ERR_BAD_LENGTH`/`ERR_BAD_UTF8`/`ERR_VIRCOPY_FAILED`/
-  `ERR_UNKNOWN_CALL`, mirroring the convention `crate::calls`/`crate::fs`
-  already use for their own failures) -- one per *kind* of mistake this
-  dispatch layer itself detects, not one per underlying cause the way a
-  real `errno` would distinguish (e.g. every `SYS_VIRCOPY` failure from
+  `ERR_UNKNOWN_CALL`/`ERR_FORK_UNSUPPORTED_CALLER`, mirroring the
+  convention `crate::calls`/`crate::fs` already use for their own
+  failures) -- one per *kind* of mistake this dispatch layer itself
+  detects, not one per underlying cause the way a real `errno` would
+  distinguish (e.g. every `SYS_VIRCOPY` failure from
   `calls::sys_vircopy` itself, whatever the reason, collapses to the same
   `ERR_VIRCOPY_FAILED`). Verified reaching a real ring-3 caller's `rax`,
   not just computed correctly inside `dispatch`: `tty` deliberately makes
@@ -645,29 +696,41 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the kernel calls
 
-- **`sys_setalarm` and `sys_vircopy` are reachable from ring 3; `sys_fork`
-  still isn't** (via `crate::syscall`'s `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
-  and `SYS_VIRCOPY`, a real register-based call-number dispatch -- see
-  "known simplifications in the syscall ABI" above). None of these three
-  are entries in a call-number dispatch table reached via a message to
-  `SYSTEM` (`kernel/system.c`'s `map(SYS_xxx, do_xxx)`) the way real
-  MINIX's kernel calls are -- `crate::syscall`'s register-based dispatch
-  stands in for that here, same as it does for everything else this port
-  reaches from ring 3.
-- **`sys_fork`'s child starts at a fixed entry point, not "wherever the
-  parent was."** Real `fork()` gives the child an exact copy of the
-  parent's *entire* address space and resumes both sides from the same
-  call site (the child's `fork()` returns `0`, the parent's returns the
-  child's pid). This port's tasks are built around a fixed `fn() -> !`
-  entry point (`crate::proc::spawn`) instead, so `sys_fork`'s child starts
-  fresh at whatever entry point the caller supplies -- a real, working
-  process-creation primitive with genuinely independent memory (see the
-  `pm`/`init` canary demo in `main.rs`), just not full POSIX continuation
-  semantics.
+- **`sys_setalarm`, `sys_vircopy`, and `sys_fork` (via its `sys_fork_from_frame`
+  sibling) are all reachable from ring 3 now** (via `crate::syscall`'s
+  `SYS_SET_ALARM`/`SYS_WAIT_ALARM`, `SYS_VIRCOPY`, and `SYS_FORK`, a real
+  register-based call-number dispatch -- see "known simplifications in
+  the syscall ABI" above). None of these are entries in a call-number
+  dispatch table reached via a message to `SYSTEM` (`kernel/system.c`'s
+  `map(SYS_xxx, do_xxx)`) the way real MINIX's kernel calls are --
+  `crate::syscall`'s register-based dispatch stands in for that here,
+  same as it does for everything else this port reaches from ring 3.
+- **Two `sys_fork`s, not one.** `calls::sys_fork` (used by `pm`'s own
+  kernel-side demo, the `pm`/`init` canary test in `main.rs`) still starts
+  its child at a fixed entry point, not "wherever the parent was" --
+  real, working process creation with genuinely independent memory, just
+  not full POSIX continuation semantics. `sys_fork_from_frame`
+  (`SYS_FORK`'s ring-3 handler) is the sibling that actually achieves
+  that: it hands `proc::fork_current` a full `proc::TrapFrame` snapshot
+  of the caller's own trap instead of a `fn() -> !`, so the new task
+  resumes at the caller's *exact* trapped instruction, in ring 3, seeing
+  `0` where the parent sees the child's `proc_nr` -- genuine `fork()`
+  semantics, verified by `tty` (`user/hello.s`) forking itself and the
+  child immediately diverging (a canary write proving its data page is a
+  real, independent copy -- not aliased with the parent's -- plus its own
+  `SYS_FS_OPEN`/`SYS_FS_WRITE` to a distinct file, all checked back from
+  `IDLE` afterward; see `fork_child_verify` in `src/main.rs`).
 - **`private_pages` must be listed explicitly**, rather than discovered
   by walking the parent's entire user-accessible page-table range. There's
   no per-process memory-map bookkeeping yet (`kernel/kernel.h`'s
-  `struct mem_map`) to read it back out of.
+  `struct mem_map`) to read it back out of -- for `SYS_FORK` specifically,
+  this means `crate::syscall`'s dispatch hardcodes which pages matter per
+  *caller* (only `TTY_PROC_NR` is known at all; anyone else gets
+  `ERR_FORK_UNSUPPORTED_CALLER`), and there's exactly one reserved child
+  slot (`com::FORK_CHILD_PROC_NR`) -- a second fork before the first
+  child's slot is somehow freed would just overwrite it, the same
+  one-outstanding-instance simplification `crate::rs`'s `SERVICES` table
+  already has.
 - **`sys_vircopy` skips validation** real MINIX's `do_copy` does first:
   resolving `SELF` to the caller's own process number, and rejecting
   invalid process numbers. Every current caller already knows both real
@@ -903,15 +966,21 @@ Roughly in the order the original kernel needs them:
    `memory::fork_address_space` + `proc::spawn`). `CLOCK` uses the first
    two for real instead of polling; `pm` uses the third to create a real
    child process with a genuinely independent, deep-copied address space
-   (verified with a canary write). `sys_vircopy` is now also reachable
-   from ring 3 (`crate::syscall`'s `SYS_VIRCOPY`, see the `src/syscall.rs`
-   bullet above): `tty` reads a byte range out of `driver`'s own private
-   memory straight from its own ring-3 code, verified by `IDLE` reading
-   the result back out of *`tty`'s* memory afterward with a second,
-   independent `sys_vircopy` call. See "known simplifications" above for
-   what's not implemented yet (`sys_fork` still not reachable from ring 3,
-   `sys_umap`, more of `kernel/system/do_*.c`, full POSIX fork
-   continuation semantics).
+   (verified with a canary write). `sys_vircopy` and `sys_fork` are now
+   both also reachable from ring 3 (`crate::syscall`'s `SYS_VIRCOPY`/
+   `SYS_FORK`, see the `src/syscall.rs`/`src/proc.rs` bullets above): `tty`
+   reads a byte range out of `driver`'s own private memory straight from
+   its own ring-3 code (verified by `IDLE` reading the result back out of
+   *`tty`'s* memory afterward with a second, independent `sys_vircopy`
+   call), and forks itself into a genuine child process that resumes at
+   the exact same ring-3 instruction rather than a fixed entry point --
+   real `fork()` semantics this time, not `calls::sys_fork`'s own
+   fixed-entry-point shape (verified by the child's canary write and its
+   own independent `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
+   `IDLE`). See "known simplifications" above for what's not implemented
+   yet (`sys_umap`, more of `kernel/system/do_*.c`, full POSIX fork/exec
+   continuation semantics for a *general* process, not just this one
+   hardcoded ring-3 caller).
 10. ~~**A minimal ELF loader**~~ — done (`src/elf.rs`). Parses a real,
     statically linked ELF64 binary (`user/hello.elf`) and maps its
     `PT_LOAD` segments into a fresh address space at their own specified
@@ -946,11 +1015,15 @@ Roughly in the order the original kernel needs them:
     a real (if minimal, one-entry) service table (`crate::rs::SERVICES`)
     deciding what to start and restart by name rather than only a single
     hardcoded demo, launchable on demand via a console `run <name>`
-    command (see the `src/rs.rs`/`src/keyboard.rs` bullets above). Still
-    missing: full POSIX fork/exec semantics (the child resuming from the
-    parent's exact call site, and using the ELF loader above to load a program
-    image instead of starting at a fixed entry point), and `fs` growing
-    `readdir` and a real backing store (see "known simplifications in
+    command (see the `src/rs.rs`/`src/keyboard.rs` bullets above).
+    `sys_fork`'s "child resumes at the parent's exact call site" gap is
+    also closed now, for the one ring-3 caller that exercises it
+    (`crate::syscall`'s `SYS_FORK`/`sys_fork_from_frame`, see item 9
+    above) -- still missing: `exec()` (using the ELF loader above to
+    replace a process's *own* image with a different program, rather than
+    forking a copy of the same one), a general per-process memory map so
+    any caller (not just a hardcoded, known one) can fork itself, and `fs`
+    growing `readdir` and a real backing store (see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
     file/directory table. Ring-3 callers can now reach `fs` for real
     (`crate::syscall`'s `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ`), but
@@ -1001,8 +1074,9 @@ Roughly in the order the original kernel needs them:
     `usermode`'s old fixed-action, count-and-cut-off `int 0x80` handler
     with genuine call-number/register dispatch: a hand-written naked trap
     gate saves every general-purpose register, reads the caller's `rax`
-    (call number) and `rdi`/`rsi`/`rdx` (up to three arguments),
-    dispatches to one of eight calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    (call number) and `rdi`/`rsi`/`rdx`/`rcx` (up to four arguments, since
+    grown from three -- see the `src/syscall.rs` bullet above),
+    dispatches to one of eleven calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
     -- a real cross-ring pointer argument, read directly since entering a
     trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
     the first of `crate::calls`' own kernel calls reachable from ring 3,
@@ -1039,10 +1113,19 @@ Roughly in the order the original kernel needs them:
     `ERR_UNKNOWN_CALL`, replacing a single undifferentiated `u64::MAX`
     sentinel), verified the same way -- a kernel task reads the raw
     return value `tty` stashed back out and checks it's exactly
-    `ERR_BAD_LENGTH`. See "known simplifications in the syscall ABI"
-    above for what's not a real syscall surface yet (ten calls, `sys_fork`
-    still not reachable, one code per *kind* of dispatch-level mistake
-    rather than a real per-cause `errno` set).
+    `ERR_BAD_LENGTH`. Finally, `tty` calls `SYS_FORK` -- growing the ABI
+    to five registers (`rdi`/`rsi`/`rdx`/`rcx` plus `frame_ptr` in `r9`,
+    the caller's full trap frame rather than a normal argument, see the
+    `src/syscall.rs`/`src/proc.rs` bullets above) -- and genuinely forks
+    itself: the parent sees the new child's `proc_nr` in `rax` and carries
+    on unchanged, while a real, separately-scheduled child resumes at that
+    *exact same* ring-3 instruction seeing `0` instead, verified by the
+    child's canary write (proving its memory is a real, independent copy)
+    and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
+    `IDLE`. See "known simplifications in the syscall ABI" above for what's
+    not a real syscall surface yet (eleven calls, one code per *kind* of
+    dispatch-level mistake rather than a real per-cause `errno` set,
+    `SYS_FORK` hardcoded to one known caller and one reserved child slot).
 
 ## Building
 
@@ -1163,8 +1246,15 @@ cycles, and finally `[rs] flaky (proc_nr 8) died again -- already
 restarted it 3 times, giving up` after the fourth crash, `driver` (the hand-assembled demo)
 and `tty` (a real ELF64 binary loaded by `crate::elf`) each making real,
 register-dispatched syscalls through `crate::syscall` --
-`[syscall] proc P: SYS_GET_UPTIME -> N` a few times each,
-`tty` additionally calling `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
+`[syscall] proc P: SYS_GET_UPTIME -> N` a few times each, `tty`
+additionally calling `SYS_FORK` right after its own loop
+(`[syscall] proc 5: SYS_FORK -> child proc_nr 11`) and genuinely forking
+itself: a real, separately-scheduled child (`proc_nr` 11) resumes at that
+same point seeing `0` instead, writes a canary into its own copy of
+`vircopy_buf`, and makes its own independent `SYS_FS_OPEN`/`SYS_FS_WRITE`
+(`[syscall] proc 11: SYS_FS_OPEN("/from_fork_child.txt") -> N`) before
+blocking for good -- while `tty` itself (seeing its child's nonzero
+`proc_nr`) falls straight through to `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
 (`[syscall] proc 5: SYS_SET_ALARM(3 ticks)`, then, after genuinely
 blocking through several other tasks' output in between,
 `[syscall] proc 5: SYS_WAIT_ALARM woken by a real SYN_ALARM notification
@@ -1187,7 +1277,7 @@ running other tasks when it showed up), `memory`'s demo task spinning
 through many quanta purely because the timer forces it to keep yielding
 and resuming (asynchronous preemption -- watch its counter resume from
 exactly where it left off every time), and finally, once everything else
-has blocked, `IDLE` running three independent checks against processes
+has blocked, `IDLE` running five independent checks against processes
 that have long since gone quiet: `sys_vircopy`-ing `tty`'s `.data` counter
 back out and confirming it reads `5` (proving the loaded ELF binary's own
 code genuinely ran, not just that it trapped the right number of times --
@@ -1198,7 +1288,14 @@ because that race was real, not just theoretical (see the
 story), reading back `/from_ring3.txt` (`[idle] read back "written
 from ring 3 via a real syscall, IPC, and fs!" from /from_ring3.txt ...`)
 to confirm `tty`'s `SYS_FS_OPEN`/`SYS_FS_WRITE` calls genuinely reached
-`fs` through a completely independent, kernel-side path, and
+`fs` through a completely independent, kernel-side path,
 `sys_vircopy`-ing `tty`'s `vircopy_buf` back out to confirm *its* ring-3
-`SYS_VIRCOPY` call actually landed the right bytes -- before reporting
-that it's halting (with the accumulated tick count).
+`SYS_VIRCOPY` call actually landed the right bytes, doing the same for
+`err_result` to confirm the deliberately-invalid second `SYS_VIRCOPY`
+came back exactly `ERR_BAD_LENGTH`, and finally two checks on the forked
+child specifically: `sys_vircopy`-ing *its* `vircopy_buf` (targeting
+`proc_nr` 11, not `tty`) to confirm it holds the canary and not `tty`'s
+own content -- proof fork's copy was genuinely independent, not
+aliased -- and reading back `/from_fork_child.txt` to confirm the
+child's own file write reached `fs` too, before reporting that it's
+halting (with the accumulated tick count).

@@ -30,4 +30,5 @@ pub static BOOT_IMAGE: [BootImageEntry; NR_BOOT_PROCS] = [
     BootImageEntry { proc_nr: FLAKY_PROC_NR, name: "flaky" },
     BootImageEntry { proc_nr: CONSOLE_PROC_NR, name: "console" },
     BootImageEntry { proc_nr: APP1_PROC_NR, name: "hello (app slot, not started at boot)" },
+    BootImageEntry { proc_nr: FORK_CHILD_PROC_NR, name: "fork_child (slot, not started at boot)" },
 ];
