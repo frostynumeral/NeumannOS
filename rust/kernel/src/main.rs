@@ -107,7 +107,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     let ring3_address_space = usermode::create_address_space(phys_mem_offset);
     // Same idea, but loading a real ELF binary's segments (crate::elf)
     // instead of hand-placing a fixed byte array.
-    let elf_address_space = elf::load(elf::HELLO_ELF, phys_mem_offset);
+    let elf_address_space = elf::load(elf::HELLO_ELF, com::TTY_PROC_NR);
     // Self-test: this is the actual proof of isolation, not just that
     // things still work. The demo pages were never mapped into *this*
     // (the kernel's own) page table -- only into `ring3_address_space` --
@@ -369,10 +369,29 @@ fn demo_pm_task() -> ! {
 
     fork_demo();
     fs_rw_demo();
+    seed_bin_hello();
 
     serial_println!("[pm] demo finished, blocking for good");
     ipc::receive(com::ANY); // nothing left to receive; parks pm so idle can run
     unreachable!("nothing sends to pm once the demo is done");
+}
+
+/// Write `elf::HELLO_ELF`'s bytes into `fs` at `/bin/hello` -- the "app is
+/// installed" step a real package manager would otherwise do. Without
+/// this, `crate::rs`'s `SERVICES` table (`rs.rs`) would have nothing to
+/// actually load: `fs` is in-memory and starts empty every boot, so a
+/// task has to put the binary there before it can be launched by name
+/// (`elf::spawn_from_fs`). Must run from a task, not `kernel_main`
+/// directly: `fs::open`/`fs::write` block on a real IPC round trip, which
+/// needs a task context to block in.
+fn seed_bin_hello() {
+    let rc = fs::mkdir("/bin");
+    assert_eq!(rc, 0, "fs::mkdir(\"/bin\") failed: {}", rc);
+    let fd = fs::open("/bin/hello");
+    assert!(fd >= 0, "fs::open(\"/bin/hello\") failed: {}", fd);
+    let n = fs::write(fd, elf::HELLO_ELF);
+    serial_println!("[pm] seeded /bin/hello with {} bytes for rs's service table", n);
+    assert_eq!(n, elf::HELLO_ELF.len() as i64, "fs::write didn't accept the whole ELF image");
 }
 
 /// Proves `fs` (see `spawn_tasks`, now `fs::InMemoryFs::serve` instead of

@@ -16,7 +16,9 @@
 //! the mapped size are the same thing.
 
 use crate::memory::{self, GlobalFrameAllocator};
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::{com, fs, proc};
+use alloc::vec::Vec;
+use spin::Mutex;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -79,20 +81,26 @@ struct Elf64ProgramHeader {
     p_align: u64,
 }
 
-/// Set by `load` for `task_entry` to pick up. A global rather than an
-/// argument because `crate::proc::spawn` takes a plain `fn() -> !`, the
-/// same reason `crate::usermode`'s demo addresses are fixed constants
-/// rather than parameters -- fine for this port's one ELF task, same as
-/// it's fine for the one hand-assembled demo task.
-static ENTRY_ADDR: AtomicU64 = AtomicU64::new(0);
-static STACK_TOP: AtomicU64 = AtomicU64::new(0);
+/// Per-task `(entry, stack_top)`, keyed by `com::slot(proc_nr)`, for
+/// `task_entry` to pick up once it's actually running as that task. A side
+/// table rather than an argument because `crate::proc::spawn` takes a
+/// plain `fn() -> !` with no way to pass per-task data in directly; a table
+/// (rather than the single pair of globals this used to be) is what makes
+/// more than one ELF-loaded task -- the boot-time demo *and* whatever
+/// `spawn_from_fs` launches later -- able to coexist, each looking up its
+/// own entry by `proc::current_proc_nr()` once its trampoline runs.
+static ELF_TASK_PARAMS: Mutex<[(u64, u64); com::NR_BOOT_PROCS]> =
+    Mutex::new([(0, 0); com::NR_BOOT_PROCS]);
 
 /// Parse `image` and map each `PT_LOAD` segment into a freshly built
 /// address space (`memory::new_address_space`), plus one stack page.
-/// Returns that address space's top-level page table frame, for
-/// `crate::proc::spawn` to record as this task's `CR3` -- same shape as
+/// Records `proc_nr`'s entry point/stack top in `ELF_TASK_PARAMS` for
+/// `task_entry` to find once it's spawned under that same `proc_nr`, and
+/// returns the new address space's top-level page table frame, for
+/// `crate::proc::spawn` to record as that task's `CR3` -- same shape as
 /// `usermode::create_address_space`.
-pub fn load(image: &'static [u8], physical_memory_offset: VirtAddr) -> PhysFrame {
+pub fn load(image: &[u8], proc_nr: i32) -> PhysFrame {
+    let physical_memory_offset = memory::physical_memory_offset();
     assert!(image.len() >= core::mem::size_of::<Elf64Header>(), "ELF image too small");
     let header = unsafe { &*(image.as_ptr() as *const Elf64Header) };
     assert_eq!(&header.e_ident[0..4], b"\x7fELF", "not an ELF file");
@@ -128,8 +136,7 @@ pub fn load(image: &'static [u8], physical_memory_offset: VirtAddr) -> PhysFrame
             .ignore();
     }
 
-    ENTRY_ADDR.store(header.e_entry, Ordering::Relaxed);
-    STACK_TOP.store(STACK_ADDR + PAGE_SIZE, Ordering::Relaxed);
+    ELF_TASK_PARAMS.lock()[com::slot(proc_nr)] = (header.e_entry, STACK_ADDR + PAGE_SIZE);
     pml4_frame
 }
 
@@ -192,14 +199,53 @@ fn load_segment(
     }
 }
 
-/// A `crate::proc` task body: jump to ring 3 at `HELLO_ELF`'s real entry
-/// point (`e_entry`, not a hardcoded constant), on the stack `load`
-/// mapped for it. Reuses `usermode::enter_ring3` -- the CPU-level part of
-/// "jump to ring 3" doesn't care whether the code being jumped to came
-/// from a hand-assembled byte array or a real ELF file.
+/// A `crate::proc` task body: jump to ring 3 at the real entry point
+/// `load` recorded for whichever process number this task was spawned
+/// under (`ELF_TASK_PARAMS`), on the stack `load` mapped for it. Reuses
+/// `usermode::enter_ring3` -- the CPU-level part of "jump to ring 3"
+/// doesn't care whether the code being jumped to came from a
+/// hand-assembled byte array or a real ELF file, or which of possibly
+/// several ELF-loaded tasks this happens to be.
 pub fn task_entry() -> ! {
     let (code_sel, data_sel) = crate::gdt::user_selectors();
-    let entry = ENTRY_ADDR.load(Ordering::Relaxed);
-    let stack_top = STACK_TOP.load(Ordering::Relaxed);
+    let (entry, stack_top) = ELF_TASK_PARAMS.lock()[com::slot(proc::current_proc_nr())];
     unsafe { crate::usermode::enter_ring3(entry, stack_top, code_sel.0 as u64, data_sel.0 as u64) }
+}
+
+/// Longest chunk `spawn_from_fs` reads out of `fs` per round trip. Not a
+/// limit on the file's own size -- `fs::read` is called in a loop until it
+/// returns `<= 0`, so the whole file is assembled regardless of length;
+/// this only bounds each individual request.
+const READ_CHUNK: usize = 256;
+
+/// Load `path` out of `fs` and spawn it as a fresh ring-3 task under
+/// `proc_nr` -- the runtime counterpart to `kernel_main`'s boot-time
+/// `load(HELLO_ELF, ...)` call, reusing the same loader and the same
+/// `task_entry` trampoline so a launched app and the boot-time demo are
+/// indistinguishable once running. `crate::rs` is the only caller: it's
+/// the one place in this port that starts services, whether at boot (not
+/// applicable here) or on request (`com::RS_LAUNCH_REQUEST`).
+pub fn spawn_from_fs(
+    path: &str,
+    proc_nr: i32,
+    name: &'static str,
+    priority: u8,
+    quantum: i32,
+) -> Result<(), i64> {
+    let fd = fs::open(path);
+    if fd < 0 {
+        return Err(fd);
+    }
+    let mut image: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; READ_CHUNK];
+    loop {
+        let n = fs::read(fd, &mut chunk);
+        if n <= 0 {
+            break;
+        }
+        image.extend_from_slice(&chunk[..n as usize]);
+    }
+    let address_space = load(&image, proc_nr);
+    proc::spawn(proc_nr, name, task_entry, priority, quantum, true, Some(address_space));
+    Ok(())
 }
