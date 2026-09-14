@@ -7,7 +7,11 @@
 # own .data (proving a real cross-ring argument -- a pointer -- gets read
 # correctly). Then it goes one step further: SYS_FS_OPEN a real file and
 # SYS_FS_WRITE a message to it -- a genuine ring 3 -> syscall -> IPC ->
-# fs round trip, not just a kernel-internal call. Finally, SYS_READ_LINE:
+# fs round trip, not just a kernel-internal call. Then SYS_VIRCOPY: reads
+# a *different* process's private memory (driver's own code page) straight
+# from ring 3, into this task's own vircopy_buf -- the same cross-address-
+# space copy crate::main's vircopy_demo already does kernel-side, now
+# reachable through the syscall ABI. Finally, SYS_READ_LINE:
 # this blocks for real, for as long as it takes a human (or a QMP
 # send-key script) to actually type a line and press Enter, then writes
 # whatever line arrives to a second file via SYS_FS_OPEN/SYS_FS_WRITE,
@@ -74,6 +78,17 @@ _start:
     mov $7, %eax        # SYS_FS_WRITE (crate::syscall::SYS_FS_WRITE)
     int $0x80
 
+    # SYS_VIRCOPY (rdi=src_proc, rsi=src_addr, rdx=local dst ptr,
+    # rcx=len): copy driver's own code page (a different process's
+    # private address space, com::DRVR_PROC_NR / usermode::USER_CODE_ADDR)
+    # into this task's own vircopy_buf.
+    mov $6, %edi              # src_proc = DRVR_PROC_NR
+    mov $0x555555550000, %rsi # src_addr = usermode::USER_CODE_ADDR
+    lea vircopy_buf(%rip), %rdx
+    mov $28, %ecx             # len = usermode::USER_CODE.len()
+    mov $10, %eax             # SYS_VIRCOPY (crate::syscall::SYS_VIRCOPY)
+    int $0x80
+
     # Block for a real line of console input (rdi=buf ptr, rsi=max len).
     # Returns however many bytes were actually typed.
     lea line_buf(%rip), %rdi
@@ -118,3 +133,5 @@ path2_len = . - path2
 line_buf:
     .skip 64
 line_buf_cap = 64
+vircopy_buf:
+    .skip 32

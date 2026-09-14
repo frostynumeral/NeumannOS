@@ -207,14 +207,22 @@ fn spawn_tasks(ring3_address_space: PhysFrame, elf_address_space: PhysFrame) {
 /// `IDLE` only ever becomes current once *everything* else has blocked
 /// (it's the lowest-priority queue, `proc::IDLE_Q`) -- `memory`'s
 /// busy-loop alone keeps that from happening until around tick 30 (see
-/// `busy_task`), comfortably after `tty`'s own alarm-triggered
-/// `SYS_FS_OPEN`/`SYS_FS_WRITE` (`user/hello.s`) has had time to run --
-/// so this is a safe, "everything that's going to happen already has"
-/// checkpoint for `fs_from_ring3_verify` to run at, the same way
-/// `clock_task`'s own checks rely on `tty`'s *counter loop* (not its full
-/// sequence) having already finished by the time *it* runs.
+/// `busy_task`), comfortably after `tty`'s entire sequence (its counter
+/// loop, its `SYS_VIRCOPY`, and its alarm-triggered
+/// `SYS_FS_OPEN`/`SYS_FS_WRITE`, `user/hello.s`) has had time to run --
+/// so this, unlike `CLOCK`'s own fixed-alarm wakeup, is a genuinely safe
+/// "everything that's going to happen already has" checkpoint, not a
+/// race against `tty`'s actual progress. `elf_counter_demo` used to run
+/// from `clock_task` instead, racing `tty`'s counter loop against
+/// `CLOCK`'s own independent 3-tick alarm -- "true in practice" (per its
+/// old doc comment) until real timing variance proved otherwise (an
+/// observed, reproducible boot panic, not a hypothetical one); it and
+/// `vircopy_from_ring3_verify` both belong here instead, for the same
+/// reason `fs_from_ring3_verify` already does.
 fn idle_task() -> ! {
+    elf_counter_demo();
     fs_from_ring3_verify();
+    vircopy_from_ring3_verify();
     serial_println!("[idle] no other task is ready, halting (uptime: {} ticks)", proc::uptime_ticks());
     halt_loop()
 }
@@ -240,6 +248,37 @@ fn fs_from_ring3_verify() {
     assert_eq!(&buf[..n as usize], expected, "fs content doesn't match what tty wrote via a real syscall");
 }
 
+/// Proves `tty`'s ring-3 `SYS_VIRCOPY` call (`user/hello.s`, via
+/// `crate::syscall`) genuinely copied `driver`'s private memory into
+/// `tty`'s *own* address space, not just that the syscall returned
+/// success: reads `tty`'s `vircopy_buf` (`elf::VIRCOPY_BUF_ADDR`) back out
+/// with a second, independent `sys_vircopy` call (kernel-side, the same
+/// mechanism `vircopy_demo` above already proved) and checks it matches
+/// `usermode::USER_CODE` -- the exact bytes `driver`'s own code page
+/// holds. Same "everything that's going to happen already has" checkpoint
+/// as `fs_from_ring3_verify` above, for the same reason: `tty`'s
+/// `SYS_VIRCOPY` runs well before its own `SYS_READ_LINE` blocks, which is
+/// itself well before `IDLE` ever becomes current.
+fn vircopy_from_ring3_verify() {
+    let mut buf = [0u8; usermode::USER_CODE.len()];
+    calls::sys_vircopy(
+        com::TTY_PROC_NR,
+        x86_64::VirtAddr::new(elf::VIRCOPY_BUF_ADDR),
+        com::IDLE,
+        x86_64::VirtAddr::new(buf.as_mut_ptr() as u64),
+        buf.len(),
+    )
+    .expect("sys_vircopy failed reading tty's vircopy_buf");
+    serial_println!(
+        "[idle] read back {:?} from tty's own vircopy_buf (copied there by tty itself via ring-3 SYS_VIRCOPY)",
+        buf
+    );
+    assert_eq!(
+        buf, usermode::USER_CODE,
+        "tty's ring-3 SYS_VIRCOPY didn't actually copy driver's code page"
+    );
+}
+
 /// Stand-in for `kernel/clock.c`'s clock task. Now much closer to the real
 /// thing than earlier milestones' version: it calls `sys_setalarm`
 /// (`crate::calls`) and blocks in `receive`, exactly like real MINIX's
@@ -253,8 +292,13 @@ fn fs_from_ring3_verify() {
 /// settling down, since `CLOCK` is a convenient, deterministic place to
 /// run it: the ring-3 task's code page is populated in `kernel_main`
 /// before any task ever runs, so this works regardless of scheduling
-/// order, without needing to coordinate with that task directly. Then
-/// demonstrates the other real-servers prerequisite this milestone adds:
+/// order, without needing to coordinate with that task directly.
+/// (`elf_counter_demo`/`vircopy_from_ring3_verify` below used to run from
+/// here too, racing `CLOCK`'s own fixed 3-tick alarm against `tty`'s
+/// actual progress through the ready queue -- "true in practice" until it
+/// wasn't; see `idle_task` for where they live now and why that's
+/// actually safe.) Then demonstrates the other real-servers prerequisite
+/// this milestone adds:
 /// dynamically spawning a brand new task (`log`) at runtime, with the
 /// scheduler already running other tasks -- the primitive real `rs`
 /// (starting services on demand, not just at boot) actually needs.
@@ -269,7 +313,6 @@ fn clock_task() -> ! {
     );
 
     vircopy_demo();
-    elf_counter_demo();
 
     serial_println!("[clock] dynamically spawning a new task (log) at runtime");
     proc::spawn(com::LOG_PROC_NR, "log (dynamic)", dynamic_log_task, 5, 24, true, None);
@@ -328,25 +371,29 @@ fn vircopy_demo() {
 /// `SYS_GET_UPTIME` calls `user/hello.s` makes before moving on to
 /// `SYS_WRITE_LINE`/`SYS_BLOCK_FOREVER`.
 ///
-/// Relies on `tty` (proc 5) having already run to completion (blocked in
-/// `SYS_BLOCK_FOREVER`) by the time this runs -- true in practice, since
-/// `tty` and `driver` share the same priority queue and `tty` is
-/// enqueued right after `driver` blocks, well before `CLOCK`'s alarm (3
-/// ticks) fires -- same kind of scheduling-order dependency
-/// `vircopy_demo` above already has on `driver`.
+/// Runs from `idle_task` (see its doc comment for why that's a genuinely
+/// safe checkpoint, not a race) rather than `clock_task`: an earlier
+/// version ran this right after `CLOCK`'s own fixed 3-tick alarm fired,
+/// racing that independent timer against `tty`'s actual progress through
+/// the ready queue -- "true in practice" until a run of real boots under
+/// heavier host load reproducibly proved it wasn't (an observed panic:
+/// `counter` read back `0`, not `5`), the same class of "two independent
+/// timers, assumed-safe interleaving" bug the scheduler's own
+/// `reschedule`/`start` race (see "A real bug found and fixed by a
+/// multi-agent review" above) already showed up once in this port.
 fn elf_counter_demo() {
     let mut buf = [0u8; 4];
     calls::sys_vircopy(
         com::TTY_PROC_NR,
         x86_64::VirtAddr::new(elf::COUNTER_ADDR),
-        com::CLOCK,
+        com::IDLE,
         x86_64::VirtAddr::new(buf.as_mut_ptr() as u64),
         buf.len(),
     )
     .expect("sys_vircopy failed reading the ELF task's counter");
     let counter = i32::from_le_bytes(buf);
     serial_println!(
-        "[clock] sys_vircopy read back the ELF-loaded task's own .data counter: {} (expected 5)",
+        "[idle] sys_vircopy read back the ELF-loaded task's own .data counter: {} (expected 5)",
         counter
     );
     assert_eq!(
