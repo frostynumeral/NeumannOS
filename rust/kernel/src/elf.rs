@@ -42,6 +42,16 @@ const PAGE_SIZE: u64 = 4096;
 /// that it trapped into the kernel the expected number of times.
 pub const COUNTER_ADDR: u64 = 0x_5555_5556_0000;
 
+/// Where `user/hello.s`'s `vircopy_buf` lives -- the destination `tty`'s
+/// own ring-3 `SYS_VIRCOPY` call (`crate::syscall`) writes into, and
+/// where a kernel task can `sys_vircopy` it back out afterward to confirm
+/// the copy genuinely landed in `tty`'s own address space. Read off the
+/// built `hello.elf` with `nm` rather than computed, since it sits partway
+/// through `.data` (after `counter`/`message`/`path`/... -- see
+/// `user/hello.s`), not at the section's own link address like
+/// `COUNTER_ADDR` is.
+pub const VIRCOPY_BUF_ADDR: u64 = 0x_5555_5556_00de;
+
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;

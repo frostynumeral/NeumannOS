@@ -72,8 +72,30 @@
 //! until a full line has actually been typed (there's no bound on how
 //! long that takes), and only then copies the result into the caller's
 //! own buffer, since by then this task's own `CR3` is active again.
+//!
+//! `SYS_VIRCOPY` is the first call here to need a fourth argument, so the
+//! convention grows to match: call number in `rax`, up to *four*
+//! arguments in `rdi`/`rsi`/`rdx`/`rcx` (`entry`'s doc comment has the
+//! updated register map). It exposes `crate::calls::sys_vircopy` --
+//! already proven kernel-side (`crate::main`'s `vircopy_demo`) -- directly
+//! to a ring-3 caller: read `arg3` (`len`) bytes from process `arg0`
+//! (`src_proc`) at address `arg1` (`src_addr`) into *this task's own*
+//! buffer at `arg2` (`local_ptr`). The destination is always the caller
+//! itself (not an arbitrary fourth process) since that's the only
+//! direction a ring-3 task can actually make use of the result; unlike
+//! `SYS_WRITE_LINE`/`SYS_FS_WRITE`'s pointers, `local_ptr` is *not* read
+//! or written directly by `dispatch` -- it's handed to
+//! `memory::copy_between_address_spaces` (via `calls::sys_vircopy`),
+//! which reaches it by walking `arg0`/the caller's page tables through the
+//! physical-memory offset window, the same way it already does for a
+//! kernel-task caller like `CLOCK`, regardless of which `CR3` happens to
+//! be loaded right now. No privilege check gates `src_proc`: any ring-3
+//! task can read any other process's memory this way, unlike real
+//! MINIX's IPC-bitmask-gated kernel calls (see "known simplifications in
+//! the kernel calls").
 
 use crate::{calls, com, fs, ipc, keyboard, proc, serial_println};
+use x86_64::VirtAddr;
 
 pub const SYS_GET_UPTIME: u64 = 1;
 pub const SYS_WRITE_LINE: u64 = 2;
@@ -84,6 +106,12 @@ pub const SYS_FS_OPEN: u64 = 6;
 pub const SYS_FS_WRITE: u64 = 7;
 pub const SYS_FS_READ: u64 = 8;
 pub const SYS_READ_LINE: u64 = 9;
+pub const SYS_VIRCOPY: u64 = 10;
+
+/// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
+/// a sanity bound on an untrusted `len` from ring 3 -- matches the size
+/// of `user/hello.s`'s own `vircopy_buf` destination with room to spare.
+const MAX_VIRCOPY_LEN: usize = 256;
 
 /// Longest path/buffer `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ` will
 /// copy through a local kernel-stack buffer in either direction.
@@ -106,9 +134,9 @@ pub const ERROR: u64 = u64::MAX;
 
 /// The actual dispatch, called by `entry` (via `core::arch::naked_asm!`'s
 /// `sym` operand) with the caller's original `rax` (as `call_num`),
-/// `rdi` (`arg1`), `rsi` (`arg2`), and `rdx` (`arg3`) -- `entry`'s doc
-/// comment has the full register-to-argument mapping.
-extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+/// `rdi` (`arg1`), `rsi` (`arg2`), `rdx` (`arg3`), and `rcx` (`arg4`) --
+/// `entry`'s doc comment has the full register-to-argument mapping.
+extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     let caller = proc::current_proc_nr();
     match call_num {
         SYS_GET_UPTIME => {
@@ -250,6 +278,31 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
             serial_println!("[syscall] proc {}: SYS_READ_LINE -> {} bytes", caller, n);
             n as u64
         }
+        SYS_VIRCOPY => {
+            let src_proc = arg1 as i32;
+            let len = arg4 as usize;
+            if len > MAX_VIRCOPY_LEN {
+                return ERROR;
+            }
+            // Safety: `local_ptr` (arg3) is never dereferenced here --
+            // it's only handed to `calls::sys_vircopy`, which reaches it
+            // through `src_proc`/the caller's own page tables via the
+            // physical-memory offset window (see the module doc
+            // comment), not a direct pointer read/write in this task's
+            // (possibly different) currently-active address space.
+            match calls::sys_vircopy(src_proc, VirtAddr::new(arg2), caller, VirtAddr::new(arg3), len) {
+                Ok(()) => {
+                    serial_println!(
+                        "[syscall] proc {}: SYS_VIRCOPY({} bytes from proc {}) -> ok",
+                        caller,
+                        len,
+                        src_proc
+                    );
+                    0
+                }
+                Err(_) => ERROR,
+            }
+        }
         _ => {
             serial_println!("[syscall] proc {}: unknown call number {}", caller, call_num);
             ERROR
@@ -270,11 +323,16 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
 /// (every one except `rsp`, which `iretq` restores from the hardware
 /// frame), in a fixed order, then reads the caller's original `rax`
 /// (offset `+112` from the post-push `rsp`: 14 registers were pushed
-/// after it) as the call number and `rdi`/`rsi`/`rdx` (`+72`/`+80`/`+88`)
-/// as the first three arguments, calls `dispatch`, writes its `u64`
-/// return value back into the saved `rax` slot, and pops everything --
-/// so the only register the caller sees changed across the trap is
-/// `rax`, exactly like a real syscall's result.
+/// after it) as the call number and `rdi`/`rsi`/`rdx`/`rcx`
+/// (`+72`/`+80`/`+88`/`+96`) as the first four arguments, calls
+/// `dispatch`, writes its `u64` return value back into the saved `rax`
+/// slot, and pops everything -- so the only register the caller sees
+/// changed across the trap is `rax`, exactly like a real syscall's
+/// result. The call to `dispatch` itself reuses these same four
+/// registers in the System V order its own `extern "C"` parameters
+/// expect -- unrelated to, and overwriting, whatever the caller's
+/// original `rdi`/`rsi`/`rdx`/`rcx` were, which are already safely saved
+/// on the stack by this point and restored by the `pop`s below.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn entry() -> ! {
     core::arch::naked_asm!(
@@ -296,6 +354,7 @@ pub(crate) unsafe extern "C" fn entry() -> ! {
         "mov rdi, [rsp + 112]", // call_num = caller's original rax
         "mov rsi, [rsp + 72]",  // arg1     = caller's original rdi
         "mov rdx, [rsp + 80]",  // arg2     = caller's original rsi
+        "mov r8,  [rsp + 96]",  // arg4     = caller's original rcx (read before rcx below is clobbered)
         "mov rcx, [rsp + 88]",  // arg3     = caller's original rdx
         "call {dispatch}",
         "mov [rsp + 112], rax", // overwrite the saved rax slot with the result
