@@ -224,6 +224,7 @@ fn idle_task() -> ! {
     fs_from_ring3_verify();
     vircopy_from_ring3_verify();
     vircopy_error_from_ring3_verify();
+    fork_child_verify();
     serial_println!("[idle] no other task is ready, halting (uptime: {} ticks)", proc::uptime_ticks());
     halt_loop()
 }
@@ -310,6 +311,56 @@ fn vircopy_error_from_ring3_verify() {
         result, syscall::ERR_BAD_LENGTH,
         "tty's deliberately-invalid ring-3 SYS_VIRCOPY didn't come back ERR_BAD_LENGTH"
     );
+}
+
+/// Proves `tty`'s ring-3 `SYS_FORK` call (`user/hello.s`, via
+/// `crate::syscall`) genuinely created an independent child process, not
+/// just that the syscall returned a plausible-looking proc_nr: checks two
+/// things a shared-page aliasing bug couldn't fake. First, the forked
+/// child's own `vircopy_buf` reads back the canary (`0xcafebabe`) the
+/// child's ring-3 code wrote into *its own* copy right after forking --
+/// read via a kernel-side `sys_vircopy` targeting
+/// `com::FORK_CHILD_PROC_NR` specifically, not `tty`. Second, `tty`'s own
+/// `vircopy_buf` (already checked by `vircopy_from_ring3_verify` above)
+/// still holds `driver`'s code bytes, not the child's canary -- if
+/// `memory::fork_address_space` had left the data page merely aliased
+/// instead of genuinely deep-copied, the child's later write would have
+/// clobbered the parent's copy too, and that earlier check would already
+/// have failed. Finally, reads back the distinguishing file the child
+/// wrote (`/from_fork_child.txt`, a real `SYS_FS_OPEN`/`SYS_FS_WRITE` from
+/// the child's own, separately-scheduled ring-3 execution) the same way
+/// `fs_from_ring3_verify` does for `tty`'s own file.
+fn fork_child_verify() {
+    let mut canary_buf = [0u8; 4];
+    calls::sys_vircopy(
+        com::FORK_CHILD_PROC_NR,
+        x86_64::VirtAddr::new(elf::VIRCOPY_BUF_ADDR),
+        com::IDLE,
+        x86_64::VirtAddr::new(canary_buf.as_mut_ptr() as u64),
+        canary_buf.len(),
+    )
+    .expect("sys_vircopy failed reading the forked child's vircopy_buf");
+    let canary = u32::from_le_bytes(canary_buf);
+    serial_println!(
+        "[idle] read back {:#x} from the forked child's own vircopy_buf (expected canary 0xcafebabe)",
+        canary
+    );
+    assert_eq!(
+        canary, 0xcafebabe,
+        "the forked child's vircopy_buf doesn't hold its own canary -- fork may have left it aliased with tty's"
+    );
+
+    let expected = b"hello from the forked child, running independently in ring 3!";
+    let fd = fs::open("/from_fork_child.txt");
+    assert!(fd >= 0, "fs::open(\"/from_fork_child.txt\") failed: {}", fd);
+    let mut buf = [0u8; 96];
+    let n = fs::read(fd, &mut buf);
+    serial_println!(
+        "[idle] read back {:?} from /from_fork_child.txt (written by the forked child from its own ring-3 execution)",
+        core::str::from_utf8(&buf[..n.max(0) as usize]).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(n, expected.len() as i64, "wrong length read back from /from_fork_child.txt");
+    assert_eq!(&buf[..n as usize], expected, "fs content doesn't match what the forked child wrote");
 }
 
 /// Stand-in for `kernel/clock.c`'s clock task. Now much closer to the real

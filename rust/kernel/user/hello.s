@@ -31,6 +31,18 @@
 # not a bug. See rust/README.md's "Running" section for how to actually
 # supply a line over QEMU's QMP interface.
 #
+# Right after the counter loop, it also calls SYS_FORK -- creating a
+# genuine child process (crate::syscall::SYS_FORK) that resumes at this
+# *exact* point too, diverging only in what SYS_FORK's own return value
+# (rax) reads: the parent sees the new child's proc_nr (nonzero) and falls
+# through to continue the sequence above unchanged; the child sees 0 and
+# branches off to write a canary into vircopy_buf (proving its copy of
+# that page is genuinely independent from the parent's -- the parent
+# populates its own copy with driver's code bytes later, via the real
+# SYS_VIRCOPY below) and a distinguishing message to its own file, before
+# blocking for good -- never touching SET_ALARM/READ_LINE, so it can't
+# collide with the parent's own use of those.
+#
 # Built into hello.elf (checked in alongside this file, since the kernel
 # build has no cross toolchain wired in yet to assemble this
 # automatically -- see rust/README.md's roadmap) via:
@@ -57,6 +69,32 @@ _start:
     int $0x80
     loop 1b
 
+    mov $11, %eax       # SYS_FORK (crate::syscall::SYS_FORK)
+    int $0x80
+    test %rax, %rax
+    jnz 2f              # parent: rax = child's proc_nr (nonzero) -- fall through unchanged below
+
+    # --- child path (rax == 0) ---
+    movl $0xcafebabe, vircopy_buf(%rip) # canary: proves this page is a
+                                         # genuinely independent copy, not
+                                         # aliased with the parent's
+    lea fork_child_path(%rip), %rdi
+    mov $fork_child_path_len, %esi
+    mov $6, %eax        # SYS_FS_OPEN
+    int $0x80
+    mov %rax, %r8
+
+    mov %r8, %rdi
+    lea fork_child_message(%rip), %rsi
+    mov $fork_child_message_len, %edx
+    mov $7, %eax        # SYS_FS_WRITE
+    int $0x80
+
+    mov $3, %eax        # SYS_BLOCK_FOREVER
+    int $0x80
+    # unreachable: the child's story ends here.
+2:
+    # --- parent continues exactly as before ---
     mov $3, %edi        # delay_ticks = 3
     mov $4, %eax        # SYS_SET_ALARM (crate::syscall::SYS_SET_ALARM)
     int $0x80
@@ -154,3 +192,9 @@ vircopy_buf:
     .skip 32
 err_result:
     .quad 0
+fork_child_path:
+    .ascii "/from_fork_child.txt"
+fork_child_path_len = . - fork_child_path
+fork_child_message:
+    .ascii "hello from the forked child, running independently in ring 3!"
+fork_child_message_len = . - fork_child_message

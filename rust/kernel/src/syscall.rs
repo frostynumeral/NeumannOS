@@ -94,7 +94,7 @@
 //! MINIX's IPC-bitmask-gated kernel calls (see "known simplifications in
 //! the kernel calls").
 
-use crate::{calls, com, fs, ipc, keyboard, proc, serial_println};
+use crate::{calls, com, elf, fs, ipc, keyboard, proc, serial_println};
 use x86_64::VirtAddr;
 
 pub const SYS_GET_UPTIME: u64 = 1;
@@ -107,6 +107,7 @@ pub const SYS_FS_WRITE: u64 = 7;
 pub const SYS_FS_READ: u64 = 8;
 pub const SYS_READ_LINE: u64 = 9;
 pub const SYS_VIRCOPY: u64 = 10;
+pub const SYS_FORK: u64 = 11;
 
 /// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
 /// a sanity bound on an untrusted `len` from ring 3 -- matches the size
@@ -137,12 +138,24 @@ pub const ERR_BAD_LENGTH: u64 = (-1i64) as u64;
 pub const ERR_BAD_UTF8: u64 = (-2i64) as u64;
 pub const ERR_VIRCOPY_FAILED: u64 = (-3i64) as u64;
 pub const ERR_UNKNOWN_CALL: u64 = (-4i64) as u64;
+/// `SYS_FORK` from a caller this port doesn't know a private-pages list
+/// for (see the `SYS_FORK` match arm below) -- a policy gap (this dispatch
+/// layer hardcodes which pages matter per caller, since there's no
+/// per-process memory-map bookkeeping yet, see `crate::calls::sys_fork`'s
+/// doc comment), not a mechanism failure.
+pub const ERR_FORK_UNSUPPORTED_CALLER: u64 = (-5i64) as u64;
 
 /// The actual dispatch, called by `entry` (via `core::arch::naked_asm!`'s
 /// `sym` operand) with the caller's original `rax` (as `call_num`),
-/// `rdi` (`arg1`), `rsi` (`arg2`), `rdx` (`arg3`), and `rcx` (`arg4`) --
-/// `entry`'s doc comment has the full register-to-argument mapping.
-extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+/// `rdi` (`arg1`), `rsi` (`arg2`), `rdx` (`arg3`), and `rcx` (`arg4`), plus
+/// `frame_ptr`: not a caller-supplied argument at all, but the address of
+/// the 15 registers `entry` itself just pushed (`lea r9, [rsp]`, taken
+/// *before* the four `mov`s above start reusing those same registers for
+/// the call) -- `SYS_FORK` is the one call needing the caller's *entire*
+/// trap frame, not just its first four arguments (see `proc::TrapFrame`
+/// and the `SYS_FORK` match arm below). `entry`'s doc comment has the full
+/// register-to-argument mapping.
+extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, frame_ptr: u64) -> u64 {
     let caller = proc::current_proc_nr();
     match call_num {
         SYS_GET_UPTIME => {
@@ -309,6 +322,44 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                 Err(_) => ERR_VIRCOPY_FAILED,
             }
         }
+        SYS_FORK => {
+            // The private pages that matter for *this* caller specifically
+            // (see ERR_FORK_UNSUPPORTED_CALLER's doc comment): `tty`'s
+            // writable data page (elf::COUNTER_ADDR -- also covers
+            // vircopy_buf/err_result, all in the same page) and its stack.
+            // Its read-only code page is deliberately
+            // *not* listed -- neither side ever writes it, so leaving it
+            // shared (inherited from the whole-PML4 copy
+            // memory::fork_address_space already does) is both cheaper and
+            // closer to real fork()'s own copy-on-write treatment of
+            // unmodified pages than copying it would be.
+            let private_pages = match caller {
+                com::TTY_PROC_NR => {
+                    [VirtAddr::new(elf::COUNTER_ADDR), VirtAddr::new(elf::STACK_ADDR)]
+                }
+                _ => return ERR_FORK_UNSUPPORTED_CALLER,
+            };
+            // Safety: `frame_ptr` points at the 15 general-purpose
+            // registers `entry` pushed for *this* trap, immediately
+            // followed by the untouched hardware iretq frame -- see the
+            // module doc comment and `proc::TrapFrame`'s. Still live and
+            // valid: `entry` hasn't popped anything yet at this point.
+            let frame = unsafe { &*(frame_ptr as *const proc::TrapFrame) };
+            let mut child_frame = *frame;
+            child_frame.rax = 0; // fork()'s own convention: the child sees 0
+            let child = calls::sys_fork_from_frame(
+                caller,
+                &private_pages,
+                com::FORK_CHILD_PROC_NR,
+                "fork_child (from tty)",
+                5,
+                24,
+                true,
+                &child_frame,
+            );
+            serial_println!("[syscall] proc {}: SYS_FORK -> child proc_nr {}", caller, child);
+            child as u64
+        }
         _ => {
             serial_println!("[syscall] proc {}: unknown call number {}", caller, call_num);
             ERR_UNKNOWN_CALL
@@ -338,7 +389,12 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
 /// registers in the System V order its own `extern "C"` parameters
 /// expect -- unrelated to, and overwriting, whatever the caller's
 /// original `rdi`/`rsi`/`rdx`/`rcx` were, which are already safely saved
-/// on the stack by this point and restored by the `pop`s below.
+/// on the stack by this point and restored by the `pop`s below. A fifth
+/// register, `r9`, carries `frame_ptr`: the address of the 15 pushed
+/// registers themselves (just `rsp` at that point, captured *before* the
+/// four `mov`s start clobbering registers for the call) -- `SYS_FORK`'s
+/// handler is the one caller that needs the whole trap frame, not just
+/// `dispatch`'s four named arguments (see `dispatch`'s own doc comment).
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn entry() -> ! {
     core::arch::naked_asm!(
@@ -357,6 +413,7 @@ pub(crate) unsafe extern "C" fn entry() -> ! {
         "push r13",
         "push r14",
         "push r15",
+        "lea r9,  [rsp]",       // frame_ptr = base of the 15 pushed GPRs just above (proc::TrapFrame)
         "mov rdi, [rsp + 112]", // call_num = caller's original rax
         "mov rsi, [rsp + 72]",  // arg1     = caller's original rdi
         "mov rdx, [rsp + 80]",  // arg2     = caller's original rsi

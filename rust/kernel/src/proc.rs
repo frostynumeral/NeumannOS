@@ -435,6 +435,148 @@ pub fn spawn(
     });
 }
 
+/// A saved trap frame: the 15 general-purpose registers `crate::syscall`'s
+/// `entry` pushes (in that exact order -- see its doc comment) followed by
+/// the hardware-pushed `iretq` frame (`rip`/`cs`/`rflags`/`rsp`/`ss`) sitting
+/// immediately above them, untouched, on the same stack. `repr(C)` so this
+/// struct's field layout (fields at strictly increasing offsets, in
+/// declaration order) matches that memory layout exactly, letting
+/// `crate::syscall::dispatch` hand `fork_current` a raw pointer into a
+/// live trap and have it read as this type directly, and letting
+/// `fork_current` write one back out as plain bytes for `fork_child_resume`
+/// to later pop.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TrapFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub cs: u64,
+    pub rflags: u64,
+    pub rsp: u64,
+    pub ss: u64,
+}
+
+/// `SYS_FORK`'s real counterpart to `spawn`: instead of starting a brand
+/// new task at a fixed `fn() -> !` entry point, this makes `child_proc_nr`
+/// resume *inside a trap*, at the exact ring-3 instruction right after
+/// whichever `int 0x80` called `SYS_FORK` -- genuine `fork()` semantics
+/// (same code, same point, diverging only in what `rax` holds), not
+/// `sys_fork`'s existing "child starts fresh at a given function" shape
+/// (`crate::calls::sys_fork`, still used by `pm`'s own demo).
+///
+/// Builds *two* stacked frames on the child's own dedicated kernel stack,
+/// lowest address first: an ordinary `switch_to`-compatible frame (see
+/// `spawn`, six callee-saved registers + `RFLAGS` + a return address) whose
+/// return address is `fork_child_resume` instead of `trampoline`, followed
+/// immediately by a full copy of `frame` (with `rax` already zeroed by the
+/// caller -- see `crate::syscall`'s `SYS_FORK` handler -- the fork()
+/// convention distinguishing the child from its parent). The first time
+/// this task is switched to, `switch_to`'s own generic `ret` lands in
+/// `fork_child_resume`, which pops that inner frame and `iretq`s with it,
+/// same as an ordinary trap return -- so from ring 3's perspective, this
+/// task simply *is* the parent, one instruction further along, with `rax`
+/// reading `0`.
+pub fn fork_current(
+    child_proc_nr: i32,
+    name: &'static str,
+    priority: u8,
+    quantum: i32,
+    preemptible: bool,
+    address_space: PhysFrame,
+    frame: &TrapFrame,
+) {
+    let idx = com::slot(child_proc_nr);
+    let rsp = unsafe {
+        let base = (stack_top(idx) as usize & !0xf) as *mut u64;
+        let base = base.sub(28); // 8 (switch_to frame) + 20 (TrapFrame, 20 u64 fields)
+        base.add(0).write(0); // r15 (outer switch_to frame; unused)
+        base.add(1).write(0); // r14
+        base.add(2).write(0); // r13
+        base.add(3).write(0); // r12
+        base.add(4).write(0); // rbp
+        base.add(5).write(0); // rbx
+        base.add(6).write(0x202); // rflags (transient -- switch_to's popfq only)
+        base.add(7).write(fork_child_resume as *const () as u64);
+        let inner = base.add(8) as *mut TrapFrame;
+        inner.write(*frame);
+        base as u64
+    };
+
+    with_scheduler(|sched| {
+        sched.procs[idx] = Proc {
+            proc_nr: child_proc_nr,
+            name,
+            rts_flags: 0,
+            priority,
+            max_priority: priority,
+            ticks_left: quantum,
+            quantum_size: quantum,
+            preemptible,
+            rsp,
+            next_ready: None,
+            caller_q: None,
+            q_link: None,
+            get_from: com::NONE,
+            send_to: com::NONE,
+            messbuf: ptr::null_mut(),
+            entry: never_spawned, // never used -- this task's first resume bypasses `trampoline`
+            cr3: Some(address_space),
+            alarm: None,
+        };
+        sched.enqueue(idx);
+    });
+}
+
+/// Where a forked child's kernel stack "starts" the very first time it's
+/// switched to (see `fork_current`): unlike an ordinary task, which lands
+/// in `trampoline` and calls a plain `fn() -> !`, a forked child needs to
+/// resume *inside a trap*. `switch_to`'s `ret` jumps here instead, straight
+/// into the same contract `crate::syscall::entry`'s own tail fulfills: pop
+/// the `TrapFrame` `fork_current` laid out immediately below the
+/// `switch_to` frame (same order `entry` itself pushes/pops its 15
+/// registers in), then `iretq` into whatever `rip`/`cs`/`rflags`/`rsp`/`ss`
+/// the parent's own trap had at the moment it called `SYS_FORK`.
+/// Deliberately duplicates `entry`'s pop sequence rather than jumping into
+/// it directly: a naked function has no addressable internal label `sym`
+/// can reach from another function, and a second, small, self-contained
+/// stub is simpler than threading one through. Keep this in sync with
+/// `crate::syscall::entry`'s own tail if that one ever changes.
+#[unsafe(naked)]
+unsafe extern "C" fn fork_child_resume() -> ! {
+    core::arch::naked_asm!(
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rbp",
+        "pop rdi",
+        "pop rsi",
+        "pop rdx",
+        "pop rcx",
+        "pop rbx",
+        "pop rax",
+        "iretq",
+    )
+}
+
 /// Every task's stack is primed to start here (see `spawn`). `reschedule`/
 /// `start` stash the target task's entry point in `NEXT_ENTRY` immediately
 /// before switching to it; a task that has run before never actually lands

@@ -73,16 +73,15 @@ pub const SYN_ALARM: i32 = com::SYN_ALARM;
 /// (duplicate the memory) and a separate scheduling step (make it
 /// runnable), since nothing in this port needs them separated yet.
 ///
-/// Simplification: real `fork()` gives the child an *exact* copy of the
-/// parent's entire address space and resumes both sides from the same
-/// point (the child's `fork()` call returns `0`, the parent's returns the
-/// child's pid) -- this port's tasks are built around a fixed
-/// `fn() -> !` entry point instead (see `crate::proc::spawn`), so the
-/// child starts at `entry`, not "wherever the caller was". `private_pages`
-/// also has to be passed explicitly rather than discovered by walking the
-/// parent's entire user-accessible range, since there's no per-process
-/// memory-map bookkeeping (`kernel/kernel.h`'s `struct mem_map`) to read
-/// it back out of yet.
+/// Simplification: this version starts the child at a fixed `fn() -> !`
+/// entry point (see `crate::proc::spawn`), not "wherever the caller was" --
+/// fine for `pm`'s own demo (a plain kernel-side child), but not real
+/// `fork()` semantics. `sys_fork_from_frame` below is the ring-3-reachable
+/// sibling that actually resumes at the caller's exact trapped
+/// instruction. `private_pages` also has to be passed explicitly rather
+/// than discovered by walking the parent's entire user-accessible range,
+/// since there's no per-process memory-map bookkeeping (`kernel/kernel.h`'s
+/// `struct mem_map`) to read it back out of yet.
 #[allow(clippy::too_many_arguments)]
 pub fn sys_fork(
     src_proc: i32,
@@ -97,4 +96,29 @@ pub fn sys_fork(
     let (src_cr3, _) = proc::cr3_of(src_proc);
     let child_pml4 = memory::fork_address_space(src_cr3, private_pages);
     proc::spawn(child_proc_nr, name, entry, priority, quantum, preemptible, Some(child_pml4));
+}
+
+/// `sys_fork`'s real-fork-semantics sibling: same deep-copy-then-schedule
+/// shape, but hands `frame` (a snapshot of the caller's own trap, taken by
+/// `crate::syscall`'s `SYS_FORK` handler with `rax` already zeroed) to
+/// `proc::fork_current` instead of a fixed entry point, so the new task
+/// resumes exactly where its parent was, in ring 3, seeing `0` where the
+/// parent sees this function's return value (the child's `proc_nr`) --
+/// genuine `fork()` semantics, reachable from ring 3 through the syscall
+/// ABI (`crate::syscall::SYS_FORK`).
+#[allow(clippy::too_many_arguments)]
+pub fn sys_fork_from_frame(
+    src_proc: i32,
+    private_pages: &[VirtAddr],
+    child_proc_nr: i32,
+    name: &'static str,
+    priority: u8,
+    quantum: i32,
+    preemptible: bool,
+    frame: &proc::TrapFrame,
+) -> i32 {
+    let (src_cr3, _) = proc::cr3_of(src_proc);
+    let child_pml4 = memory::fork_address_space(src_cr3, private_pages);
+    proc::fork_current(child_proc_nr, name, priority, quantum, preemptible, child_pml4, frame);
+    child_proc_nr
 }

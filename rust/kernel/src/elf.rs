@@ -32,14 +32,20 @@ pub static HELLO_ELF: &[u8] = include_bytes!("../user/hello.elf");
 /// `crate::usermode`'s own demo addresses (a different address space
 /// entirely, so no real collision risk -- just kept distinct for
 /// clarity) and of `HELLO_ELF`'s own linked addresses (see `user/hello.s`).
-const STACK_ADDR: u64 = 0x_7777_7777_0000;
+/// `pub` so `crate::syscall`'s `SYS_FORK` handler can list it as one of
+/// `tty`'s private pages to deep-copy into a forked child (`fork` must
+/// give the child its own stack, not one aliased with the parent's).
+pub const STACK_ADDR: u64 = 0x_7777_7777_0000;
 const PAGE_SIZE: u64 = 4096;
 
 /// Where `user/hello.s`'s `counter` lives (matches its `--section-start`
 /// build command). Exposed so a kernel task can `sys_vircopy` it back out
 /// after the demo ends and confirm the loaded program's own code
 /// genuinely executed and wrote to its mapped `.data` segment -- not just
-/// that it trapped into the kernel the expected number of times.
+/// that it trapped into the kernel the expected number of times. Also the
+/// page `crate::syscall`'s `SYS_FORK` handler lists as one of `tty`'s
+/// private pages: it holds every other symbol below too (`vircopy_buf`,
+/// `err_result`, ...), all in the same 4 KiB page.
 pub const COUNTER_ADDR: u64 = 0x_5555_5556_0000;
 
 /// Where `user/hello.s`'s `vircopy_buf` lives -- the destination `tty`'s

@@ -56,8 +56,15 @@ pub const CONSOLE_PROC_NR: i32 = 9;
 /// `FLAKY_PROC_NR`/`CONSOLE_PROC_NR`: there's no free-list/dynamic
 /// process-number allocator in this port yet.
 pub const APP1_PROC_NR: i32 = 10;
+/// Reserved slot for `crate::syscall`'s `SYS_FORK`: the one outstanding
+/// forked child this port supports at a time, same reasoning as
+/// `APP1_PROC_NR` -- no dynamic process-number allocator yet, and no
+/// per-process memory-map bookkeeping to decide *which* pages a generic
+/// caller's fork should copy, so this is fixed to `tty`'s one demo fork
+/// rather than a real, any-process `fork()`.
+pub const FORK_CHILD_PROC_NR: i32 = 11;
 
-pub const NR_BOOT_PROCS: usize = NR_TASKS + APP1_PROC_NR as usize + 1;
+pub const NR_BOOT_PROCS: usize = NR_TASKS + FORK_CHILD_PROC_NR as usize + 1;
 
 /// Map a process number to a dense array index, for the process table
 /// (`crate::proc`) and the IPC mailboxes it used to have on its own
