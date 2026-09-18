@@ -63,8 +63,15 @@ pub const APP1_PROC_NR: i32 = 10;
 /// caller's fork should copy, so this is fixed to `tty`'s one demo fork
 /// rather than a real, any-process `fork()`.
 pub const FORK_CHILD_PROC_NR: i32 = 11;
+/// The `exec()` demo (`crate::calls::sys_exec`): a ring-3 task that
+/// starts life running `crate::elf::SHELL_ELF` and, a moment later, is
+/// running `/bin/echo` instead -- same process number, same slot, a
+/// different program. One process number covers both because that's the
+/// whole point of `exec`: unlike `FORK_CHILD_PROC_NR`, no second process
+/// is created.
+pub const SHELL_PROC_NR: i32 = 12;
 
-pub const NR_BOOT_PROCS: usize = NR_TASKS + FORK_CHILD_PROC_NR as usize + 1;
+pub const NR_BOOT_PROCS: usize = NR_TASKS + SHELL_PROC_NR as usize + 1;
 
 /// Map a process number to a dense array index, for the process table
 /// (`crate::proc`) and the IPC mailboxes it used to have on its own

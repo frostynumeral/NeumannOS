@@ -108,6 +108,15 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Same idea, but loading a real ELF binary's segments (crate::elf)
     // instead of hand-placing a fixed byte array.
     let elf_address_space = elf::load(elf::HELLO_ELF, com::TTY_PROC_NR);
+    // And a third: the first half of the exec() demo (`user/shell.s`),
+    // which replaces itself with a *different* program the moment it
+    // runs (crate::calls::sys_exec). Loaded here exactly like any other
+    // ELF task -- exec is what makes it interesting, not how it starts.
+    let shell_address_space = elf::load(elf::SHELL_ELF, com::SHELL_PROC_NR);
+    // Self-test: the loader's *rejections*, which are the only part of
+    // its validation that a working boot can't demonstrate. See
+    // `elf::validator_self_test` for why this is here and not assumed.
+    elf::validator_self_test();
     // Self-test: this is the actual proof of isolation, not just that
     // things still work. The demo pages were never mapped into *this*
     // (the kernel's own) page table -- only into `ring3_address_space` --
@@ -131,7 +140,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // programmed, and its handler calls `reschedule()` unconditionally
     // (see `proc.rs`'s module doc comment) -- with no task enqueued yet,
     // there would be nothing for it to pick.
-    spawn_tasks(ring3_address_space, elf_address_space);
+    spawn_tasks(ring3_address_space, elf_address_space, shell_address_space);
     serial_println!("tasks spawned");
 
     pic::init();
@@ -163,7 +172,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 /// quantum sizes, and preemptibility match `kernel/table.c`'s image
 /// entries (`IDL_F`/`TSK_F`/`SRV_F` flags) where a real counterpart
 /// exists.
-fn spawn_tasks(ring3_address_space: PhysFrame, elf_address_space: PhysFrame) {
+fn spawn_tasks(
+    ring3_address_space: PhysFrame,
+    elf_address_space: PhysFrame,
+    shell_address_space: PhysFrame,
+) {
     proc::spawn(com::IDLE, "IDLE", idle_task, proc::IDLE_Q, 8, true, None);
     proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false, None);
     proc::spawn(com::PM_PROC_NR, "pm (demo)", demo_pm_task, 3, 32, true, None);
@@ -196,6 +209,18 @@ fn spawn_tasks(ring3_address_space: PhysFrame, elf_address_space: PhysFrame) {
         true,
         Some(elf_address_space),
     );
+    // The exec() demo, at the same priority as the other ring-3 tasks:
+    // it starts out running `elf::SHELL_ELF` and ends up running
+    // /bin/echo, without ever ceasing to be this process.
+    proc::spawn(
+        com::SHELL_PROC_NR,
+        "shell (exec demo)",
+        elf::task_entry,
+        6,
+        16,
+        true,
+        Some(shell_address_space),
+    );
     rs::spawn_flaky();
     proc::spawn(com::CONSOLE_PROC_NR, "console", keyboard::console_task, 5, 16, true, None);
 }
@@ -225,6 +250,7 @@ fn idle_task() -> ! {
     vircopy_from_ring3_verify();
     vircopy_error_from_ring3_verify();
     fork_child_verify();
+    exec_verify();
     serial_println!("[idle] no other task is ready, halting (uptime: {} ticks)", proc::uptime_ticks());
     halt_loop()
 }
@@ -363,6 +389,177 @@ fn fork_child_verify() {
     assert_eq!(&buf[..n as usize], expected, "fs content doesn't match what the forked child wrote");
 }
 
+/// Proves `shell`'s ring-3 `SYS_EXEC` call (`user/shell.s`, via
+/// `crate::syscall`) genuinely *replaced* that process's program rather
+/// than starting a second one alongside it. Five independent checks, in
+/// the order they run, each ruling out a different way a fake (or
+/// half-done) exec could still look real:
+///
+/// 1. `/from_exec.txt` holds what `user/echo.s` writes -- read back
+///    through `fs`'s ordinary kernel-side path, so the exec'd image
+///    demonstrably ran and did real work, not just that the syscall
+///    logged something. (An exec that loaded the image but never
+///    transferred control would fail here.)
+/// 2. `/exec_error.bin` holds `syscall::ERR_BAD_ELF`, written by
+///    `shell` *after* a deliberately-failed exec of an ordinary text
+///    file it created itself (`user/shell.s`). That file existing at all
+///    is the real result: a failed exec has to leave the caller running
+///    its original image (POSIX requires it, and `sys_exec` discards the
+///    old address space only a few lines after building the new one), so
+///    `shell` had to still be `shell` -- own `.data`, own stack -- long
+///    enough to write it.
+/// 3. `/evil_exec_error.bin` holds `syscall::ERR_BAD_ELF`, written by
+///    the exec'd image after it tried, from ring 3, to exec a
+///    hand-built ELF whose only segment asks to be mapped at
+///    `allocator::HEAP_START` -- the kernel's own heap (`user/echo.s`).
+///    The first version of this port's validator accepted exactly that
+///    image, and mapping it wrote into the kernel's own page tables,
+///    because a new address space copies only the top-level table and
+///    the check bounded addresses rather than PML4 slots.
+///    `elf::validator_self_test` covers the same ground kernel-side;
+///    this is the one that proves the path is shut to an actual
+///    unprivileged process.
+/// 4. `user/echo.s`'s own `.data` counter (`elf::ECHO_COUNTER_ADDR`)
+///    reads `1` *in `com::SHELL_PROC_NR`'s address space* -- the new
+///    program's instructions ran inside the original process's slot, not
+///    somewhere else. (A `spawn`-in-disguise would have put it in a
+///    different process.)
+/// 5. `user/shell.s`'s `pre_exec_marker` (`elf::SHELL_MARKER_ADDR`), a
+///    page that demonstrably *was* mapped in this process a moment ago
+///    (`shell` wrote to it before calling exec, and a write to an
+///    unmapped page would have faulted), is now unmapped: reading it
+///    back has to fail with `CopyError::SrcNotMapped`. (An exec that
+///    merely added the new image's mappings to the old address space --
+///    the easy way to get checks 1 and 4 to pass -- would fail here.)
+///
+/// Runs from `idle_task` for the same reason every other check there
+/// does; see its doc comment. Check 1 additionally waits rather than
+/// assuming: `shell` sleeps between exec attempts if `/bin/echo` hasn't
+/// been installed yet (`user/shell.s`), and `IDLE` becoming runnable
+/// during one of those naps is exactly the sort of interleaving this
+/// port has already been bitten by once.
+fn exec_verify() {
+    let expected = b"written by the exec'd image, not the one that called exec";
+    let mut buf = [0u8; 96];
+    let n = read_when_available("/from_exec.txt", &mut buf);
+    serial_println!(
+        "[idle] read back {:?} from /from_exec.txt (written by the image shell exec'd itself into)",
+        core::str::from_utf8(&buf[..n.max(0) as usize]).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(n, expected.len() as i64, "wrong length read back from /from_exec.txt");
+    assert_eq!(&buf[..n as usize], expected, "fs content doesn't match what the exec'd image wrote");
+
+    let mut err_buf = [0u8; 8];
+    let err_n = read_when_available("/exec_error.bin", &mut err_buf);
+    assert_eq!(err_n, 8, "wrong length read back from /exec_error.bin");
+    let exec_error = u64::from_le_bytes(err_buf);
+    serial_println!(
+        "[idle] read back {:#x} from /exec_error.bin -- shell's deliberately-failed exec of a non-ELF file (expected ERR_BAD_ELF {:#x}), written by shell itself afterward",
+        exec_error,
+        syscall::ERR_BAD_ELF
+    );
+    assert_eq!(
+        exec_error,
+        syscall::ERR_BAD_ELF,
+        "exec'ing a non-ELF file should come back ERR_BAD_ELF to the ring-3 caller"
+    );
+
+    let mut evil_buf = [0u8; 8];
+    let evil_n = read_when_available("/evil_exec_error.bin", &mut evil_buf);
+    assert_eq!(evil_n, 8, "wrong length read back from /evil_exec_error.bin");
+    let evil_result = u64::from_le_bytes(evil_buf);
+    serial_println!(
+        "[idle] read back {:#x} from /evil_exec_error.bin -- a ring-3 exec of an image asking to be mapped onto the kernel heap (expected ERR_BAD_ELF {:#x})",
+        evil_result,
+        syscall::ERR_BAD_ELF
+    );
+    assert_eq!(
+        evil_result,
+        syscall::ERR_BAD_ELF,
+        "a ring-3 process was able to exec an image targeting the kernel's own address range"
+    );
+
+    let mut counter_buf = [0u8; 4];
+    calls::sys_vircopy(
+        com::SHELL_PROC_NR,
+        x86_64::VirtAddr::new(elf::ECHO_COUNTER_ADDR),
+        com::IDLE,
+        x86_64::VirtAddr::new(counter_buf.as_mut_ptr() as u64),
+        counter_buf.len(),
+    )
+    .expect("sys_vircopy failed reading the exec'd image's counter out of shell's address space");
+    let counter = i32::from_le_bytes(counter_buf);
+    serial_println!(
+        "[idle] read back {} from /bin/echo's own .data counter, in shell's process (expected 1)",
+        counter
+    );
+    assert_eq!(counter, 1, "the exec'd image's own code should have incremented its counter once");
+
+    let mut marker_buf = [0u8; 4];
+    let stale = calls::sys_vircopy(
+        com::SHELL_PROC_NR,
+        x86_64::VirtAddr::new(elf::SHELL_MARKER_ADDR),
+        com::IDLE,
+        x86_64::VirtAddr::new(marker_buf.as_mut_ptr() as u64),
+        marker_buf.len(),
+    );
+    serial_println!(
+        "[idle] reading shell's pre-exec marker page at {:#x} back: {:?} (expected SrcNotMapped -- the old image is gone)",
+        elf::SHELL_MARKER_ADDR,
+        stale
+    );
+    assert!(
+        matches!(stale, Err(memory::CopyError::SrcNotMapped)),
+        "shell's pre-exec .data page is still mapped after exec -- the old image wasn't replaced, only added to"
+    );
+}
+
+/// Read `path`, waiting until it both exists *and* has content. `fs`
+/// starts empty every boot and this port has no "wait for a file"
+/// primitive (no `select`, no inotify, nothing), so the wait is a plain
+/// poll bounded by a real deadline (see the tick comment below).
+///
+/// `fs::open_existing`, not `fs::open` -- and that distinction is the
+/// whole reason this function works. `fs::open` creates a missing file
+/// (`crate::fs`'s `open_path`), so polling with it would succeed on the
+/// first attempt no matter what, read zero bytes, and leave behind an
+/// empty file at the very path it was waiting for: a "wait" that can
+/// never wait, and that destroys the evidence it was checking for. The
+/// zero-length retry covers the other half of the same race -- the
+/// writer having opened the file but not yet written to it.
+fn read_when_available(path: &str, buf: &mut [u8]) -> i64 {
+    // Bounded in real ticks, not in attempts. An attempt count is the
+    // wrong unit here: `yield_now` from `IDLE` with every other task
+    // asleep re-picks `IDLE` and returns immediately, so five hundred
+    // attempts can elapse inside a single timer tick -- while the task
+    // being waited for is blocked on a one-tick alarm and hasn't had a
+    // chance to run at all. (Observed, not hypothetical: with `pm`'s
+    // seeding artificially delayed, this gave up before `shell` had
+    // retried its exec even twice.) Spinning on `yield_now` until the
+    // clock moves is what actually lets the other task make progress --
+    // and it has to be a spin rather than a real `sys_setalarm` sleep,
+    // because `IDLE` blocking would leave the scheduler with nothing
+    // runnable at all.
+    const MAX_TICKS: u64 = 300; // 5 seconds at pit::HZ
+    let deadline = proc::uptime_ticks() + MAX_TICKS;
+    loop {
+        let fd = fs::open_existing(path);
+        if fd >= 0 {
+            // A file that exists but is still empty means the writer got
+            // as far as `open` and no further -- the same race, one step
+            // later.
+            let n = fs::read(fd, buf);
+            if n != 0 {
+                return n;
+            }
+        }
+        if proc::uptime_ticks() >= deadline {
+            panic!("{} never appeared within {} ticks", path, MAX_TICKS);
+        }
+        proc::yield_now();
+    }
+}
+
 /// Stand-in for `kernel/clock.c`'s clock task. Now much closer to the real
 /// thing than earlier milestones' version: it calls `sys_setalarm`
 /// (`crate::calls`) and blocks in `receive`, exactly like real MINIX's
@@ -498,31 +695,74 @@ fn demo_pm_task() -> ! {
         serial_println!("[pm] got reply from fs: {:?}", reply);
     }
 
+    seed_bin();
+    missing_program_check();
     fork_demo();
     fs_rw_demo();
-    seed_bin_hello();
 
     serial_println!("[pm] demo finished, blocking for good");
     ipc::receive(com::ANY); // nothing left to receive; parks pm so idle can run
     unreachable!("nothing sends to pm once the demo is done");
 }
 
-/// Write `elf::HELLO_ELF`'s bytes into `fs` at `/bin/hello` -- the "app is
-/// installed" step a real package manager would otherwise do. Without
-/// this, `crate::rs`'s `SERVICES` table (`rs.rs`) would have nothing to
-/// actually load: `fs` is in-memory and starts empty every boot, so a
-/// task has to put the binary there before it can be launched by name
-/// (`elf::spawn_from_fs`). Must run from a task, not `kernel_main`
-/// directly: `fs::open`/`fs::write` block on a real IPC round trip, which
-/// needs a task context to block in.
-fn seed_bin_hello() {
+/// Install the two runnable programs into `fs` -- the "the binaries are
+/// on disk" step a real package manager (or an install CD) would
+/// otherwise have done. `fs` is in-memory and starts empty every boot, so
+/// nothing can be loaded *by path* until a task has put it there:
+/// `/bin/hello` is what `crate::rs`'s `SERVICES` table launches on
+/// demand (`elf::spawn_from_fs`), and `/bin/echo` is what `shell` execs
+/// itself into (`crate::calls::sys_exec`, via `user/shell.s`). Must run
+/// from a task, not `kernel_main` directly: `fs::open`/`fs::write` block
+/// on a real IPC round trip, which needs a task context to block in.
+///
+/// Runs as early in `pm`'s demo as it can rather than at the end, since
+/// `shell` is waiting on `/bin/echo` to appear before it can get on with
+/// its own job. "As early as it can" is immediately after the
+/// `pm`/`fs` ping-pong: `fs` only becomes a real file server once those
+/// three messages are done with (`demo_fs_task`), and a `mkdir` sent
+/// before that gets answered by the ping-pong stand-in instead, which
+/// replies to anything at all with `ping + 100`. It doesn't have to be
+/// early for correctness -- `user/shell.s` retries rather than assuming
+/// an ordering, deliberately (see its header comment) -- but there's no
+/// reason to make it sit through pointless retries either.
+fn seed_bin() {
     let rc = fs::mkdir("/bin");
     assert_eq!(rc, 0, "fs::mkdir(\"/bin\") failed: {}", rc);
-    let fd = fs::open("/bin/hello");
-    assert!(fd >= 0, "fs::open(\"/bin/hello\") failed: {}", fd);
-    let n = fs::write(fd, elf::HELLO_ELF);
-    serial_println!("[pm] seeded /bin/hello with {} bytes for rs's service table", n);
-    assert_eq!(n, elf::HELLO_ELF.len() as i64, "fs::write didn't accept the whole ELF image");
+    for (path, image) in [("/bin/hello", elf::HELLO_ELF), ("/bin/echo", elf::ECHO_ELF)] {
+        let fd = fs::open(path);
+        assert!(fd >= 0, "fs::open({:?}) failed: {}", path, fd);
+        let n = fs::write(fd, image);
+        serial_println!("[pm] seeded {} with {} bytes", path, n);
+        assert_eq!(n, image.len() as i64, "fs::write didn't accept the whole ELF image");
+    }
+}
+
+/// Proves that looking for a program that isn't there reports `ENOENT`
+/// and *changes nothing* -- the second half of "a failed exec is a
+/// no-op", and the half that isn't about the caller's own image.
+///
+/// Worth checking explicitly because `fs::open` creates the file it's
+/// asked for (`crate::fs`'s `open_path`), so the obvious implementation
+/// of `elf::read_file` had exec of a missing path succeed at opening
+/// nothing, read zero bytes, report the *wrong* error (`ERR_BAD_ELF`,
+/// as if the program were malformed rather than absent), and leave a
+/// stray empty file behind at whatever path ring 3 named -- which a
+/// ring-3 caller could repeat to grow `fs` without bound.
+fn missing_program_check() {
+    const MISSING: &str = "/no_such_program";
+    assert_eq!(fs::open_existing(MISSING), fs::ENOENT, "{} exists before the test?", MISSING);
+    let result = elf::read_file(MISSING);
+    assert!(
+        matches!(result, Err(fs::ENOENT)),
+        "reading a program that doesn't exist should be ENOENT, got {:?}",
+        result.map(|image| image.len())
+    );
+    assert_eq!(
+        fs::open_existing(MISSING),
+        fs::ENOENT,
+        "looking for a missing program created it -- a failed exec has to change nothing"
+    );
+    serial_println!("[pm] reading {:?} -> ENOENT, and no empty file left behind", MISSING);
 }
 
 /// Proves `fs` (see `spawn_tasks`, now `fs::InMemoryFs::serve` instead of

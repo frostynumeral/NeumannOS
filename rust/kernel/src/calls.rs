@@ -12,6 +12,7 @@
 //! anything needed them from ring 3.
 
 use crate::com;
+use crate::elf;
 use crate::memory::{self, CopyError};
 use crate::proc;
 use x86_64::VirtAddr;
@@ -121,4 +122,41 @@ pub fn sys_fork_from_frame(
     let child_pml4 = memory::fork_address_space(src_cr3, private_pages);
     proc::fork_current(child_proc_nr, name, priority, quantum, preemptible, child_pml4, frame);
     child_proc_nr
+}
+
+/// `sys_exec()`: throw away everything `proc_nr` was running and give it
+/// `image` instead, keeping the process itself -- its process number, its
+/// priority, its kernel stack, its place in the ready queue, every other
+/// process's right to send to it. `fork` makes a second process that is
+/// the caller; `exec` keeps the one process and replaces what it is.
+/// Together they're how every process after `init` comes to exist on a
+/// real system.
+///
+/// Ported in spirit from the pair MINIX splits this across:
+/// `servers/pm/exec.c`'s `do_exec` (find the file, work out the memory
+/// layout, load the image) and the `SYS_EXEC` kernel call it then makes,
+/// `kernel/system/do_exec.c` (point the process at the new image and set
+/// its saved `pc`/`sp` so it resumes there). This does the first half and
+/// the address-space swap; the second half -- writing the new entry point
+/// and stack pointer into the caller's *live* trap frame -- belongs to
+/// `crate::syscall`'s `SYS_EXEC` handler, which is the only code holding
+/// that frame, exactly as `do_exec.c` is the only code holding
+/// `rp->p_reg`. The returned `LoadedImage` is what it needs for that.
+///
+/// The new address space is built from the kernel's PML4, not the
+/// caller's (`memory::new_address_space_from`), so the new image starts
+/// with a genuinely empty user address space rather than inheriting the
+/// mappings of the program it replaced. Nothing frees those old mappings
+/// -- see `proc::set_address_space` for that caveat.
+///
+/// Notably absent compared to real `exec`: `argv`/`envp` (this port's
+/// loader jumps straight to `_start` with nothing but a stack --
+/// `crate::elf`), any notion of file permissions or a set-uid bit, and
+/// closing file descriptors marked close-on-exec (`fs` has no such flag,
+/// and descriptors here survive the call, as they would for a plain
+/// POSIX `exec` without it).
+pub fn sys_exec(proc_nr: i32, image: &[u8]) -> Result<elf::LoadedImage, elf::ElfError> {
+    let loaded = elf::load_image(proc::kernel_cr3(), image)?;
+    proc::set_address_space(proc_nr, loaded.pml4);
+    Ok(loaded)
 }

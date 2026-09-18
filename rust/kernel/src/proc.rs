@@ -470,6 +470,52 @@ pub struct TrapFrame {
     pub ss: u64,
 }
 
+impl TrapFrame {
+    /// `RFLAGS` a freshly started ring-3 image gets: reserved bit 1 plus
+    /// `IF`, the same value `crate::usermode::enter_ring3` pushes when it
+    /// jumps to ring 3 from scratch. Deliberately not inherited from the
+    /// caller -- a new program shouldn't start out with whatever
+    /// arithmetic flags (or, worse, direction flag) the program it
+    /// replaced happened to leave set.
+    const USER_RFLAGS: u64 = 0x202;
+
+    /// The trap frame that turns this trap's return into the *start* of a
+    /// different program: same ring (`cs`/`ss` carried over from the
+    /// caller, which is already running with the user selectors), new
+    /// entry point, new stack, and every general-purpose register zeroed
+    /// -- the exec'd image inherits no register state from its
+    /// predecessor, exactly as a fresh `crate::elf::task_entry` jump
+    /// would leave it. `crate::syscall`'s `SYS_EXEC` handler writes the
+    /// result back over the live frame, so the `iretq` at the end of
+    /// `crate::syscall::entry` lands in the new image instead of
+    /// returning to the old one -- the Rust counterpart of
+    /// `kernel/system/do_exec.c` assigning `rp->p_reg.pc`/`sp`.
+    pub fn exec_into(&self, entry: u64, stack_top: u64) -> TrapFrame {
+        TrapFrame {
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            r11: 0,
+            r10: 0,
+            r9: 0,
+            r8: 0,
+            rbp: 0,
+            rdi: 0,
+            rsi: 0,
+            rdx: 0,
+            rcx: 0,
+            rbx: 0,
+            rax: 0,
+            rip: entry,
+            cs: self.cs,
+            rflags: Self::USER_RFLAGS,
+            rsp: stack_top,
+            ss: self.ss,
+        }
+    }
+}
+
 /// `SYS_FORK`'s real counterpart to `spawn`: instead of starting a brand
 /// new task at a fixed `fn() -> !` entry point, this makes `child_proc_nr`
 /// resume *inside a trap*, at the exact ring-3 instruction right after
@@ -747,6 +793,55 @@ pub fn kill(proc_nr: i32, reason: &str) {
 pub fn cr3_of(proc_nr: i32) -> (PhysFrame, Cr3Flags) {
     let idx = com::slot(proc_nr);
     with_scheduler(|sched| sched.cr3_for(idx))
+}
+
+/// The PML4 the kernel's own address space is rooted at -- what
+/// `Scheduler::cr3_for` falls back to for any task without one of its
+/// own. For `crate::calls::sys_exec`, which needs to build a new address
+/// space derived from *the kernel's* rather than from whatever happens to
+/// be in `CR3` at the time (see `crate::memory::new_address_space_from`).
+pub fn kernel_cr3() -> PhysFrame {
+    with_scheduler(|sched| sched.kernel_cr3.0)
+}
+
+/// Point `proc_nr` at a different address space from now on -- the
+/// process-table half of `exec()` (`crate::calls::sys_exec`), where a
+/// process keeps its identity (process number, priority, kernel stack,
+/// place in the ready queue) and swaps out only the memory it runs in.
+/// Nothing in `kernel/proc.c` corresponds directly, because MINIX's
+/// `exec` is a `PM` operation over segment descriptors
+/// (`servers/pm/exec.c` calling `sys_newmap`), not a page-table pointer
+/// swap; this is that step's paging-era equivalent.
+///
+/// If `proc_nr` is the *currently running* task -- which it always is
+/// when `sys_exec` calls this, since exec happens inside the caller's own
+/// trap -- `CR3` is reloaded immediately rather than waiting for the next
+/// `reschedule`: the trap is about to `iretq` straight into the new
+/// image, which only exists in the new address space. Interrupts are off
+/// across the update so a timer tick can't land between the table write
+/// and the `CR3` load and switch away with the two disagreeing.
+///
+/// The address space being replaced is *not* freed. Its frames (the
+/// PML4, the lower-level tables that were private to it, and every page
+/// the old image's segments and stack occupied) leak, because this port
+/// has no frame deallocator at all -- `crate::memory`'s allocator only
+/// ever hands frames out (see "known simplifications" in
+/// `rust/README.md`). Real `exec` reclaims the old image's memory; this
+/// one only stops referencing it.
+pub fn set_address_space(proc_nr: i32, address_space: PhysFrame) {
+    let idx = com::slot(proc_nr);
+    let interrupts_were_enabled = are_enabled();
+    disable();
+    let load_now = with_scheduler(|sched| {
+        sched.procs[idx].cr3 = Some(address_space);
+        (sched.current == idx).then_some(sched.kernel_cr3.1)
+    });
+    if let Some(flags) = load_now {
+        unsafe { Cr3::write(address_space, flags) };
+    }
+    if interrupts_were_enabled {
+        enable();
+    }
 }
 
 /// `sys_setalarm()`: ask to be sent a `SYN_ALARM` notification once

@@ -16,9 +16,10 @@
 //! the mapped size are the same thing.
 
 use crate::memory::{self, GlobalFrameAllocator};
-use crate::{com, fs, proc};
+use crate::{com, fs, proc, serial_println};
 use alloc::vec::Vec;
 use spin::Mutex;
+use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
@@ -27,6 +28,20 @@ use x86_64::VirtAddr;
 /// time: there's no cross toolchain wired into this build yet to produce
 /// a user-mode binary automatically (see `rust/README.md`'s roadmap).
 pub static HELLO_ELF: &[u8] = include_bytes!("../user/hello.elf");
+
+/// The `exec()` demo's *first* image (`user/shell.s`): a program whose
+/// entire job is to replace itself with `ECHO_ELF` (see
+/// `crate::calls::sys_exec`). Loaded at boot like `HELLO_ELF`.
+pub static SHELL_ELF: &[u8] = include_bytes!("../user/shell.elf");
+
+/// The `exec()` demo's *second* image (`user/echo.s`): what
+/// `SHELL_ELF`'s process is running by the time anything looks at it.
+/// Unlike the other two, this one is never loaded from a static byte
+/// slice at boot -- `crate::main`'s `seed_bin` writes it into `fs` at
+/// `/bin/echo`, and `sys_exec` reads it back out of the filesystem by
+/// path, the way a real `exec` finds a program. It's `include_bytes!`d
+/// here only to have something to install; nothing loads it directly.
+pub static ECHO_ELF: &[u8] = include_bytes!("../user/echo.elf");
 
 /// Fixed virtual address for this demo's one stack page, chosen clear of
 /// `crate::usermode`'s own demo addresses (a different address space
@@ -67,6 +82,45 @@ pub const VIRCOPY_BUF_ADDR: u64 = 0x_5555_5556_00de;
 /// computes the right value internally. Read off the built `hello.elf`
 /// with `nm`, same reasoning as `VIRCOPY_BUF_ADDR`.
 pub const ERR_RESULT_ADDR: u64 = 0x_5555_5556_00fe;
+
+/// Where `user/shell.s`'s `pre_exec_marker` lives (the first thing in its
+/// `.data`, matching its `--section-start` build command). `crate::main`'s
+/// `exec_verify` requires reading this address out of the exec'd process
+/// to *fail*: it belongs to the image exec threw away, and nothing maps it
+/// in the address space that replaced it.
+pub const SHELL_MARKER_ADDR: u64 = 0x_5555_5558_0000;
+
+/// Where `user/echo.s`'s `counter` lives (the first thing in *its*
+/// `.data`). `crate::main`'s `exec_verify` reads this back out of the
+/// exec'd process and checks it's `1` -- the new image's own instructions
+/// having run, inside the caller's original process slot.
+pub const ECHO_COUNTER_ADDR: u64 = 0x_6666_6667_0000;
+
+/// One past the last canonical lower-half address. A segment above this
+/// is rejected outright -- but note this is only a *canonicality* bound,
+/// not a user/kernel boundary. This port has no such boundary: the
+/// kernel image, the heap (`crate::allocator::HEAP_START`) and the
+/// bootloader's physical-memory window all live at low addresses,
+/// interleaved with the ones user images use. What actually keeps a
+/// loaded image off the kernel is the PML4-slot check in `validate`
+/// (`memory::pml4_slots_unused`); see that function for why the slot,
+/// not the address, is the thing worth checking.
+const USER_SPACE_END: u64 = 0x_0000_8000_0000_0000;
+
+/// Most `PT_LOAD` segments an image may have. Real binaries have a
+/// handful; the bound exists so the pairwise overlap check in `validate`
+/// stays cheap on a file that claims tens of thousands of them.
+const MAX_LOAD_SEGMENTS: usize = 16;
+
+/// Most program header table entries `validate` will walk at all, for
+/// the same reason.
+const MAX_PROGRAM_HEADERS: usize = 64;
+
+/// Most pages an image (all its segments plus its stack) may occupy --
+/// 4 MiB. `p_memsz` needs no file bytes behind it (that's what BSS is),
+/// so without this a hundred-byte file can ask for terabytes and walk
+/// `load_segment` straight through every free frame in the machine.
+const MAX_IMAGE_PAGES: u64 = 1024;
 
 const PT_LOAD: u32 = 1;
 const PF_X: u32 = 1;
@@ -118,33 +172,244 @@ struct Elf64ProgramHeader {
 static ELF_TASK_PARAMS: Mutex<[(u64, u64); com::NR_BOOT_PROCS]> =
     Mutex::new([(0, 0); com::NR_BOOT_PROCS]);
 
-/// Parse `image` and map each `PT_LOAD` segment into a freshly built
-/// address space (`memory::new_address_space`), plus one stack page.
-/// Records `proc_nr`'s entry point/stack top in `ELF_TASK_PARAMS` for
-/// `task_entry` to find once it's spawned under that same `proc_nr`, and
-/// returns the new address space's top-level page table frame, for
-/// `crate::proc::spawn` to record as that task's `CR3` -- same shape as
-/// `usermode::create_address_space`.
-pub fn load(image: &[u8], proc_nr: i32) -> PhysFrame {
-    let physical_memory_offset = memory::physical_memory_offset();
-    assert!(image.len() >= core::mem::size_of::<Elf64Header>(), "ELF image too small");
-    let header = unsafe { &*(image.as_ptr() as *const Elf64Header) };
-    assert_eq!(&header.e_ident[0..4], b"\x7fELF", "not an ELF file");
-    assert_eq!(header.e_ident[4], 2, "not a 64-bit ELF file (ELFCLASS64)");
-    assert_eq!(header.e_ident[5], 1, "not a little-endian ELF file (ELFDATA2LSB)");
+/// Everything a successfully loaded image consists of. `load` records
+/// the last two fields in `ELF_TASK_PARAMS` for a task that hasn't
+/// started yet; `crate::calls::sys_exec` writes them straight into a live
+/// trap frame instead, which is why `load_image` returns them rather than
+/// only stashing them.
+pub struct LoadedImage {
+    pub pml4: PhysFrame,
+    pub entry: u64,
+    pub stack_top: u64,
+}
 
-    let (pml4_frame, mut mapper) = memory::new_address_space(physical_memory_offset);
-    let mut frame_allocator = GlobalFrameAllocator;
+/// Why an image was rejected. Every variant is a check `load` used to
+/// make with `assert!` (or not at all): fine when the only images in the
+/// system were two `include_bytes!`d files the build produced, but
+/// `crate::calls::sys_exec` now loads whatever bytes happen to be at a
+/// path a *ring-3* caller named, so a malformed or hostile file has to
+/// come back as an error to that caller rather than panicking the whole
+/// kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElfError {
+    /// Shorter than a single ELF64 header.
+    TooSmall,
+    /// No `\x7fELF` magic.
+    NotElf,
+    /// Not `ELFCLASS64`/`ELFDATA2LSB` -- some other ELF flavor entirely.
+    NotElf64,
+    /// The program header table (or one entry of it) falls outside the
+    /// file, or `e_phentsize` is too small to hold an `Elf64_Phdr`.
+    BadProgramHeaders,
+    /// Nothing to load: no `PT_LOAD` segment, or one with `p_memsz == 0`.
+    NoLoadableSegments,
+    /// A segment's file contents (`p_offset + p_filesz`) run past the end
+    /// of the image, or claim more file bytes than memory bytes.
+    SegmentOutOfFile,
+    /// A segment (or the entry point) asks to live past the canonical
+    /// lower-half boundary (`USER_SPACE_END`).
+    SegmentOutsideUserSpace,
+    /// A segment lands in a PML4 slot the base address space already
+    /// uses (`memory::pml4_slots_unused`). Such a mapping would not be
+    /// private to the new address space at all: it would reach into the
+    /// *kernel's* own lower-level page tables and modify them, since a
+    /// new address space is only a copy of the top-level table. This is
+    /// the check that actually keeps a chosen file off the kernel --
+    /// `SegmentOutsideUserSpace` does not, because this port's kernel
+    /// mappings are in the lower half too.
+    SegmentInSharedSlot,
+    /// A segment overlaps the fixed stack page this loader maps
+    /// (`STACK_ADDR`), which would leave the image's own contents and its
+    /// stack fighting over the same frame.
+    SegmentOverlapsStack,
+    /// Two `PT_LOAD` segments want pages that overlap. Not just a broken
+    /// program: the second `map_to` of the same page fails, and this
+    /// loader has no way to merge them.
+    SegmentsOverlap,
+    /// More `PT_LOAD` segments (or program headers) than this loader
+    /// will consider -- see `MAX_LOAD_SEGMENTS`/`MAX_PROGRAM_HEADERS`.
+    TooManySegments,
+    /// The image's segments and stack would occupy more than
+    /// `MAX_IMAGE_PAGES` pages. `p_memsz` needs no file bytes behind it,
+    /// so this bound is what stops a tiny file from draining the frame
+    /// allocator.
+    ImageTooLarge,
+    /// Mapping a page failed even though validation passed -- the frame
+    /// allocator is empty, or the page turned out to be mapped already.
+    /// Should be unreachable after `validate`; it exists so that being
+    /// wrong about that returns an error to the caller instead of
+    /// panicking the kernel.
+    MappingFailed,
+}
 
-    let ph_entry_size = header.e_phentsize as usize;
-    let ph_base = header.e_phoff as usize;
+/// Read the fixed-size ELF header out of `image`.
+///
+/// `read_unaligned`, not a reference cast: an image loaded by `sys_exec`
+/// is a heap `Vec<u8>` assembled from `fs` reads, with no alignment
+/// guarantee at all, and a misaligned `&Elf64Header` would be undefined
+/// behavior even on x86, where the load itself happens to work.
+fn header_of(image: &[u8]) -> Result<Elf64Header, ElfError> {
+    if image.len() < core::mem::size_of::<Elf64Header>() {
+        return Err(ElfError::TooSmall);
+    }
+    let header = unsafe { (image.as_ptr() as *const Elf64Header).read_unaligned() };
+    if &header.e_ident[0..4] != b"\x7fELF" {
+        return Err(ElfError::NotElf);
+    }
+    if header.e_ident[4] != 2 || header.e_ident[5] != 1 {
+        return Err(ElfError::NotElf64);
+    }
+    Ok(header)
+}
+
+/// Read program header `i`, bounds-checking it against the image first
+/// (same `read_unaligned` reasoning as `header_of`).
+fn program_header(
+    image: &[u8],
+    header: &Elf64Header,
+    i: usize,
+) -> Result<Elf64ProgramHeader, ElfError> {
+    let entry_size = core::mem::size_of::<Elf64ProgramHeader>();
+    if (header.e_phentsize as usize) < entry_size {
+        return Err(ElfError::BadProgramHeaders);
+    }
+    let offset = (header.e_phoff as usize)
+        .checked_add(i * header.e_phentsize as usize)
+        .ok_or(ElfError::BadProgramHeaders)?;
+    let end = offset.checked_add(entry_size).ok_or(ElfError::BadProgramHeaders)?;
+    if end > image.len() {
+        return Err(ElfError::BadProgramHeaders);
+    }
+    Ok(unsafe { (image.as_ptr().add(offset) as *const Elf64ProgramHeader).read_unaligned() })
+}
+
+/// Check every `PT_LOAD` segment before a single frame is allocated, so
+/// a rejected image leaves nothing behind to clean up (this port has no
+/// frame deallocator -- see `crate::proc::set_address_space`). See
+/// `ElfError` for what each check is defending against.
+///
+/// `base_pml4` is needed because the most important check here is not
+/// about the address at all, but about which PML4 slot it falls in: a
+/// new address space copies only the top-level table, so a segment in a
+/// slot the base already uses would be written into the *base's* own
+/// lower-level tables (`memory::pml4_slots_unused`). Everything else --
+/// bounds, overlaps, size -- exists so that `load_segment` cannot fail
+/// once it starts.
+fn validate(image: &[u8], header: &Elf64Header, base_pml4: PhysFrame) -> Result<(), ElfError> {
+    if header.e_entry >= USER_SPACE_END {
+        return Err(ElfError::SegmentOutsideUserSpace);
+    }
+    if header.e_phnum as usize > MAX_PROGRAM_HEADERS {
+        return Err(ElfError::TooManySegments);
+    }
+
+    // Page ranges claimed so far, as inclusive `(first, last)` page
+    // numbers, starting with the stack page this loader always maps --
+    // so a segment colliding with the stack and a segment colliding with
+    // another segment are the same check, made once.
+    let stack_page = STACK_ADDR / PAGE_SIZE;
+    let mut claimed: [(u64, u64); MAX_LOAD_SEGMENTS + 1] = [(0, 0); MAX_LOAD_SEGMENTS + 1];
+    claimed[0] = (stack_page, stack_page);
+    let mut claimed_len = 1;
+    let mut total_pages: u64 = 1; // the stack page
+
+    if !memory::pml4_slots_unused(
+        base_pml4,
+        VirtAddr::new(STACK_ADDR),
+        VirtAddr::new(STACK_ADDR + PAGE_SIZE - 1),
+    ) {
+        return Err(ElfError::SegmentInSharedSlot);
+    }
+
     for i in 0..header.e_phnum as usize {
-        let ph_offset = ph_base + i * ph_entry_size;
-        let ph = unsafe { &*(image[ph_offset..].as_ptr() as *const Elf64ProgramHeader) };
-        if ph.p_type != PT_LOAD {
+        let ph = program_header(image, header, i)?;
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
             continue;
         }
-        load_segment(&mut mapper, &mut frame_allocator, image, ph, physical_memory_offset);
+        if claimed_len > MAX_LOAD_SEGMENTS {
+            return Err(ElfError::TooManySegments);
+        }
+
+        if ph.p_filesz > ph.p_memsz {
+            return Err(ElfError::SegmentOutOfFile);
+        }
+        let file_end = ph.p_offset.checked_add(ph.p_filesz).ok_or(ElfError::SegmentOutOfFile)?;
+        if file_end > image.len() as u64 {
+            return Err(ElfError::SegmentOutOfFile);
+        }
+
+        let mem_end =
+            ph.p_vaddr.checked_add(ph.p_memsz).ok_or(ElfError::SegmentOutsideUserSpace)?;
+        if mem_end > USER_SPACE_END {
+            return Err(ElfError::SegmentOutsideUserSpace);
+        }
+
+        // The real gate: would mapping this reach into the base address
+        // space's own page tables?
+        if !memory::pml4_slots_unused(
+            base_pml4,
+            VirtAddr::new(ph.p_vaddr),
+            VirtAddr::new(mem_end - 1),
+        ) {
+            return Err(ElfError::SegmentInSharedSlot);
+        }
+
+        let first_page = ph.p_vaddr / PAGE_SIZE;
+        let last_page = (mem_end - 1) / PAGE_SIZE;
+        total_pages = total_pages
+            .checked_add(last_page - first_page + 1)
+            .ok_or(ElfError::ImageTooLarge)?;
+        if total_pages > MAX_IMAGE_PAGES {
+            return Err(ElfError::ImageTooLarge);
+        }
+
+        // Page-granular, not byte-granular: two segments sharing one page
+        // without their bytes overlapping still means mapping that page
+        // twice, which is exactly what `load_segment` cannot do.
+        for &(other_first, other_last) in claimed[..claimed_len].iter() {
+            if first_page <= other_last && last_page >= other_first {
+                return Err(if other_first == stack_page && other_last == stack_page {
+                    ElfError::SegmentOverlapsStack
+                } else {
+                    ElfError::SegmentsOverlap
+                });
+            }
+        }
+        claimed[claimed_len] = (first_page, last_page);
+        claimed_len += 1;
+    }
+
+    if claimed_len == 1 {
+        return Err(ElfError::NoLoadableSegments);
+    }
+    Ok(())
+}
+
+/// Parse `image` and map each `PT_LOAD` segment into a brand-new address
+/// space derived from `base_pml4` (`memory::new_address_space_from`),
+/// plus one stack page, and return where to start it.
+///
+/// `base_pml4` is explicit rather than "whatever is in `CR3`" because
+/// `sys_exec` runs inside a ring-3 caller's own trap, where the active
+/// address space is the one being discarded -- see
+/// `memory::new_address_space_from`'s doc comment for why copying that
+/// one would quietly hand the new image its predecessor's pages.
+pub fn load_image(base_pml4: PhysFrame, image: &[u8]) -> Result<LoadedImage, ElfError> {
+    let physical_memory_offset = memory::physical_memory_offset();
+    let header = header_of(image)?;
+    validate(image, &header, base_pml4)?;
+
+    let (pml4_frame, mut mapper) =
+        memory::new_address_space_from(base_pml4, physical_memory_offset)
+            .ok_or(ElfError::MappingFailed)?;
+    let mut frame_allocator = GlobalFrameAllocator;
+
+    for i in 0..header.e_phnum as usize {
+        let ph = program_header(image, &header, i)?;
+        if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
+            continue;
+        }
+        load_segment(&mut mapper, &mut frame_allocator, image, &ph, physical_memory_offset)?;
     }
 
     let stack_flags = PageTableFlags::PRESENT
@@ -152,19 +417,70 @@ pub fn load(image: &[u8], proc_nr: i32) -> PhysFrame {
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
     let stack_page = Page::containing_address(VirtAddr::new(STACK_ADDR));
-    let stack_frame = frame_allocator
-        .allocate_frame()
-        .expect("out of physical frames for the ELF demo's stack page");
+    let stack_frame = frame_allocator.allocate_frame().ok_or(ElfError::MappingFailed)?;
     unsafe {
         mapper
             .map_to(stack_page, stack_frame, stack_flags, &mut frame_allocator)
-            .expect("failed to map the ELF demo's stack page")
+            .map_err(|_| ElfError::MappingFailed)?
             .ignore();
     }
 
-    ELF_TASK_PARAMS.lock()[com::slot(proc_nr)] = (header.e_entry, STACK_ADDR + PAGE_SIZE);
-    pml4_frame
+    Ok(LoadedImage {
+        pml4: pml4_frame,
+        entry: header.e_entry,
+        stack_top: STACK_ADDR + PAGE_SIZE,
+    })
 }
+
+/// `load_image` for a task that hasn't been spawned yet: records
+/// `proc_nr`'s entry point/stack top in `ELF_TASK_PARAMS` for
+/// `task_entry` to find once it's spawned under that same `proc_nr`, and
+/// returns the new address space's top-level page table frame, for
+/// `crate::proc::spawn` to record as that task's `CR3` -- same shape as
+/// `usermode::create_address_space`.
+///
+/// Both callers run in the kernel's own address space (`kernel_main`,
+/// and `spawn_from_fs` below from a kernel task), so deriving from the
+/// active `CR3` is the same thing as deriving from the kernel's; only
+/// `sys_exec`, running inside a ring-3 caller's trap, has to say which
+/// it means. The images loaded this way are the ones built into the
+/// kernel binary, so a malformed one really is a build bug and panicking
+/// is the right answer -- unlike `sys_exec`'s, which come from `fs`.
+pub fn load(image: &[u8], proc_nr: i32) -> PhysFrame {
+    let (active_pml4, _) = Cr3::read();
+    let loaded = load_image(active_pml4, image).expect("failed to load a built-in ELF image");
+    record_params(proc_nr, &loaded);
+    loaded.pml4
+}
+
+/// Remember where `task_entry` should start `proc_nr` once it's spawned.
+fn record_params(proc_nr: i32, loaded: &LoadedImage) {
+    ELF_TASK_PARAMS.lock()[com::slot(proc_nr)] = (loaded.entry, loaded.stack_top);
+}
+
+/// Largest program `read_file` will pull out of `fs`. `MAX_IMAGE_PAGES`
+/// cannot serve here: it bounds what a *validated* image may map, which
+/// is only checked after the whole file is already sitting in the heap
+/// -- and at 4 MiB it is larger than the heap itself
+/// (`crate::allocator::HEAP_SIZE`, 1 MiB), so an oversized file would
+/// exhaust the allocator before anything got to reject it. `fs` puts no
+/// limit on how much a ring-3 task can write into a file
+/// (`SYS_FS_WRITE` bounds one call at 256 bytes, not the file), so the
+/// limit has to live here. Generous next to the ~9.5 KiB images this
+/// port actually loads.
+const MAX_IMAGE_BYTES: usize = 256 * 1024;
+
+/// "File too large" -- `read_file`'s answer to a file bigger than
+/// `MAX_IMAGE_BYTES`, sharing the numbering of the `fs` error codes it
+/// is returned alongside (POSIX `EFBIG`).
+pub const EFBIG: i64 = -27;
+
+/// "Exec format error" -- what `spawn_from_fs` reports when the file it
+/// read is not a program this loader can run. Shares the numbering of
+/// the `fs` error codes it's returned alongside (`crate::fs`), since
+/// both end up in the same `Result<(), i64>`, and matches POSIX's own
+/// `ENOEXEC` for exactly this condition.
+pub const ENOEXEC: i64 = -8;
 
 /// Map every page `ph` spans, zero it (so BSS -- the `p_memsz - p_filesz`
 /// tail with no file backing -- reads as zero rather than leftover frame
@@ -179,7 +495,7 @@ fn load_segment(
     image: &[u8],
     ph: &Elf64ProgramHeader,
     physical_memory_offset: VirtAddr,
-) {
+) -> Result<(), ElfError> {
     let flags = PageTableFlags::PRESENT
         | PageTableFlags::USER_ACCESSIBLE
         | if ph.p_flags & PF_W != 0 { PageTableFlags::WRITABLE } else { PageTableFlags::empty() }
@@ -193,13 +509,18 @@ fn load_segment(
     let end_page = Page::<Size4KiB>::containing_address(VirtAddr::new(seg_mem_end - 1));
 
     for page in Page::range_inclusive(start_page, end_page) {
-        let frame = frame_allocator
-            .allocate_frame()
-            .expect("out of physical frames loading an ELF segment");
+        // Both of these are `validate`'s job to have made impossible --
+        // an image small enough to fit `MAX_IMAGE_PAGES`, in PML4 slots
+        // nothing else uses, with no two segments sharing a page. They
+        // return an error rather than panicking anyway: the caller may be
+        // ring 3 (`crate::calls::sys_exec`), and a mistake in the
+        // reasoning above should cost that caller its `exec`, not cost
+        // the machine its kernel.
+        let frame = frame_allocator.allocate_frame().ok_or(ElfError::MappingFailed)?;
         unsafe {
             mapper
                 .map_to(page, frame, flags, frame_allocator)
-                .expect("failed to map an ELF segment page")
+                .map_err(|_| ElfError::MappingFailed)?
                 .ignore();
         }
 
@@ -223,6 +544,132 @@ fn load_segment(
             }
         }
     }
+    Ok(())
+}
+
+/// Assemble a syntactically well-formed ELF64 image whose `PT_LOAD`
+/// segments are `(p_vaddr, p_memsz)` pairs with no file contents, for
+/// `validator_self_test` below. Deliberately hand-built rather than
+/// produced by `as`/`ld`: the point is to express images a linker would
+/// never emit.
+fn synthetic_image(entry: u64, segments: &[(u64, u64)]) -> Vec<u8> {
+    let mut image: Vec<u8> = Vec::new();
+    image.extend_from_slice(b"\x7fELF\x02\x01\x01\x00");
+    image.extend_from_slice(&[0u8; 8]); // e_ident padding
+    image.extend_from_slice(&2u16.to_le_bytes()); // e_type = ET_EXEC
+    image.extend_from_slice(&0x3eu16.to_le_bytes()); // e_machine = x86-64
+    image.extend_from_slice(&1u32.to_le_bytes()); // e_version
+    image.extend_from_slice(&entry.to_le_bytes());
+    image.extend_from_slice(&64u64.to_le_bytes()); // e_phoff
+    image.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+    image.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+    image.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+    image.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+    image.extend_from_slice(&(segments.len() as u16).to_le_bytes()); // e_phnum
+    image.extend_from_slice(&0u16.to_le_bytes()); // e_shentsize
+    image.extend_from_slice(&0u16.to_le_bytes()); // e_shnum
+    image.extend_from_slice(&0u16.to_le_bytes()); // e_shstrndx
+    for &(vaddr, memsz) in segments {
+        image.extend_from_slice(&PT_LOAD.to_le_bytes()); // p_type
+        image.extend_from_slice(&(PF_W | 4).to_le_bytes()); // p_flags = RW
+        image.extend_from_slice(&0u64.to_le_bytes()); // p_offset
+        image.extend_from_slice(&vaddr.to_le_bytes()); // p_vaddr
+        image.extend_from_slice(&vaddr.to_le_bytes()); // p_paddr
+        image.extend_from_slice(&0u64.to_le_bytes()); // p_filesz -- pure BSS
+        image.extend_from_slice(&memsz.to_le_bytes()); // p_memsz
+        image.extend_from_slice(&PAGE_SIZE.to_le_bytes()); // p_align
+    }
+    image
+}
+
+/// Feed `load_image` the images a hostile `exec` would use and require
+/// each one to come back as the right `ElfError`.
+///
+/// This exists because the first version of this loader's validation was
+/// wrong in a way that testing the happy path could never have shown:
+/// it bounded segments against `USER_SPACE_END` and called that "can't
+/// map over the kernel", when in this port every kernel mapping is
+/// *below* that line, and a new address space shares the base's
+/// lower-level page tables for any PML4 slot the base already uses. An
+/// image asking to be loaded at `crate::allocator::HEAP_START` was
+/// accepted, and `map_to` then edited the kernel's own page tables.
+/// Checking that legitimate programs still load says nothing about any
+/// of that; only the rejections are evidence.
+///
+/// Every case below is rejected, so nothing here allocates a frame or
+/// builds an address space -- safe to run from `kernel_main`, before the
+/// scheduler exists.
+pub fn validator_self_test() {
+    let (base, _) = Cr3::read();
+    let user_slot = 0x_5555_5559_0000u64; // a PML4 slot the kernel doesn't use
+
+    let mut truncated = synthetic_image(user_slot, &[(user_slot, PAGE_SIZE)]);
+    truncated.truncate(70); // header plus a fragment of one program header
+
+    // Long enough to reach the magic check -- a short file is caught by
+    // the length guard in `header_of` first, which would make a
+    // "not an ELF" case silently test something else. (That is exactly
+    // what the first version of this table did: its shell script was 46
+    // bytes, so it asserted `TooSmall` under a `NotElf` label, and
+    // deleting the magic check would not have failed a single case.)
+    let mut script = Vec::from(&b"#!/bin/sh\necho this is a script, not a program\n"[..]);
+    script.resize(200, b' ');
+
+    let mut wrong_class = synthetic_image(user_slot, &[(user_slot, PAGE_SIZE)]);
+    wrong_class[4] = 1; // ELFCLASS32
+
+    let cases: [(&str, Vec<u8>, ElfError); 11] = [
+        (
+            "a segment on top of the kernel heap",
+            synthetic_image(user_slot, &[(crate::allocator::HEAP_START as u64, PAGE_SIZE)]),
+            ElfError::SegmentInSharedSlot,
+        ),
+        (
+            "a segment on top of the kernel image",
+            synthetic_image(user_slot, &[(0x20_0000, PAGE_SIZE)]),
+            ElfError::SegmentInSharedSlot,
+        ),
+        (
+            "two segments sharing one page",
+            synthetic_image(user_slot, &[(user_slot, 0x10), (user_slot + 0x100, 0x10)]),
+            ElfError::SegmentsOverlap,
+        ),
+        (
+            "a segment on top of the stack page",
+            synthetic_image(user_slot, &[(STACK_ADDR, PAGE_SIZE)]),
+            ElfError::SegmentOverlapsStack,
+        ),
+        (
+            "4 GiB of BSS from a 120-byte file",
+            synthetic_image(user_slot, &[(user_slot, 0x1_0000_0000)]),
+            ElfError::ImageTooLarge,
+        ),
+        (
+            "a segment past the canonical boundary",
+            synthetic_image(user_slot, &[(USER_SPACE_END, PAGE_SIZE)]),
+            ElfError::SegmentOutsideUserSpace,
+        ),
+        (
+            "no loadable segments at all",
+            synthetic_image(user_slot, &[]),
+            ElfError::NoLoadableSegments,
+        ),
+        ("a program header table past the end of the file", truncated, ElfError::BadProgramHeaders),
+        ("a shell script long enough to reach the magic check", script, ElfError::NotElf),
+        ("a 32-bit ELF", wrong_class, ElfError::NotElf64),
+        ("a file too short to hold an ELF header", Vec::from(&b"#!/bin/sh\n"[..]), ElfError::TooSmall),
+    ];
+
+    for (name, image, expected) in cases.iter() {
+        match load_image(base, image) {
+            Err(actual) if actual == *expected => {
+                serial_println!("[elf] rejected {}: {:?}", name, actual);
+            }
+            Err(actual) => panic!("{}: expected {:?}, got {:?}", name, expected, actual),
+            Ok(_) => panic!("{}: was ACCEPTED -- the loader would have mapped it", name),
+        }
+    }
+    serial_println!("[elf] validator self-test: all {} hostile images rejected", cases.len());
 }
 
 /// A `crate::proc` task body: jump to ring 3 at the real entry point
@@ -258,7 +705,34 @@ pub fn spawn_from_fs(
     priority: u8,
     quantum: i32,
 ) -> Result<(), i64> {
-    let fd = fs::open(path);
+    let image = read_file(path)?;
+    // Unlike `load` above, this image came out of `fs` rather than out
+    // of the kernel binary, so a malformed one is a bad file, not a bad
+    // build: report it like any other failure to start a service rather
+    // than bringing the kernel down over it.
+    let loaded = load_image(proc::kernel_cr3(), &image).map_err(|_| ENOEXEC)?;
+    record_params(proc_nr, &loaded);
+    proc::spawn(proc_nr, name, task_entry, priority, quantum, true, Some(loaded.pml4));
+    Ok(())
+}
+
+/// Read an entire file out of `fs` into a heap buffer, or return `fs`'s
+/// own negative error code (`ENOENT`, `EISDIR`, ...) unchanged. Shared by
+/// `spawn_from_fs` (start a *new* process running this program) and
+/// `crate::calls::sys_exec` (make an *existing* process start running it
+/// instead of what it was) -- the two halves of "get a program off the
+/// filesystem", which differ only in what they do with the bytes.
+///
+/// Must be called from a real task: `fs::open`/`fs::read` block on IPC
+/// round trips, which needs a task context to block in.
+pub fn read_file(path: &str) -> Result<Vec<u8>, i64> {
+    // `open_existing`, not `open`: `fs::open` creates the file when it
+    // isn't there, so asking for a program that doesn't exist would
+    // otherwise succeed, hand back zero bytes, get rejected as a
+    // malformed image (`ElfError::TooSmall` -> `ERR_BAD_ELF`), and leave
+    // a stray empty file behind at the caller's chosen path. A missing
+    // program is `ENOENT`, and a failed `exec` changes nothing.
+    let fd = fs::open_existing(path);
     if fd < 0 {
         return Err(fd);
     }
@@ -269,9 +743,14 @@ pub fn spawn_from_fs(
         if n <= 0 {
             break;
         }
+        // Checked before appending, not after: the point is never to
+        // hold more than this in the heap, and there is no allocation
+        // error handler to catch it if we do (an over-large `Vec` growth
+        // aborts).
+        if image.len() + n as usize > MAX_IMAGE_BYTES {
+            return Err(EFBIG);
+        }
         image.extend_from_slice(&chunk[..n as usize]);
     }
-    let address_space = load(&image, proc_nr);
-    proc::spawn(proc_nr, name, task_entry, priority, quantum, true, Some(address_space));
-    Ok(())
+    Ok(image)
 }

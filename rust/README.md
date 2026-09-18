@@ -54,7 +54,18 @@ a real ring-3 task blocks *inside its own trap* for however long it
 takes a human to actually type a line and press Enter, then resumes in
 ring 3 with the typed bytes — a real keypress, reaching a real process,
 by way of a real syscall — enough to build the rest of the system on
-top of.
+top of. `fork`'s other half is real now too: `exec()` (`SYS_EXEC`), where
+a ring-3 task names a program by path, and the very trap it made returns
+into a *different binary* — loaded out of `fs`, mapped into a brand-new
+address space, resumed at its own entry point on its own fresh stack,
+with the process itself (its number, priority, kernel stack, open
+descriptors) carrying straight through. Verified from outside the
+process, not from its own logs: the new image's `.data` reads back
+through the *caller's* process slot, while the old image's `.data` page
+is no longer mapped there at all — replaced, not merely added to. A
+deliberately-failed exec of a non-ELF file is checked the same way,
+since "a failed exec leaves the caller exactly as it was" is the part
+that is easiest to get wrong.
 
 **Porting philosophy:** the C tree is kept as the behavioral spec — process
 numbers, message/call numbers, the device-driver protocol
@@ -153,7 +164,18 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   code/data, the heap, the physical-memory window) by aliasing the same
   lower-level tables, and only becoming genuinely private wherever
   something is mapped into a PML4 slot the original table didn't already
-  use. `crate::usermode` is the first thing to use this, to give the
+  use. `new_address_space_from` is the same thing with the source table
+  named explicitly instead of read out of `CR3`: invisible to every
+  caller that runs in the kernel's own address space, but load-bearing
+  for `exec` (`src/calls.rs`'s `sys_exec` below), which runs inside a
+  *ring-3* caller's trap -- where the active table is the one exec is
+  supposed to be throwing away, and copying it would quietly hand the new
+  image its predecessor's pages. `pml4_slots_unused` is the check that
+  makes the aliasing caveat above enforceable rather than a comment: it
+  reports whether every PML4 slot an address range falls in is unused in
+  a given table, which is exactly the precondition "mapping this will be
+  private" depends on. `crate::elf`'s `validate` uses it on every
+  segment of an image `exec` was handed. `crate::usermode` is the first thing to use this, to give the
   ring-3 demo task real isolation instead of just a CPU privilege level.
   `page_table_for` and `copy_between_address_spaces` build on it: given
   any process's PML4 frame, translate a virtual address through *that*
@@ -260,7 +282,22 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   hands `proc::fork_current` a snapshot of that trap -- `rax` zeroed --
   instead of a fixed entry point, so the new task resumes at the exact
   ring-3 instruction its parent trapped from, not somewhere fixed; see the
-  `src/proc.rs` bullet below for how), and `SYS_BLOCK_FOREVER` (calls
+  `src/proc.rs` bullet below for how), `SYS_EXEC` (the other half of
+  `fork`: same `frame_ptr` mechanism, opposite effect -- instead of
+  copying this trap into a *new* process, it overwrites this trap's own
+  saved registers so that the `iretq` at the end of `entry` resumes a
+  *different program* rather than returning to the caller at all. Reads
+  the path out of ring 3 into a kernel-stack buffer first, since the
+  caller's own pointer stops meaning anything the moment the address
+  space is swapped; loads the image out of `fs` by path
+  (`elf::read_file`, blocking on real IPC round trips the whole time,
+  still on the old address space, so a missing file changes nothing);
+  then `calls::sys_exec` and `TrapFrame::exec_into`. Forwards `fs`'s own
+  error codes unchanged when the path is the problem, `ERR_BAD_ELF` when
+  the file is, and refuses outright -- `ERR_EXEC_NOT_RING3` -- if the
+  caller's saved `CS` says it wasn't in ring 3, since exec'ing a kernel
+  task would swap its address space out from under it and `iretq` it into
+  a ring-3 entry point with a kernel `CS`), and `SYS_BLOCK_FOREVER` (calls
   `ipc::receive(ANY)` directly from inside the trap, never returning --
   the same "nothing sends to this
   proc again" pattern every other demo task in `main.rs` ends with).
@@ -292,6 +329,17 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   sequence rather than jumping into it (naked functions have no
   addressable internal label another function's `sym` can reach) --
   a small, self-contained stub kept in sync with `entry`'s tail by hand.
+  `SYS_EXEC`'s counterparts are smaller but sit in the same place:
+  `set_address_space` points a process at a different PML4 and, when
+  that process is the one currently running (always, for exec, which
+  happens inside the caller's own trap), reloads `CR3` immediately rather
+  than waiting for the next `reschedule` -- with interrupts off across
+  both, so a timer tick can't land between the table write and the `CR3`
+  load. `TrapFrame::exec_into` builds the frame that turns a trap return
+  into a program *start*: caller's `cs`/`ss` (same ring), the new entry
+  point and stack, a fresh `RFLAGS` of `0x202` (deliberately not
+  inherited -- a new program shouldn't start with the direction flag its
+  predecessor left set), and every general-purpose register zeroed.
 - `src/calls.rs` — the first kernel calls, ported from
   `kernel/system/do_copy.c` (`sys_vircopy`), `do_setalarm.c`
   (`sys_setalarm`), and `kernel/proc.c`'s `do_fork()` (`sys_fork`). Real
@@ -318,6 +366,21 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   entry point (see the `src/proc.rs`/`src/syscall.rs` bullets above) --
   reachable from ring 3 (`crate::syscall`'s `SYS_FORK`), unlike `sys_fork`
   itself, which only `pm`'s own kernel-side demo calls.
+  `sys_exec` is `fork`'s opposite number, ported in spirit from the pair
+  MINIX splits exec across -- `servers/pm/exec.c`'s `do_exec` (find the
+  file, lay out and load the image) and the `SYS_EXEC` kernel call it
+  makes, `kernel/system/do_exec.c` (point the process at the new image
+  and set its saved `pc`/`sp`). This does the first part plus the
+  address-space swap: `elf::load_image` into a brand-new address space
+  derived from the *kernel's* PML4 (so the new image starts with an empty
+  user address space, not its predecessor's mappings), then
+  `proc::set_address_space`. Writing the new entry point and stack into
+  the caller's live trap frame stays in `crate::syscall`, which is the
+  only code holding that frame -- the same split `do_exec.c` has by being
+  the only code holding `rp->p_reg`. Nothing is mutated until the image
+  has been fully validated and mapped, so a failed exec leaves the caller
+  running exactly as it was, which is what POSIX requires and what
+  `user/shell.s` deliberately checks.
 - `src/fs.rs` — a real, in-memory file server, replacing `fs`'s ping-pong
   stand-in. No single C file to port: real `servers/fs` is a whole
   subsystem (`open.c`/`read.c`/`write.c`/`path.c`, an inode/block-cache
@@ -332,6 +395,14 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `ipc`'s new `send_receive`) that any task can call to talk to it,
   mirroring `src/calls.rs`'s kernel-call wrappers in shape even though
   these cross a real IPC round trip rather than a direct function call.
+  `open_existing` is a second client stub added alongside `open`: same
+  request, but with a no-create flag, so a caller can ask *whether* a
+  file is there. `open`'s create-on-open behavior (see "known
+  simplifications in `fs`" below) is fine for a writer and actively
+  wrong for a looker-up -- `exec` of a path that doesn't exist would
+  otherwise succeed at opening nothing, report `ERR_BAD_ELF` as if the
+  program were malformed rather than absent, and leave a stray empty
+  file behind at whatever path ring 3 named.
   `InMemoryFs` also now enforces a real directory hierarchy, not just a
   flat, exact-match namespace: `directories` is a flat list of known
   directory paths (the root, `"/"`, always is, implicitly), and
@@ -364,6 +435,63 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   mapped size are the same thing. `task_entry` reuses
   `usermode::enter_ring3` to jump to the parsed `e_entry` (not a fixed
   constant) on a mapped stack.
+  The loader is now split in two, because `exec` made its inputs
+  untrusted. `load_image` does the real work and returns a `LoadedImage`
+  (`{ pml4, entry, stack_top }`) or an `ElfError`, after a `validate`
+  pass that runs *before* a single frame is allocated: magic/class/
+  endianness, a program header table that actually fits inside the file,
+  per-segment `p_offset + p_filesz` within the image and `p_filesz <=
+  p_memsz`, a bound on how many pages the whole image may occupy
+  (`p_memsz` needs no file bytes behind it, so without that a
+  hundred-byte file can ask for terabytes and walk the frame allocator
+  dry), no two `PT_LOAD` segments sharing a page, nothing overlapping
+  the fixed stack page, and -- the one that matters most -- every
+  segment landing in a PML4 slot the base address space does **not**
+  already use (`memory::pml4_slots_unused`).
+  That last check is what keeps a chosen file off the kernel, and it is
+  deliberately about the *slot*, not the address. An earlier version of
+  this bounded segments against `USER_SPACE_END` and called that "can't
+  map over the kernel"; that was simply wrong. This port has no
+  user/kernel address boundary to bound against -- the kernel image sits
+  near `0x20_0000`, the heap at `allocator::HEAP_START`
+  (`0x4444_4444_0000`), and the bootloader's physical-memory window at a
+  low free PML4 index, all far *below* `USER_SPACE_END` and interleaved
+  with the addresses user images legitimately use. Since a new address
+  space copies only the top-level table, a segment landing in an
+  already-used slot gets no private mapping at all: `map_to` descends
+  into the kernel's own lower-level tables and edits them. A crafted ELF
+  naming `HEAP_START` was accepted and panicked the kernel from ring 3
+  (`PageAlreadyMapped`); one naming an unmapped address in the same slot
+  was accepted and installed a user-accessible page into the kernel's
+  live page tables. `USER_SPACE_END` remains, but only as the
+  canonicality bound it actually is.
+  Belt and braces on top: `load_segment` and the stack mapping return
+  `ElfError::MappingFailed` rather than `.expect()`-ing, so being wrong
+  again about what `validate` guarantees costs a ring-3 caller its
+  `exec` instead of costing the machine its kernel. And
+  `elf::validator_self_test` (run from `kernel_main`) feeds the loader
+  eleven hostile images -- a segment on the kernel heap, one on the
+  kernel image, two segments sharing a page, one over the stack page,
+  4 GiB of BSS from a 120-byte file, one past the canonical boundary, a
+  truncated program header table, an image with no `PT_LOAD` at all, a
+  shell script, a 32-bit ELF, and a file too short to hold a header --
+  and requires each to come back as the specific right `ElfError`; the rejections are the only part of this a working boot
+  cannot demonstrate. `user/echo.s` then does the same thing the other
+  way round, from ring 3 and for real: it writes a 120-byte hand-built
+  ELF targeting `HEAP_START` into `fs` and execs it, and `exec_verify`
+  checks the `ERR_BAD_ELF` it got back. The kernel-side self-test says
+  the validator rejects that image; only this one says an unprivileged
+  process cannot get it loaded. Header reads go through `read_unaligned` rather than a reference
+  cast, since an image `sys_exec` loads is a heap `Vec<u8>` assembled
+  from `fs` reads with no alignment guarantee at all. `load` is the thin
+  wrapper the boot path still uses: it keeps the old "a built-in image is
+  known good, so panic" contract and stashes the entry/stack in
+  `ELF_TASK_PARAMS` for a task that hasn't started yet. `read_file`
+  (factored out of `spawn_from_fs`) is the other half of "get a program
+  off the filesystem", shared with `sys_exec`. `spawn_from_fs` moved off
+  `load` and onto `load_image` in the process: its image comes out of
+  `fs` too, so a malformed one is now an `ENOEXEC` returned to whoever
+  asked for the launch (`crate::rs`) rather than a kernel panic.
 - `src/vga.rs` — VGA mode 13h (320x200, 256-color) graphics. No MINIX C
   equivalent (2005-era MINIX has no graphics stack at all); this is the
   first concrete step toward the BeOS/Haiku-flavored desktop-OS direction
@@ -641,7 +769,7 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Eleven calls exist**, and all but the unrecognized-call-number
+- **Twelve calls exist**, and all but the unrecognized-call-number
   fallback reach real server/kernel-call logic, including `SYS_FORK` now
   (see the `src/syscall.rs`/`src/proc.rs` bullets above). Real enough to
   write a genuine ring-3 program against (a demo user program can now get
@@ -760,7 +888,9 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   "known simplifications in the ring-3 task" above); a real, isolated
   `fs` server would need a `sys_vircopy`-style copy for every buffer, the
   same way `sys_vircopy` itself does for `sys_fork`'d tasks.
-- **`open` always creates**, and there's no `close`: a file descriptor is
+- **`open` still always creates** (`open_existing` is opt-in, not the
+  default, and there is no `O_CREAT`-style flag set for a caller to
+  express anything finer), and there's no `close`: a file descriptor is
   never freed once allocated (`InMemoryFs::open`'s slot table only ever
   grows), and repeated opens of the same name return independent
   descriptors with independent cursors rather than sharing or refusing
@@ -789,16 +919,88 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   vectors, the auxiliary vector) and can invoke a dynamic linker named by
   a `PT_INTERP` segment. `user/hello.s` is freestanding and asks for
   none of that, so this hasn't mattered yet.
-- **One fixed binary, one fixed stack address.** `elf::load` always loads
-  `HELLO_ELF` at a hardcoded `STACK_ADDR`, the same way `usermode.rs`'s
-  demo uses fixed constants -- fine for this port's one ELF task, but not
-  a general "load any binary, anywhere" API yet (no ASLR, no picking an
-  unused address range).
-- **No `PT_LOAD` overlap/validation.** A real loader also has to guard
-  against a hostile or malformed file (overlapping segments, addresses
-  that alias kernel-reserved ranges, `p_align` mismatches); `load` trusts
-  `user/hello.elf` is well-formed, since this port only ever loads a
-  binary it built itself.
+- **One fixed stack address, one page of it.** Every image gets its
+  stack at a hardcoded `STACK_ADDR`, one 4 KiB page, the same way
+  `usermode.rs`'s demo uses fixed constants. Harmless while each image
+  has its own address space, but not a general "load any binary
+  anywhere" API (no ASLR, no picking an unused range, no stack growth).
+- **Validation covers safety, not program sanity.** `validate` rejects
+  everything that could hurt the kernel or another process (see the
+  `src/elf.rs` bullet above), and `elf::validator_self_test` holds it to
+  that. What it still doesn't check is the class of thing that only
+  produces a *broken program*: `p_align` disagreeing with `p_vaddr`, an
+  entry point that doesn't land in an executable segment, or a stack
+  that is one page whether the program wanted more or not. An earlier
+  version of this bullet listed "`PT_LOAD` segments overlapping each
+  other" here as merely cosmetic -- it wasn't; it panicked the kernel
+  from ring 3, and it is now a rejected case with a self-test behind
+  it.
+- **Three images, all built out of band.** `HELLO_ELF`, `SHELL_ELF`, and
+  `ECHO_ELF` are `include_bytes!`d from hand-assembled files; the last of
+  those only so `pm` has something to install at `/bin/echo`. Loading by
+  path out of `fs` is real (`read_file`), but what's *in* `fs` still
+  ultimately comes from the kernel binary.
+
+### Known simplifications in `exec()`
+
+- **No `argv`/`envp`.** `sys_exec` takes a path and nothing else. A real
+  `execve` copies the argument and environment vectors out of the old
+  address space (the one it's about to destroy) and reconstructs them on
+  the new image's stack before jumping to it -- the single fiddliest part
+  of a real exec, and entirely absent here, because this port's programs
+  are freestanding assembly that reads neither.
+- **The replaced image is leaked, not freed.** Its PML4, the page-table
+  levels that were private to it, and every frame its segments and stack
+  occupied stay allocated forever. Not an exec-specific gap: this port
+  has no frame deallocator at all (`crate::memory`'s allocator only hands
+  frames out), which is also why `proc::kill` doesn't reclaim a dead
+  process's memory. Real `exec` frees the old image as a matter of
+  course.
+- **The whole image is read into the heap first.** `read_file` assembles
+  the entire program into a `Vec<u8>` over repeated `fs` round trips,
+  then copies it page by page into the new address space -- two full
+  copies of every byte, and a hard dependency on the heap being big
+  enough for the largest program. Real systems demand-page an executable
+  straight from the file cache.
+- **No permission, ownership, or `#!` handling.** Anything can exec
+  anything readable: no execute bit (`fs` has no mode bits), no set-uid,
+  no `EACCES`, and no interpreter line (a shell script comes back as a
+  malformed image, which is one of the self-test's cases). File
+  descriptors survive the call, since `fs` has no close-on-exec flag --
+  which happens to match what POSIX does for descriptors *without* the
+  flag set, so it's a missing feature rather than wrong behavior.
+- **Per-process state that should be reset isn't.** A pending
+  `sys_setalarm` deadline survives exec, and so would a signal
+  disposition if this port had signals (real `exec` resets handled
+  signals to their default). The process's priority, quantum, and
+  scheduling history carry over too, which real `exec` also does -- but
+  here that's because nothing touches them, not because it was decided.
+- **A failed `exec` is a no-op, and that is load-bearing rather than
+  incidental.** Nothing is mutated until the image is fully validated
+  and mapped, the path is resolved with `fs::open_existing` so a missing
+  program creates nothing, and the caller keeps running its own image --
+  checked from both sides (`user/shell.s` survives a deliberately-failed
+  exec and writes the error code to a file afterward;
+  `crate::main`'s `missing_program_check` confirms a missing path
+  reports `ENOENT` and leaves no file behind). What is *not* guaranteed:
+  frames already consumed by a partially-mapped image are leaked, since
+  there is no deallocator to give them back.
+- **The path pointer from ring 3 is dereferenced without validation**,
+  like every other pointer argument in `crate::syscall` (`dispatch`
+  bounds the *length* against `MAX_FS_BUF` but takes `arg1` on trust and
+  reads it directly). A caller passing an unmapped or non-canonical
+  pointer faults inside the kernel, and `interrupts::recover_or_halt`
+  only converts faults with a *ring-3* saved `CS` into `proc::kill` --
+  a fault in `dispatch` has a ring-0 `CS` and halts the machine. Closing
+  this needs a real `copy_from_user` with fault fixup (a fault handler
+  that can resume at a recovery address), which this port has nowhere
+  yet; it is a pre-existing property of the whole syscall surface rather
+  than of `exec`, but `exec` is a conspicuous place to meet it.
+- **Unlike `SYS_FORK`, it isn't hardcoded to one caller** -- `sys_exec`
+  works for any ring-3 process, since replacing an address space needs no
+  per-caller knowledge (`SYS_FORK` still needs an explicit private-pages
+  list, see "known simplifications in the kernel calls"). The demo only
+  exercises one caller, but the call itself is general.
 
 ### Known simplifications in the VGA graphics
 
@@ -1019,10 +1221,20 @@ Roughly in the order the original kernel needs them:
     `sys_fork`'s "child resumes at the parent's exact call site" gap is
     also closed now, for the one ring-3 caller that exercises it
     (`crate::syscall`'s `SYS_FORK`/`sys_fork_from_frame`, see item 9
-    above) -- still missing: `exec()` (using the ELF loader above to
-    replace a process's *own* image with a different program, rather than
-    forking a copy of the same one), a general per-process memory map so
-    any caller (not just a hardcoded, known one) can fork itself, and `fs`
+    above), and so is its other half: `exec()` is real
+    (`crate::calls::sys_exec`, `crate::syscall`'s `SYS_EXEC`) -- `shell`
+    loads a *different* program out of `fs` by path and replaces its own
+    image with it, keeping its process number, priority, kernel stack and
+    open descriptors, and resuming in ring 3 at the new binary's entry
+    point on a freshly mapped stack, in an address space that no longer
+    contains a single page of what it used to be running (proven by
+    `crate::main`'s `exec_verify`, which requires reading the old image's
+    `.data` back to *fail*). A deliberately-failed exec of a non-ELF file
+    is checked too, since "a failed exec leaves the caller exactly as it
+    was" is the guarantee most easily broken here. Still missing: `argv`/
+    `envp` and freeing the replaced image (see "known simplifications in
+    `exec()`" above), a general per-process memory map so any caller (not
+    just a hardcoded, known one) can fork itself, and `fs`
     growing `readdir` and a real backing store (see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
     file/directory table. Ring-3 callers can now reach `fs` for real
@@ -1076,7 +1288,7 @@ Roughly in the order the original kernel needs them:
     gate saves every general-purpose register, reads the caller's `rax`
     (call number) and `rdi`/`rsi`/`rdx`/`rcx` (up to four arguments, since
     grown from three -- see the `src/syscall.rs` bullet above),
-    dispatches to one of eleven calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    dispatches to one of twelve calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
     -- a real cross-ring pointer argument, read directly since entering a
     trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
     the first of `crate::calls`' own kernel calls reachable from ring 3,
@@ -1123,9 +1335,15 @@ Roughly in the order the original kernel needs them:
     child's canary write (proving its memory is a real, independent copy)
     and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
     `IDLE`. See "known simplifications in the syscall ABI" above for what's
-    not a real syscall surface yet (eleven calls, one code per *kind* of
+    not a real syscall surface yet (twelve calls, one code per *kind* of
     dispatch-level mistake rather than a real per-cause `errno` set,
-    `SYS_FORK` hardcoded to one known caller and one reserved child slot).
+    `SYS_FORK` hardcoded to one known caller and one reserved child
+    slot). The twelfth is `SYS_EXEC`, which uses the same `frame_ptr`
+    plumbing `SYS_FORK` introduced for the opposite purpose: rather than
+    copying the caller's trap into a new process, it overwrites the
+    caller's own saved registers, so the trap returns into a different
+    program entirely (`shell` becomes `/bin/echo` mid-syscall). See item
+    11 above and "known simplifications in `exec()`".
 
 ## Building
 
@@ -1220,7 +1438,12 @@ finally blocking on its own `SYS_READ_LINE` -- entirely separately from
 Expected output on COM1: a line confirming the LCARS demo panel
 was painted (`vga: painted the LCARS demo panel ...`, printed as early as
 possible -- before paging/heap/scheduler setup -- so the panel is on
-screen even if something later panics), a heap self-test (`Box`/`Vec` both actually work), an isolation
+screen even if something later panics), a heap self-test (`Box`/`Vec` both actually work),
+eleven `[elf] rejected ...` lines from `elf::validator_self_test` (each
+naming a hostile image and the `ElfError` it earned) followed by
+`[elf] validator self-test: all 11 hostile images rejected` -- these come
+*after* the heap self-test, not at the very top, because the synthetic
+images are built in the heap -- an isolation
 self-test (the ring-3 demo's code page translates to `None` through the
 kernel's own page table -- it only exists in that task's private address
 space), the boot image table, the `pm`/`fs` demo tasks ping-ponging three
@@ -1277,7 +1500,7 @@ running other tasks when it showed up), `memory`'s demo task spinning
 through many quanta purely because the timer forces it to keep yielding
 and resuming (asynchronous preemption -- watch its counter resume from
 exactly where it left off every time), and finally, once everything else
-has blocked, `IDLE` running five independent checks against processes
+has blocked, `IDLE` running eleven independent checks against processes
 that have long since gone quiet: `sys_vircopy`-ing `tty`'s `.data` counter
 back out and confirming it reads `5` (proving the loaded ELF binary's own
 code genuinely ran, not just that it trapped the right number of times --
@@ -1297,5 +1520,32 @@ child specifically: `sys_vircopy`-ing *its* `vircopy_buf` (targeting
 `proc_nr` 11, not `tty`) to confirm it holds the canary and not `tty`'s
 own content -- proof fork's copy was genuinely independent, not
 aliased -- and reading back `/from_fork_child.txt` to confirm the
-child's own file write reached `fs` too, before reporting that it's
-halting (with the accumulated tick count).
+child's own file write reached `fs` too, and finally five checks on the
+`exec()` demo: reading back `/from_exec.txt` (written by the *exec'd*
+image, `user/echo.s`), reading `/exec_error.bin` and confirming it holds
+exactly `ERR_BAD_ELF` -- which `shell` could only have written after
+surviving its own deliberately-failed exec of a non-ELF file --
+reading `/evil_exec_error.bin` and confirming it too holds
+`ERR_BAD_ELF` -- that one written by the exec'd image after it tried,
+from ring 3, to `exec` a hand-built ELF asking to be mapped onto the
+kernel's own heap (`[syscall] proc 12: SYS_EXEC("/evil") -> bad image:
+SegmentInSharedSlot` appears earlier in the log), which the first
+version of this loader's validation accepted --
+`sys_vircopy`-ing the exec'd image's `.data` counter out of `proc_nr`
+12's address space and confirming it reads `1` (the new program's own
+instructions ran, in the *caller's* process slot), and then the one
+check that has to fail: reading `shell`'s pre-exec marker page back out
+of that same process must come back `Err(SrcNotMapped)`
+(`[idle] reading shell's pre-exec marker page at 0x555555580000 back:
+Err(SrcNotMapped) ...`), since the image that wrote it no longer exists
+anywhere in that address space. Before all of that, watch `shell` itself
+(`proc_nr` 12) announce itself, fail an exec on purpose
+(`[syscall] proc 12: SYS_EXEC("/not_a_program") -> bad image: NotElf`),
+carry on regardless, and then stop being itself
+(`[syscall] proc 12: SYS_EXEC("/bin/echo") -> replaced its own image,
+entering at 0x666666660000 on a fresh stack`), with every line after
+that from `proc 12` coming from a completely different program. If
+`shell` runs before `pm` has installed `/bin/echo`, you'll also see a
+few `-> fs error -2` (`ENOENT`) attempts a tick apart first: that's
+`user/shell.s`'s retry loop, not a failure. Finally `IDLE` reports that
+it's halting (with the accumulated tick count).

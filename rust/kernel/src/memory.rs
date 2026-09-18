@@ -113,20 +113,80 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 pub fn new_address_space(
     physical_memory_offset: VirtAddr,
 ) -> (PhysFrame, OffsetPageTable<'static>) {
-    let new_frame = GlobalFrameAllocator
-        .allocate_frame()
-        .expect("out of physical frames for a new address space's PML4");
-
     let (active_frame, _) = x86_64::registers::control::Cr3::read();
-    let active_ptr: *const PageTable =
-        (physical_memory_offset + active_frame.start_address().as_u64()).as_ptr();
+    new_address_space_from(active_frame, physical_memory_offset)
+        .expect("out of physical frames for a new address space's PML4")
+}
+
+/// `new_address_space`, but copying an explicitly named PML4 rather than
+/// whichever one happens to be in `CR3` right now.
+///
+/// The distinction is invisible to every caller that runs in the kernel's
+/// own address space (`kernel_main`, `crate::rs`) -- for them the active
+/// table *is* the kernel's. It matters exactly once: `crate::calls::
+/// sys_exec` runs inside a ring-3 caller's own trap, so `CR3` is that
+/// caller's address space, complete with the user mappings of the image
+/// exec is supposed to be throwing away. Copying *that* would hand the
+/// new image its predecessor's pages, which is both wrong (exec must
+/// start from a clean user address space) and unobservable-until-it-bites
+/// (the new program would run fine; only the old image's pages
+/// mysteriously surviving would show it). Passing `crate::proc::
+/// kernel_cr3()` explicitly makes "which address space is this derived
+/// from" a decision rather than an accident.
+///
+/// Returns `None` when there is no frame left for the new top-level
+/// table, rather than panicking like `new_address_space` does. That
+/// difference exists for the same reason the explicit `src_pml4` does:
+/// the caller may be `sys_exec`, acting for a ring-3 process, and this
+/// is the first of three allocations on that path -- the other two
+/// (`crate::elf`'s segment and stack mappings) already degrade to
+/// `ElfError::MappingFailed`. Frames only ever get scarcer here (there
+/// is no deallocator, and every `exec` leaks the image it replaces), so
+/// "running out" is a state the system can genuinely reach, and a
+/// ring-3 caller reaching it should lose its `exec`, not the machine.
+pub fn new_address_space_from(
+    src_pml4: PhysFrame,
+    physical_memory_offset: VirtAddr,
+) -> Option<(PhysFrame, OffsetPageTable<'static>)> {
+    let new_frame = GlobalFrameAllocator.allocate_frame()?;
+
+    let src_ptr: *const PageTable =
+        (physical_memory_offset + src_pml4.start_address().as_u64()).as_ptr();
     let new_ptr: *mut PageTable =
         (physical_memory_offset + new_frame.start_address().as_u64()).as_mut_ptr();
     unsafe {
-        core::ptr::copy_nonoverlapping(active_ptr, new_ptr, 1);
+        core::ptr::copy_nonoverlapping(src_ptr, new_ptr, 1);
         let table = &mut *new_ptr;
-        (new_frame, OffsetPageTable::new(table, physical_memory_offset))
+        Some((new_frame, OffsetPageTable::new(table, physical_memory_offset)))
     }
+}
+
+/// Whether every PML4 slot the range `start ..= end_inclusive` falls in
+/// is *unused* in the address space rooted at `pml4`.
+///
+/// This is the precondition `new_address_space_from` describes and that
+/// nothing previously checked. A new address space is only a copy of the
+/// top-level table, so any slot the base table already uses is shared:
+/// mapping into it does not create a private mapping, it reaches down
+/// into the base address space's own lower-level tables and edits them.
+/// For a hand-picked demo address (`crate::usermode`, `crate::elf`'s
+/// built-in images) that was checkable by eye. For `crate::calls::
+/// sys_exec`, whose addresses come out of a file a ring-3 caller chose,
+/// it has to be checked for real -- and checking the *slot* is the only
+/// correct form of the check, because "is this a kernel address?" has no
+/// answer in terms of a single boundary here: this port's kernel lives in
+/// the lower half (the kernel image near `0x20_0000`, the heap at
+/// `crate::allocator::HEAP_START`, and the bootloader's
+/// physical-memory window all sit at low PML4 indices), interleaved with
+/// the addresses user images legitimately use.
+pub fn pml4_slots_unused(pml4: PhysFrame, start: VirtAddr, end_inclusive: VirtAddr) -> bool {
+    let offset = physical_memory_offset();
+    // Safety: same contract as `page_table_for` -- `pml4` is a frame this
+    // module handed out, reachable through the physical-memory window.
+    let table: &PageTable = unsafe { &*((offset + pml4.start_address().as_u64()).as_ptr()) };
+    let first = u16::from(start.p4_index());
+    let last = u16::from(end_inclusive.p4_index());
+    (first..=last).all(|i| table[i as usize].is_unused())
 }
 
 /// Fork `src_pml4` into a brand-new, independent address space: like

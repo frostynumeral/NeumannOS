@@ -108,6 +108,7 @@ pub const SYS_FS_READ: u64 = 8;
 pub const SYS_READ_LINE: u64 = 9;
 pub const SYS_VIRCOPY: u64 = 10;
 pub const SYS_FORK: u64 = 11;
+pub const SYS_EXEC: u64 = 12;
 
 /// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
 /// a sanity bound on an untrusted `len` from ring 3 -- matches the size
@@ -144,6 +145,19 @@ pub const ERR_UNKNOWN_CALL: u64 = (-4i64) as u64;
 /// per-process memory-map bookkeeping yet, see `crate::calls::sys_fork`'s
 /// doc comment), not a mechanism failure.
 pub const ERR_FORK_UNSUPPORTED_CALLER: u64 = (-5i64) as u64;
+/// `SYS_EXEC` found the file but it isn't a program this loader can run
+/// (`crate::elf::ElfError` -- bad magic, a segment outside user space,
+/// truncated headers, ...). Distinct from the `fs` error codes `SYS_EXEC`
+/// forwards unchanged when the *path* is the problem (`ENOENT` and
+/// friends), which is the far more common case and the one
+/// `user/shell.s`'s retry loop is waiting on.
+pub const ERR_BAD_ELF: u64 = (-6i64) as u64;
+/// `SYS_EXEC` from a caller that wasn't in ring 3. Nothing in this port
+/// does that (kernel tasks call `crate::calls` directly rather than
+/// trapping), but the consequence if one ever did is bad enough to check
+/// for: `exec` would swap a *kernel* task's address space out from under
+/// it and `iretq` it into a ring-3 entry point with a kernel `CS`.
+pub const ERR_EXEC_NOT_RING3: u64 = (-7i64) as u64;
 
 /// The actual dispatch, called by `entry` (via `core::arch::naked_asm!`'s
 /// `sym` operand) with the caller's original `rax` (as `call_num`),
@@ -359,6 +373,81 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             );
             serial_println!("[syscall] proc {}: SYS_FORK -> child proc_nr {}", caller, child);
             child as u64
+        }
+        SYS_EXEC => {
+            if arg2 as usize > MAX_FS_BUF {
+                return ERR_BAD_LENGTH;
+            }
+            // Safety: same reasoning as SYS_FS_OPEN -- `CR3` is still the
+            // caller's own here. Note this read has to happen *before*
+            // `calls::sys_exec` switches address spaces, after which the
+            // caller's pointer refers to nothing at all; copying into a
+            // kernel-stack buffer (mapped identically in every address
+            // space) is what makes the path outlive its own image.
+            let src = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
+            let mut path_buf = [0u8; MAX_FS_BUF];
+            path_buf[..src.len()].copy_from_slice(src);
+            let path = match core::str::from_utf8(&path_buf[..src.len()]) {
+                Ok(path) => path,
+                Err(_) => return ERR_BAD_UTF8,
+            };
+
+            // Safety: `frame_ptr` points at this trap's own saved
+            // registers -- see the `SYS_FORK` arm above and
+            // `proc::TrapFrame`. A plain read, not a borrow: the `&mut`
+            // is deliberately left until after everything below that can
+            // block, so no reference into a live trap frame is held
+            // across a task switch.
+            let caller_cs = unsafe { (*(frame_ptr as *const proc::TrapFrame)).cs };
+            if caller_cs & 3 != 3 {
+                serial_println!("[syscall] proc {}: SYS_EXEC from ring {}, refusing", caller, caller_cs & 3);
+                return ERR_EXEC_NOT_RING3;
+            }
+
+            // Reading the program out of `fs` blocks on real IPC round
+            // trips, so this task may be switched away from and back
+            // several times before the image is complete -- all of it
+            // still running on the *old* address space, which is exactly
+            // what we want: nothing has been replaced yet if the file
+            // turns out not to exist.
+            let image = match elf::read_file(path) {
+                Ok(image) => image,
+                Err(err) => {
+                    serial_println!("[syscall] proc {}: SYS_EXEC({:?}) -> fs error {}", caller, path, err);
+                    return err as u64;
+                }
+            };
+            let loaded = match calls::sys_exec(caller, &image) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    serial_println!("[syscall] proc {}: SYS_EXEC({:?}) -> bad image: {:?}", caller, path, err);
+                    return ERR_BAD_ELF;
+                }
+            };
+
+            // The point of no return, and the reason this call has no
+            // meaningful success value: overwrite this trap's own saved
+            // registers so `entry`'s `iretq` resumes the *new* image at
+            // its entry point instead of returning to the instruction
+            // after the caller's `int 0x80`. `entry` still writes this
+            // function's return value into the saved `rax` slot
+            // afterward, which is why `0` is the only sensible thing to
+            // return: it's what the new program will find in `rax` on its
+            // first instruction, and `exec_into` zeroes every register
+            // anyway.
+            //
+            // Safety: as above, and nothing below this point blocks, so
+            // this borrow lives and dies inside one uninterrupted stretch
+            // of this task's own execution.
+            let frame = unsafe { &mut *(frame_ptr as *mut proc::TrapFrame) };
+            *frame = frame.exec_into(loaded.entry, loaded.stack_top);
+            serial_println!(
+                "[syscall] proc {}: SYS_EXEC({:?}) -> replaced its own image, entering at {:#x} on a fresh stack",
+                caller,
+                path,
+                loaded.entry
+            );
+            0
         }
         _ => {
             serial_println!("[syscall] proc {}: unknown call number {}", caller, call_num);

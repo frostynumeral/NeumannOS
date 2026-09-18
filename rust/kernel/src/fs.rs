@@ -126,11 +126,21 @@ impl InMemoryFs {
         0
     }
 
-    /// Resolve `path` to a file-table index for `open`, creating it if it
-    /// doesn't exist yet -- but only after the same parent-directory
-    /// checks `mkdir` makes, so a caller can't `open("/missing/x")` or
-    /// `open("/a_file/x")` and have it silently succeed.
-    fn open_path(&mut self, path: &str) -> Result<usize, i64> {
+    /// Resolve `path` to a file-table index for `open`, creating it if
+    /// it doesn't exist yet and `create` is set -- but only after the
+    /// same parent-directory checks `mkdir` makes, so a caller can't
+    /// `open("/missing/x")` or `open("/a_file/x")` and have it silently
+    /// succeed.
+    ///
+    /// `create` exists because "open always creates" (this server's
+    /// original, `O_CREAT`-is-implied behavior) is wrong for a caller
+    /// that wants to *find out whether a file exists*: it turns every
+    /// failed lookup into a successful open of a brand-new empty file,
+    /// and leaves that file behind. `crate::elf::read_file` is the
+    /// caller that cares -- `exec`'ing a path that doesn't exist has to
+    /// report `ENOENT` and change nothing, not invent an empty program
+    /// and then reject it for being malformed.
+    fn open_path(&mut self, path: &str, create: bool) -> Result<usize, i64> {
         if !path.starts_with('/') {
             return Err(EINVAL);
         }
@@ -146,6 +156,9 @@ impl InMemoryFs {
         }
         if let Some(i) = self.files.iter().position(|(existing, _)| existing == path) {
             return Ok(i);
+        }
+        if !create {
+            return Err(ENOENT);
         }
         self.files.push((String::from(path), Vec::new()));
         Ok(self.files.len() - 1)
@@ -179,7 +192,11 @@ impl InMemoryFs {
                 let name = unsafe {
                     core::str::from_utf8(core::slice::from_raw_parts(name_ptr, name_len)).unwrap_or("")
                 };
-                let result = match self.open_path(name) {
+                // `args[2]` is the no-create flag (see `open_existing`);
+                // absent (`0`) for every caller that predates it, which
+                // keeps the original create-on-open behavior the default.
+                let create = req.args[2] == 0;
+                let result = match self.open_path(name, create) {
                     Ok(file_index) => {
                         let fd = self.alloc_fd(OpenFile { file_index, position: 0 });
                         fd as i64
@@ -256,7 +273,8 @@ impl InMemoryFs {
     }
 }
 
-/// Client-side stub: open (creating if necessary) the file named `name`,
+/// Client-side stub: open the file named `name`, creating it if it
+/// doesn't exist (see `open_existing` for the variant that doesn't),
 /// returning a file descriptor, or a negative error (`ENOENT` if some
 /// parent directory doesn't exist, `ENOTDIR` if one exists but isn't a
 /// directory, `EISDIR` if `name` itself is a directory). Mirrors
@@ -264,12 +282,26 @@ impl InMemoryFs {
 /// real IPC round trip rather than a direct function call -- `fs` is a
 /// separate task, reached only through `crate::ipc`.
 pub fn open(name: &str) -> i64 {
+    open_with(name, true)
+}
+
+/// Client-side stub: open `name` only if it already exists, returning
+/// `ENOENT` rather than creating it. The distinction matters to anyone
+/// asking "is this file here yet?" -- `crate::elf::read_file` (so that a
+/// failed `exec` reports `ENOENT` and leaves nothing behind) and
+/// `crate::main`'s `read_when_available` (so that waiting for a file to
+/// appear can't be satisfied by conjuring it).
+pub fn open_existing(name: &str) -> i64 {
+    open_with(name, false)
+}
+
+fn open_with(name: &str, create: bool) -> i64 {
     let reply = ipc::send_receive(
         com::FS_PROC_NR,
         Message {
             source: proc::current_proc_nr(),
             m_type: FS_OPEN,
-            args: [name.as_ptr() as i64, name.len() as i64, 0, 0],
+            args: [name.as_ptr() as i64, name.len() as i64, i64::from(!create), 0],
         },
     );
     reply.args[0]
