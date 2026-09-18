@@ -170,7 +170,26 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   for `exec` (`src/calls.rs`'s `sys_exec` below), which runs inside a
   *ring-3* caller's trap -- where the active table is the one exec is
   supposed to be throwing away, and copying it would quietly hand the new
-  image its predecessor's pages. `pml4_slots_unused` is the check that
+  image its predecessor's pages.
+  Frames come back now, too. `BootInfoFrameAllocator` was a pure bump
+  allocator; it keeps the bump cursor for never-yet-used memory but adds
+  a free list threaded *through the free frames themselves* (each one's
+  first eight bytes hold the next one's physical address). That shape is
+  forced by boot order rather than chosen for elegance --
+  `allocator::init_heap` allocates frames in order to map the heap, so
+  the frame allocator cannot depend on a heap existing. `allocate_frame`
+  pops the free list before bumping, and every frame is zeroed on the
+  way out: once frames are recycled a fresh page is no longer untouched
+  memory but some *other process's* former stack, and several callers
+  map a page without writing all of it. `free_address_space` hands a
+  whole address space back -- its user pages, the page-table levels
+  leading to them, and the PML4 -- walking exactly the slots used here
+  and unused in the base table, the same private/shared distinction
+  `pml4_slots_unused` tests; descending into a shared slot would feed
+  the kernel's own page tables to the allocator. `frame_stats` exposes
+  the accounting, which is the only observable signature "no leak" has
+  in a kernel with no process accounting.
+  `pml4_slots_unused` is the check that
   makes the aliasing caveat above enforceable rather than a comment: it
   reports whether every PML4 slot an address range falls in is unused in
   a given table, which is exactly the precondition "mapping this will be
@@ -335,7 +354,12 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   happens inside the caller's own trap), reloads `CR3` immediately rather
   than waiting for the next `reschedule` -- with interrupts off across
   both, so a timer tick can't land between the table write and the `CR3`
-  load. `TrapFrame::exec_into` builds the frame that turns a trap return
+  load. `set_address_space` also frees the address space it replaces,
+  and `kill` frees the dead process's -- both only after `CR3` has been
+  moved off the tables in question (`kill` switches to the kernel's own
+  address space first, since a process usually dies from the CPU
+  exception its own code raised, with its own page tables still
+  loaded). `TrapFrame::exec_into` builds the frame that turns a trap return
   into a program *start*: caller's `cs`/`ss` (same ring), the new entry
   point and stack, a fresh `RFLAGS` of `0x202` (deliberately not
   inherited -- a new program shouldn't start with the direction flag its
@@ -949,13 +973,15 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   the new image's stack before jumping to it -- the single fiddliest part
   of a real exec, and entirely absent here, because this port's programs
   are freestanding assembly that reads neither.
-- **The replaced image is leaked, not freed.** Its PML4, the page-table
-  levels that were private to it, and every frame its segments and stack
-  occupied stay allocated forever. Not an exec-specific gap: this port
-  has no frame deallocator at all (`crate::memory`'s allocator only hands
-  frames out), which is also why `proc::kill` doesn't reclaim a dead
-  process's memory. Real `exec` frees the old image as a matter of
-  course.
+- **The replaced image *is* freed now** (`memory::free_address_space`,
+  called from `proc::set_address_space` once the new `CR3` is loaded),
+  so `exec` no longer costs an address space per call. What is still
+  missing is the rest of a real teardown: `fs` descriptors the old image
+  opened stay open (there is no `close`), and a partially-mapped image
+  rejected mid-way leaves the frames it already took behind, because
+  `load_image` frees nothing on the error path -- it only avoids
+  allocating in the first place, which covers every case `validate`
+  catches but not a `MappingFailed` in the middle.
 - **The whole image is read into the heap first.** `read_file` assembles
   the entire program into a `Vec<u8>` over repeated `fs` round trips,
   then copies it page by page into the new address space -- two full
@@ -983,8 +1009,9 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   exec and writes the error code to a file afterward;
   `crate::main`'s `missing_program_check` confirms a missing path
   reports `ENOENT` and leaves no file behind). What is *not* guaranteed:
-  frames already consumed by a partially-mapped image are leaked, since
-  there is no deallocator to give them back.
+  an image rejected *after* mapping began (`ElfError::MappingFailed`)
+  leaves its already-mapped frames behind -- `validate` is what makes
+  that unreachable in practice, not an unwind path.
 - **The path pointer from ring 3 is dereferenced without validation**,
   like every other pointer argument in `crate::syscall` (`dispatch`
   bounds the *length* against `MAX_FS_BUF` but takes `arg1` on trust and
@@ -1109,12 +1136,13 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   spawned at a strictly higher priority than `flaky` specifically to
   avoid this race (see the `src/main.rs` bullet above), rather than the
   notification itself being reliable.
-- **No real teardown.** `kill` never frees a dead process's memory (its
-  page-table frames, if it had its own address space, are simply
-  leaked -- consistent with this port having no frame-freeing path
-  anywhere yet, see `crate::memory`) or otherwise cleans up IPC state
-  (`caller_q` links, in particular, aren't unwound) beyond removing it
-  from the ready queues. Fine for a demo that only ever kills a lone,
+- **Teardown reclaims memory but not IPC state.** `kill` now does free
+  a dead process's address space (`memory::free_address_space`, after
+  moving `CR3` off it if the process died while current), so `flaky`'s
+  restart cycle no longer costs an address space per crash -- each round
+  hands nine frames back and the next restart reuses them. It still
+  doesn't unwind IPC state: `caller_q` links, in particular, are left as
+  they were beyond removing the process from the ready queues. Fine for a demo that only ever kills a lone,
   never-blocked-on-by-anyone-else ring-3 task; not fine for a real,
   general "any process can die at any time" story.
 - **A crash is only ever `ud2`.** `flaky`'s address space and stack page
@@ -1443,7 +1471,9 @@ eleven `[elf] rejected ...` lines from `elf::validator_self_test` (each
 naming a hostile image and the `ElfError` it earned) followed by
 `[elf] validator self-test: all 11 hostile images rejected` -- these come
 *after* the heap self-test, not at the very top, because the synthetic
-images are built in the heap -- an isolation
+images are built in the heap -- then `[memory] frame reclaim self-test:
+N frames in use before and N after five address-space build/teardown
+cycles`, an isolation
 self-test (the ring-3 demo's code page translates to `None` through the
 kernel's own page table -- it only exists in that task's private address
 space), the boot image table, the `pm`/`fs` demo tasks ping-ponging three
@@ -1548,4 +1578,15 @@ that from `proc 12` coming from a completely different program. If
 `shell` runs before `pm` has installed `/bin/echo`, you'll also see a
 few `-> fs error -2` (`ENOENT`) attempts a tick apart first: that's
 `user/shell.s`'s retry loop, not a failure. Finally `IDLE` reports that
-it's halting (with the accumulated tick count).
+it's halting. Just before that it reports the final frame accounting and
+re-runs three more address-space build/teardown cycles
+(`[idle] frames in use: N (free list M) -- unchanged after three more
+address-space cycles: N ...`) -- the same balance check the boot-time
+one makes, but at the end of a real workload, once `flaky`'s kills have
+actually put frames on the free list and `exec` has returned an image.
+Watch too for `[proc] reclaimed 9 frames from flaky (crash demo)` after
+each of its four crashes and `[proc] shell (exec demo) (proc_nr 12)
+replaced its address space, freed 11 frames of the old one`; both of
+those were permanent leaks until the allocator learned to take memory
+back. Finally `IDLE` reports it is halting (with the accumulated tick
+count).

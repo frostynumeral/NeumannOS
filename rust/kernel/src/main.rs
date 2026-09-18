@@ -117,6 +117,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // its validation that a working boot can't demonstrate. See
     // `elf::validator_self_test` for why this is here and not assumed.
     elf::validator_self_test();
+    // Self-test: the frame allocator can now take frames back, and a
+    // whole address space can be torn down without leaking. See
+    // `frame_reclaim_self_test`.
+    frame_reclaim_self_test();
     // Self-test: this is the actual proof of isolation, not just that
     // things still work. The demo pages were never mapped into *this*
     // (the kernel's own) page table -- only into `ring3_address_space` --
@@ -150,6 +154,62 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_println!("handing off to the scheduler");
     serial_println!();
     proc::start()
+}
+
+/// Proves physical memory is genuinely reclaimed, in the two shapes that
+/// matter: one frame at a time, and a whole address space at once.
+///
+/// Until now this port only ever handed frames out -- `exec` leaked the
+/// image it replaced, and a process killed by `rs` leaked everything it
+/// owned, so `flaky`'s three restarts cost three address spaces. "No
+/// leak" has no other observable signature in a kernel with no process
+/// accounting, so `memory::frame_stats` exists to make it assertable and
+/// this checks it directly: the counts have to come back to exactly
+/// where they started, and freed frames have to be the ones handed out
+/// again (a free list that silently dropped frames would keep the *first*
+/// check happy while still leaking).
+///
+/// Runs from `kernel_main` before any task exists, so nothing else is
+/// allocating concurrently and the numbers mean what they say.
+fn frame_reclaim_self_test() {
+    use x86_64::structures::paging::FrameAllocator;
+
+    let (baseline_in_use, _) = memory::frame_stats();
+
+    // One frame at a time, and reused in LIFO order.
+    let mut allocator = memory::GlobalFrameAllocator;
+    let first = allocator.allocate_frame().expect("out of frames in the self-test");
+    let second = allocator.allocate_frame().expect("out of frames in the self-test");
+    assert_eq!(memory::frame_stats().0, baseline_in_use + 2, "allocation isn't being counted");
+    unsafe {
+        memory::deallocate_frame(second);
+        memory::deallocate_frame(first);
+    }
+    assert_eq!(memory::frame_stats().0, baseline_in_use, "freed frames still counted as in use");
+    let reused = allocator.allocate_frame().expect("out of frames in the self-test");
+    assert_eq!(reused, first, "a freed frame should be handed out again before the bump cursor moves");
+    unsafe { memory::deallocate_frame(reused) };
+
+    // A whole address space, repeatedly. Five build-and-tear-down cycles
+    // of a real ELF image (the same one `shell` runs) have to leave the
+    // allocator exactly where they found it -- this is the `exec` loop
+    // that used to consume physical memory without bound.
+    let (before, _) = memory::frame_stats();
+    let kernel_pml4 = x86_64::registers::control::Cr3::read().0;
+    for _ in 0..5 {
+        let image = elf::load_image(kernel_pml4, elf::SHELL_ELF).expect("SHELL_ELF should load");
+        // Safety: just built here, never loaded into CR3, referenced by
+        // nothing else.
+        unsafe { memory::free_address_space(image.pml4, kernel_pml4) };
+    }
+    let (after, free_listed) = memory::frame_stats();
+    serial_println!(
+        "[memory] frame reclaim self-test: {} frames in use before and {} after five address-space build/teardown cycles ({} on the free list)",
+        before,
+        after,
+        free_listed
+    );
+    assert_eq!(after, before, "building and freeing an address space leaked {} frames", after - before);
 }
 
 /// Spawn the kernel tasks. `IDLE` and `CLOCK` are real kernel tasks, same
@@ -251,6 +311,7 @@ fn idle_task() -> ! {
     vircopy_error_from_ring3_verify();
     fork_child_verify();
     exec_verify();
+    runtime_reclaim_check();
     serial_println!("[idle] no other task is ready, halting (uptime: {} ticks)", proc::uptime_ticks());
     halt_loop()
 }
@@ -512,6 +573,37 @@ fn exec_verify() {
         matches!(stale, Err(memory::CopyError::SrcNotMapped)),
         "shell's pre-exec .data page is still mapped after exec -- the old image wasn't replaced, only added to"
     );
+}
+
+/// The boot-time `frame_reclaim_self_test` runs in an empty system;
+/// this runs the same build-and-tear-down cycle at the *end* of a real
+/// workload -- after four `flaky` crash/kill/restart rounds, a real
+/// `exec`, a `fork`, and every demo task's allocations -- and requires
+/// the allocator to still balance. A reclaim bug that only appeared once
+/// frames had actually been recycled (which is the interesting case:
+/// `flaky`'s kills are what first put frames on the free list) would
+/// show up here and not there.
+///
+/// Also reports the final accounting, which is the one number that says
+/// whether this port still leaks: before this change every one of
+/// `flaky`'s restarts cost an address space permanently.
+fn runtime_reclaim_check() {
+    let (before, free_before) = memory::frame_stats();
+    let kernel_pml4 = x86_64::registers::control::Cr3::read().0;
+    for _ in 0..3 {
+        let image = elf::load_image(kernel_pml4, elf::SHELL_ELF).expect("SHELL_ELF should load");
+        // Safety: built here, never loaded into CR3, referenced by nothing.
+        unsafe { memory::free_address_space(image.pml4, kernel_pml4) };
+    }
+    let (after, free_after) = memory::frame_stats();
+    serial_println!(
+        "[idle] frames in use: {} (free list {}) -- unchanged after three more address-space cycles: {} (free list {})",
+        before,
+        free_before,
+        after,
+        free_after
+    );
+    assert_eq!(after, before, "address-space teardown leaks once frames are being recycled");
 }
 
 /// Read `path`, waiting until it both exists *and* has content. `fs`

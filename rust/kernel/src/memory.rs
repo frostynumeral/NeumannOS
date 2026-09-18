@@ -22,7 +22,8 @@
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
 use spin::Mutex;
 use x86_64::structures::paging::{
-    FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB, Translate,
+    FrameAllocator, FrameDeallocator, OffsetPageTable, PageTable, PageTableFlags, PhysFrame,
+    Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -65,6 +66,41 @@ unsafe impl FrameAllocator<Size4KiB> for GlobalFrameAllocator {
             .expect("global frame allocator used before init_frame_allocator")
             .allocate_frame()
     }
+}
+
+impl FrameDeallocator<Size4KiB> for GlobalFrameAllocator {
+    /// # Safety
+    /// `frame` must be a frame this allocator handed out, no longer
+    /// mapped in any address space and not referenced by any page table.
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame) {
+        FRAME_ALLOCATOR
+            .lock()
+            .as_mut()
+            .expect("global frame allocator used before init_frame_allocator")
+            .deallocate_frame(frame)
+    }
+}
+
+/// Give `frame` back to the allocator. Free function rather than only the
+/// `FrameDeallocator` impl, since most callers here (`free_address_space`)
+/// have a bare frame rather than a `&mut impl FrameDeallocator`.
+///
+/// # Safety
+/// Same as the trait method: the frame must be one this allocator handed
+/// out, currently unmapped everywhere. Freeing a frame twice, or one
+/// still reachable through some page table, corrupts unrelated memory.
+pub unsafe fn deallocate_frame(frame: PhysFrame) {
+    GlobalFrameAllocator.deallocate_frame(frame)
+}
+
+/// `(frames currently handed out, frames sitting on the free list)`.
+/// Exists so a self-test can assert that a sequence of allocate-and-free
+/// operations actually balances -- "no leak" is not observable any other
+/// way in a kernel with no process accounting.
+pub fn frame_stats() -> (usize, usize) {
+    let guard = FRAME_ALLOCATOR.lock();
+    let allocator = guard.as_ref().expect("frame allocator used before init_frame_allocator");
+    (allocator.in_use, allocator.free_count)
 }
 
 /// Build an `OffsetPageTable` over the page table the bootloader already
@@ -269,6 +305,87 @@ unsafe fn fork_one_page(pml4_frame: PhysFrame, addr: VirtAddr, offset: VirtAddr)
     leaf.set_frame(fresh_data_frame, leaf.flags());
 }
 
+/// Give back every frame that belongs to the address space rooted at
+/// `pml4` -- its user pages, the page-table levels that lead to them,
+/// and finally the top-level table itself -- and return how many frames
+/// that was.
+///
+/// "Belongs to" is decided by the same rule that makes a mapping private
+/// in the first place (`pml4_slots_unused`): a PML4 slot used here but
+/// *unused in `base_pml4`* was created by and for this address space, so
+/// everything under it is ours to free. A slot the base also uses is
+/// shared -- the kernel image, the heap, the physical-memory window --
+/// and its lower-level tables are the *kernel's*, so walking into it
+/// would hand the kernel's own page tables back to the allocator. That
+/// asymmetry is the whole difficulty of freeing an address space in this
+/// port, and it is why this takes `base_pml4` rather than working it out
+/// alone.
+///
+/// This is what the old "every `exec` leaks the image it replaces, and
+/// `kill` never reclaims a dead process" simplification was waiting on.
+///
+/// # Safety
+/// `pml4` must not be loaded in `CR3` on any CPU, and nothing may reach
+/// its pages afterward. Callers switch `CR3` away first
+/// (`crate::proc::set_address_space`, `crate::proc::kill`).
+pub unsafe fn free_address_space(pml4: PhysFrame, base_pml4: PhysFrame) -> usize {
+    let offset = physical_memory_offset();
+    let table: &PageTable = &*((offset + pml4.start_address().as_u64()).as_ptr());
+    let base: &PageTable = &*((offset + base_pml4.start_address().as_u64()).as_ptr());
+
+    let mut freed = 0;
+    for i in 0..512 {
+        if table[i].is_unused() || !base[i].is_unused() {
+            continue; // empty, or shared with the base address space
+        }
+        if let Ok(frame) = table[i].frame() {
+            freed += free_table(frame, 3);
+        }
+    }
+    deallocate_frame(pml4);
+    freed + 1
+}
+
+/// Free one page-table frame and everything below it. `level` counts
+/// down: 3 = PDPT, 2 = PD, 1 = PT, whose entries are leaf pages.
+///
+/// # Safety
+/// `table_frame` must be a page-table frame private to the address space
+/// being torn down (see `free_address_space`), reachable through the
+/// physical-memory window and referenced by nothing else.
+unsafe fn free_table(table_frame: PhysFrame, level: u8) -> usize {
+    let offset = physical_memory_offset();
+    let table: &PageTable = &*((offset + table_frame.start_address().as_u64()).as_ptr());
+
+    let mut freed = 0;
+    for i in 0..512 {
+        let entry = &table[i];
+        if entry.is_unused() {
+            continue;
+        }
+        // A huge-page entry is a leaf mapping of 2 MiB or 1 GiB, not a
+        // pointer to a table. Nothing in a private address space maps
+        // one today (every mapping here goes through 4 KiB `map_to`), and
+        // freeing a large region as though it were one 4 KiB frame would
+        // be actively wrong -- so skip it rather than guess.
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            continue;
+        }
+        let frame = match entry.frame() {
+            Ok(frame) => frame,
+            Err(_) => continue,
+        };
+        if level > 1 {
+            freed += free_table(frame, level - 1);
+        } else {
+            deallocate_frame(frame); // a leaf: one of the process's own pages
+            freed += 1;
+        }
+    }
+    deallocate_frame(table_frame);
+    freed + 1
+}
+
 /// Build a *read-only-in-spirit* `OffsetPageTable` over `pml4_frame`,
 /// whether or not it's the currently-active one. Used to translate a
 /// virtual address in some *other* process's address space without
@@ -347,7 +464,25 @@ pub enum CopyError {
 /// segment-granular.
 pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryMap,
+    /// How far the bump cursor has advanced into `usable_frames()`. Only
+    /// moves forward; frames that come back are reused from `free_list`
+    /// instead.
     next: usize,
+    /// Head of a free list threaded *through the free frames themselves*
+    /// -- each one's first eight bytes hold the physical address of the
+    /// next, or zero at the end.
+    ///
+    /// Storing the list inside the frames rather than in a `Vec` is not
+    /// a micro-optimization: `crate::allocator::init_heap` allocates
+    /// frames to map the heap, so anything the allocator needs has to
+    /// work before a heap exists. A free frame is by definition memory
+    /// nothing else is using, which makes it exactly the right place to
+    /// keep the bookkeeping.
+    free_list: Option<PhysFrame>,
+    /// Frames handed out and not yet returned, and the length of
+    /// `free_list` -- see `frame_stats`.
+    in_use: usize,
+    free_count: usize,
 }
 
 impl BootInfoFrameAllocator {
@@ -355,7 +490,7 @@ impl BootInfoFrameAllocator {
     /// The caller must guarantee `memory_map` is valid and that every
     /// frame it marks `Usable` really is unused.
     pub unsafe fn init(memory_map: &'static MemoryMap) -> Self {
-        BootInfoFrameAllocator { memory_map, next: 0 }
+        BootInfoFrameAllocator { memory_map, next: 0, free_list: None, in_use: 0, free_count: 0 }
     }
 
     fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
@@ -365,12 +500,74 @@ impl BootInfoFrameAllocator {
         let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
         frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
+
+    /// The `u64` inside `frame` that holds the next free-list link.
+    fn link_of(frame: PhysFrame) -> *mut u64 {
+        (physical_memory_offset() + frame.start_address().as_u64()).as_mut_ptr()
+    }
+
+    /// Wipe a frame before handing it out.
+    ///
+    /// This became necessary the moment frames started being reused. A
+    /// bump allocator only ever returns memory nobody has touched; a
+    /// recycling one returns memory that belonged to some *other
+    /// process* moments ago -- `flaky`'s stack, the image `exec` just
+    /// discarded -- and several callers map a fresh frame without
+    /// writing all of it (`crate::elf`'s stack page,
+    /// `crate::usermode`'s code page beyond `code.len()`). Left alone,
+    /// a new ring-3 task would start life able to read a dead one's
+    /// memory. Zeroing here rather than at those call sites makes it an
+    /// invariant of the allocator instead of a rule every future caller
+    /// has to remember -- and it also erases this allocator's own
+    /// free-list link, which would otherwise be the first eight bytes
+    /// of every recycled page.
+    fn zero(frame: PhysFrame) {
+        let ptr: *mut u8 = (physical_memory_offset() + frame.start_address().as_u64()).as_mut_ptr();
+        // Safety: the frame is owned by this allocator and about to be
+        // handed to a caller; nothing else refers to it.
+        unsafe { core::ptr::write_bytes(ptr, 0, 4096) };
+    }
+
+    /// # Safety
+    /// See `deallocate_frame` in this module.
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame) {
+        let next = self.free_list.map_or(0, |f| f.start_address().as_u64());
+        Self::link_of(frame).write(next);
+        self.free_list = Some(frame);
+        self.free_count += 1;
+        self.in_use = self.in_use.saturating_sub(1);
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        // Reuse before bumping, so a workload that frees as much as it
+        // allocates (every `exec`, every `rs` restart) runs forever in a
+        // fixed footprint instead of marching through physical memory.
+        // It also keeps `usable_frames().nth()` -- which is O(n) in the
+        // cursor -- from being walked again for a frame already known.
+        if let Some(frame) = self.free_list {
+            // Safety: the frame is on the free list, so nothing else
+            // holds it, and its first eight bytes are the link this
+            // allocator wrote in `deallocate_frame`.
+            let next = unsafe { Self::link_of(frame).read() };
+            self.free_list = if next == 0 {
+                None
+            } else {
+                Some(PhysFrame::containing_address(PhysAddr::new(next)))
+            };
+            self.free_count -= 1;
+            self.in_use += 1;
+            Self::zero(frame);
+            return Some(frame);
+        }
+
         let frame = self.usable_frames().nth(self.next);
-        self.next += 1;
+        if let Some(frame) = frame {
+            self.next += 1;
+            self.in_use += 1;
+            Self::zero(frame);
+        }
         frame
     }
 }

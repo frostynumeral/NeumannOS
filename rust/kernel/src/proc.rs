@@ -767,7 +767,7 @@ pub fn uptime_ticks() -> u64 {
 /// is left alone rather than notifying `RS` twice.
 pub fn kill(proc_nr: i32, reason: &str) {
     let idx = com::slot(proc_nr);
-    let name = with_scheduler(|sched| {
+    let dying = with_scheduler(|sched| {
         if sched.procs[idx].rts_flags & rts::DEAD != 0 {
             return None;
         }
@@ -775,14 +775,38 @@ pub fn kill(proc_nr: i32, reason: &str) {
             sched.dequeue(idx); // already repicks if idx was current/next_ptr
         }
         sched.procs[idx].rts_flags |= rts::DEAD;
-        if sched.current == idx {
+        let was_current = sched.current == idx;
+        if was_current {
             sched.pick_proc();
         }
         sched.try_deliver_notification(com::slot(com::RS_PROC_NR), com::KERNEL, com::proc_died(proc_nr));
-        Some(sched.procs[idx].name)
+        // Detach the address space here, under the lock, so nothing can
+        // observe a dead slot still pointing at memory that is about to
+        // be handed back.
+        let address_space = sched.procs[idx].cr3.take();
+        Some((sched.procs[idx].name, address_space, was_current, sched.kernel_cr3))
     });
-    if let Some(name) = name {
-        crate::serial_println!("[proc] {} (proc_nr {}) killed: {}", name, proc_nr, reason);
+
+    let (name, address_space, was_current, kernel_cr3) = match dying {
+        Some(dying) => dying,
+        None => return,
+    };
+    crate::serial_println!("[proc] {} (proc_nr {}) killed: {}", name, proc_nr, reason);
+
+    if let Some(address_space) = address_space {
+        // If the process that just died is the one whose page tables are
+        // currently loaded -- the usual case, since `kill` is called from
+        // the CPU exception its own code raised -- `CR3` has to move off
+        // them before they can be freed. The kernel's own address space
+        // is always a safe place to stand: this code, this stack and the
+        // physical-memory window are mapped there identically.
+        if was_current {
+            unsafe { Cr3::write(kernel_cr3.0, kernel_cr3.1) };
+        }
+        // Safety: detached from the process table above and no longer in
+        // `CR3`.
+        let freed = unsafe { crate::memory::free_address_space(address_space, kernel_cr3.0) };
+        crate::serial_println!("[proc] reclaimed {} frames from {} (proc_nr {})", freed, name, proc_nr);
     }
 }
 
@@ -821,26 +845,40 @@ pub fn kernel_cr3() -> PhysFrame {
 /// across the update so a timer tick can't land between the table write
 /// and the `CR3` load and switch away with the two disagreeing.
 ///
-/// The address space being replaced is *not* freed. Its frames (the
-/// PML4, the lower-level tables that were private to it, and every page
-/// the old image's segments and stack occupied) leak, because this port
-/// has no frame deallocator at all -- `crate::memory`'s allocator only
-/// ever hands frames out (see "known simplifications" in
-/// `rust/README.md`). Real `exec` reclaims the old image's memory; this
-/// one only stops referencing it.
+/// The address space being replaced *is* freed
+/// (`memory::free_address_space`), which is only safe in this order:
+/// the new `CR3` is loaded first, so by the time the old tables are
+/// handed back nothing is running on them. Freeing is deliberately not
+/// done while the scheduler lock is held -- the walk touches hundreds of
+/// frames -- and the old space is unreachable from the process table by
+/// then, so nothing can pick it up in between.
 pub fn set_address_space(proc_nr: i32, address_space: PhysFrame) {
     let idx = com::slot(proc_nr);
     let interrupts_were_enabled = are_enabled();
     disable();
-    let load_now = with_scheduler(|sched| {
+    let (previous, load_now, kernel_pml4) = with_scheduler(|sched| {
+        let previous = sched.procs[idx].cr3;
         sched.procs[idx].cr3 = Some(address_space);
-        (sched.current == idx).then_some(sched.kernel_cr3.1)
+        (previous, (sched.current == idx).then_some(sched.kernel_cr3.1), sched.kernel_cr3.0)
     });
     if let Some(flags) = load_now {
         unsafe { Cr3::write(address_space, flags) };
     }
     if interrupts_were_enabled {
         enable();
+    }
+
+    if let Some(previous) = previous {
+        // Safety: `previous` is no longer in `CR3` (replaced just above
+        // if this process was current, never loaded otherwise) and no
+        // longer reachable from the process table.
+        let freed = unsafe { crate::memory::free_address_space(previous, kernel_pml4) };
+        crate::serial_println!(
+            "[proc] {} (proc_nr {}) replaced its address space, freed {} frames of the old one",
+            with_scheduler(|sched| sched.procs[idx].name),
+            proc_nr,
+            freed
+        );
     }
 }
 
