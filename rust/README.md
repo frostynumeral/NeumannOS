@@ -119,6 +119,34 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `RS` (`crate::rs`). Called from `crate::interrupts` when a ring-3 task
   takes a CPU exception; this port's stand-in for real MINIX turning a
   user-process fault into a signal and `PM` reporting the exit to `RS`.
+  `kill` is now one of *two* ways a process stops existing, sharing
+  `Scheduler::terminate` with the other: `exit_now`, reached from ring 3
+  through `crate::syscall`'s `SYS_EXIT`, where the process asked. Ported
+  in spirit from `servers/pm/forkexit.c`'s `do_exit`, which real MINIX
+  likewise reaches either from an `exit()` call or from the kernel's
+  `SYS_SIG` notification about a fatal signal. `terminate` takes the
+  slot off every queue, detaches its address space and memory map, and
+  then decides what happens to the exit *status*, which is the part that
+  needs a policy: a parent already blocked in `wait_for_child` gets it
+  handed over directly and is woken (no zombie ever exists); a live
+  parent that isn't waiting yet leaves the slot a zombie
+  (`rts::ZOMBIE`, `mp_flags & ZOMBIE`) holding the status, keeping the
+  process number allocated for exactly as long as that takes -- which is
+  what a zombie *is*; and no live parent frees the slot outright, since
+  nothing can ever collect a status nobody is related to.
+  `wait_for_child` (`do_waitpid`) is the collecting side: it blocks in
+  `rts::WAITING` until a child terminates, or picks up a zombie that
+  terminated earlier and releases its slot. That release is the only
+  thing in this port that ever reclaims a dynamic process number --
+  before it, `alloc_proc_nr`'s pool drained monotonically. A process
+  with no children at all is told so rather than blocked forever
+  (POSIX's `ECHILD`). `exit_now` keeps interrupts off from the
+  scheduler-lock section through its final `reschedule()`, which is
+  load-bearing rather than tidy: `terminate` can have released this very
+  slot, and `switch_to` has not yet written the dead task's stack
+  pointer into it, so a timer tick switching to a task that forks could
+  otherwise be handed this number and have its brand-new process's `rsp`
+  overwritten.
   Two of `struct proc`'s neighbours from `servers/pm/mproc.h` live here
   too, since `fork` is a kernel call in this port and the kernel is
   therefore who needs them: `Proc::mem_map` (`mp_seg[]`, which pages this
@@ -317,7 +345,7 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   CPU didn't already save, calls `dispatch` with the caller's original
   `rax`/`rdi`/`rsi`/`rdx`/`rcx`, writes the `u64` result back into the
   saved `rax` slot, restores everything else unchanged, and `iretq`s.
-  `dispatch` implements ten calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  `dispatch` implements fourteen calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
@@ -378,10 +406,25 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   the file is, and refuses outright -- `ERR_EXEC_NOT_RING3` -- if the
   caller's saved `CS` says it wasn't in ring 3, since exec'ing a kernel
   task would swap its address space out from under it and `iretq` it into
-  a ring-3 entry point with a kernel `CS`), and `SYS_BLOCK_FOREVER` (calls
+  a ring-3 entry point with a kernel `CS`), `SYS_EXIT`/`SYS_WAIT` (the
+  end of a process's life, and the only pair here where one call's
+  *absence* of a return is the point: `SYS_EXIT` reaches
+  `proc::exit_now`, which never comes back, because the process the
+  `iretq` would have returned to has stopped existing by then;
+  `SYS_WAIT` blocks in `proc::wait_for_child` until one of the caller's
+  children terminates, then returns that child's `proc_nr` and writes
+  its status through a caller-supplied pointer -- written directly,
+  unlike `SYS_READ_LINE`'s, because no other task ever touches it: the
+  status comes back through the process table, and by the time it is
+  written this task is running again with its own `CR3`. Both refuse a
+  non-ring-3 caller -- `ERR_NOT_RING3` -- for the same reason `SYS_EXEC`
+  does, and more sharply: `exit` would tear a *kernel* task's slot down
+  from under it mid-trap), and `SYS_BLOCK_FOREVER` (calls
   `ipc::receive(ANY)` directly from inside the trap, never returning --
   the same "nothing sends to this
-  proc again" pattern every other demo task in `main.rs` ends with).
+  proc again" pattern the demo tasks that have to stay readable
+  afterwards end with, `SYS_EXIT` being what a process that is simply
+  *done* now uses instead).
 - `src/proc.rs`'s `reschedule`/`start` call `gdt::set_rsp0` *and* switch
   `CR3` on every switch, pointing both at whichever task just became
   current: `RSP0` at that task's own dedicated kernel stack (the same one
@@ -863,13 +906,14 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Twelve calls exist**, and all but the unrecognized-call-number
+- **Fourteen calls exist**, and all but the unrecognized-call-number
   fallback reach real server/kernel-call logic, including `SYS_FORK`
   from any ring-3 caller now (see the `src/syscall.rs`/`src/proc.rs`
   bullets above). Real enough to
   write a genuine ring-3 program against (a demo user program can now get
   the time, print, sleep, do real file I/O, block for real keyboard
-  input, read another process's memory, and fork itself), but still a
+  input, read another process's memory, fork itself, replace its own
+  image, terminate with a status, and collect a child's), but still a
   hand-picked set proving the dispatch mechanism works, not a real
   syscall surface.
 - **Five arguments, not a full calling convention.** `rdi`/`rsi`/`rdx`/
@@ -961,12 +1005,18 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   sharing version was unsound rather than merely clever), and
   copy-on-write for the writable ones needs the same plus a `#PF`
   handler that resolves faults instead of reporting them. There's also
-  no `wait()`/exit-status side to it at all: `Proc::parent` records who
-  forked whom, but nothing can be waited for, and a dynamic process
-  number is never reclaimed once a child blocks forever, so the pool
-  (`com::NR_DYNAMIC_PROCS`, four) drains monotonically -- generous
-  against the three processes that fork today, and not a real process
-  lifecycle.
+  a real process *lifecycle* beyond fork/exit/wait: there is no process
+  group, session, or controlling terminal; no signals, so no way to ask
+  another process to stop (only `kill`, which the kernel does to a
+  process that faulted, not something anyone can request); no `waitpid`,
+  so a parent can only wait for *some* child rather than a named one,
+  and can't poll (`WNOHANG`); and an orphan is not reparented to `init`
+  the way a real system does it -- `terminate` frees the slot of a
+  process whose parent is already gone, on the grounds that nothing can
+  ever collect its status, which is the right outcome but by a different
+  route. A process blocked trying to `send` to one that then terminates
+  stays blocked forever, too, where MINIX would fail it with
+  `EDEADSRCDST`; nothing in this port sends to a process that exits.
 - **`sys_vircopy` skips validation** real MINIX's `do_copy` does first:
   resolving `SELF` to the caller's own process number, and rejecting
   invalid process numbers. Every current caller already knows both real
@@ -1301,8 +1351,12 @@ Roughly in the order the original kernel needs them:
    own independent `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
    `IDLE`). See "known simplifications" above for what's not implemented
    yet (`sys_umap`, more of `kernel/system/do_*.c`, and `fork`'s missing
-   other halves -- copy-on-write, and a `wait()`/exit-status side that
-   would let a dynamic process number ever be reclaimed). Which pages a
+   other half, copy-on-write). `exit`/`wait` are real now too
+   (`proc::exit_now`/`wait_for_child`, `crate::syscall`'s
+   `SYS_EXIT`/`SYS_WAIT`, ported in spirit from
+   `servers/pm/forkexit.c`), which is what finally makes a dynamic
+   process number reclaimable: collecting a child's status is what
+   releases its slot. Which pages a
    fork copies and which process number its child gets are no longer
    hardcoded per caller, though: both come from real bookkeeping now
    (`crate::memory::MemMap` in `Proc::mem_map`, and
@@ -1365,10 +1419,17 @@ Roughly in the order the original kernel needs them:
     handed out when the fork happens rather than reserved per caller in
     `crate::com` (`proc::alloc_proc_nr`) -- so `SYS_FORK` is now
     something any ring-3 process can call, as many times as there are
-    slots, instead of something one hardcoded task could do once. Still
+    slots, instead of something one hardcoded task could do once. The
+    rest of the cycle is there as well: `shell`'s other two children
+    `SYS_EXIT` with statuses of their own and `shell` collects both with
+    `SYS_WAIT` -- one handed over directly because the parent was
+    already blocked waiting, the other collected out of a zombie slot it
+    had been sitting in since it terminated. That is the whole
+    fork/exec/exit/wait cycle a real program launch is made of, running
+    in ring 3. Still
     missing: `argv`/`envp` (see "known simplifications in `exec()`"
-    above), copy-on-write and a `wait()`/exit-status side to `fork` (see
-    "known simplifications in the kernel calls"), and `fs`
+    above), copy-on-write (see "known simplifications in the kernel
+    calls"), and `fs`
     growing `readdir` and a real backing store (see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
     file/directory table. Ring-3 callers can now reach `fs` for real
@@ -1422,7 +1483,7 @@ Roughly in the order the original kernel needs them:
     gate saves every general-purpose register, reads the caller's `rax`
     (call number) and `rdi`/`rsi`/`rdx`/`rcx` (up to four arguments, since
     grown from three -- see the `src/syscall.rs` bullet above),
-    dispatches to one of twelve calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    dispatches to one of fourteen calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
     -- a real cross-ring pointer argument, read directly since entering a
     trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
     the first of `crate::calls`' own kernel calls reachable from ring 3,
@@ -1469,7 +1530,7 @@ Roughly in the order the original kernel needs them:
     child's canary write (proving its memory is a real, independent copy)
     and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
     `IDLE`. See "known simplifications in the syscall ABI" above for what's
-    not a real syscall surface yet (twelve calls, one code per *kind* of
+    not a real syscall surface yet (fourteen calls, one code per *kind* of
     dispatch-level mistake rather than a real per-cause `errno` set).
     `SYS_FORK` is no longer restricted to one known caller with one
     reserved child slot: the pages to copy come out of the caller's own
@@ -1649,7 +1710,7 @@ running other tasks when it showed up), `memory`'s demo task spinning
 through many quanta purely because the timer forces it to keep yielding
 and resuming (asynchronous preemption -- watch its counter resume from
 exactly where it left off every time), and finally, once everything else
-has blocked, `IDLE` running sixteen independent checks against processes
+has blocked, `IDLE` running twenty independent checks against processes
 that have long since gone quiet: `sys_vircopy`-ing `tty`'s `.data` counter
 back out and confirming it reads `5` (proving the loaded ELF binary's own
 code genuinely ran, not just that it trapped the right number of times --
@@ -1696,13 +1757,29 @@ strongest single line in the boot: the child had that page a moment
 ago -- it inherited a copy from the fork -- and `exec` freed 11 frames
 of that inherited image, so `shell`'s own copy still reading
 `0xfeedface` afterwards is also direct evidence that teardown didn't
-reach into the parent. Before all of that, watch `shell`
+reach into the parent. Then the other end of a process's life:
+`/from_exited_child.txt` (written by a forked child that then
+terminated with `SYS_EXIT`) and the two `(proc_nr, status)` pairs
+`shell` collected with `SYS_WAIT`, in `/shell_wait1.bin` and
+`/shell_wait2.bin`, which have to read `42` and `7`. Both children get
+the *same* process number, which is the point: collecting a status is
+what releases a slot, so the second fork gets the first child's number
+back. Watch for the two different collection paths in the log --
+`[proc] proc_nr 11 collected child proc_nr 13 (status 42) handed over
+directly -- it was still blocked here when the child exited` for the
+first, and `... (status 7) out of a zombie slot, which is now free
+again` for the second, which `shell` deliberately lets terminate before
+asking for it. Before all of that, watch `shell`
 (`proc_nr` 11) announce itself, fail an exec on purpose
 (`[syscall] proc 11: SYS_EXEC("/not_a_program") -> bad image: NotElf`),
 carry on regardless, and then fork
-(`[syscall] proc 11: SYS_FORK -> child proc_nr 12`) and go quiet with
+(`[syscall] proc 11: SYS_FORK -> child proc_nr 12`), then fork twice
+more and wait for each of those in turn
+(`[syscall] proc 13: SYS_EXIT(42)` from a child, then
+`[syscall] proc 11: SYS_WAIT -> child proc_nr 13 terminated with
+status 42` from the parent), and finally go quiet with
 `shell: forked -- my child is becoming /bin/echo, and I am still shell`,
-while its child stops being that program entirely
+while its first child stops being that program entirely
 (`[syscall] proc 12: SYS_EXEC("/bin/echo") -> replaced its own image,
 entering at 0x666666660000 on a fresh stack`), with every line after
 that from `proc 12` coming from a completely different program. If
@@ -1710,10 +1787,14 @@ the child runs before `pm` has installed `/bin/echo`, you'll also see a
 few `-> fs error -2` (`ENOENT`) attempts a tick apart first: that's
 `user/shell.s`'s retry loop, not a failure. `IDLE` then exercises the
 dynamic process-number pool's own two edges, which no successful boot
-reaches on its own (`[idle] process-number pool: claimed the 2 remaining
-dynamic slot(s) ([14, 15]), then it correctly refused`): it claims every
-number left until the pool refuses, hands them all back, and checks the
-first one comes out again. Finally `IDLE` reports that
+reaches on its own (`[idle] process-number pool: claimed the 4 remaining
+dynamic slot(s) ([13, 15, 16, 17]), then it correctly refused`): it
+claims every number left until the pool refuses, hands them all back,
+and checks the first one comes out again. It also asks
+`proc::wait_for_child` for a child it doesn't have, which has to come
+back `None` (POSIX `ECHILD`) rather than block -- a case no ring-3
+program here reaches, and one that would hang the whole system rather
+than fail quietly if it were wrong. Finally `IDLE` reports that
 it's halting. Just before that it reports the final frame accounting and
 re-runs three more address-space build/teardown cycles
 (`[idle] frames in use: N (free list M) -- unchanged after three more

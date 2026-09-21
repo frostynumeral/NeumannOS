@@ -82,6 +82,18 @@ pub mod rts {
     /// step (no memory to free -- see `crate::rs`), so `DEAD` just marks
     /// "never schedule this slot again" until it's respawned.
     pub const DEAD: u8 = 0x10;
+    /// Exited (or was killed) and still holds an uncollected exit
+    /// status: a zombie, `mp_flags & ZOMBIE` in `servers/pm/mproc.h`.
+    /// The slot -- and so the process number -- stays allocated until a
+    /// parent collects the status (`crate::proc::wait_for_child`), which
+    /// is the whole reason zombies exist: the status has to outlive the
+    /// process it describes.
+    pub const ZOMBIE: u8 = 0x40;
+    /// Blocked in `crate::proc::wait_for_child` until one of this
+    /// process's children terminates. `mp_flags & WAITING` in
+    /// `servers/pm/mproc.h`; a distinct state from `RECEIVING` because
+    /// what wakes it is a child exiting, not a message arriving.
+    pub const WAITING: u8 = 0x80;
     /// Claimed by `crate::proc::alloc_proc_nr` but not yet filled in by
     /// the `spawn`/`fork_current` that asked for it: not free (so a
     /// second allocation skips it) and not runnable (so the scheduler
@@ -174,6 +186,17 @@ pub struct Proc {
     /// its parent is (`child_of`), rather than needing its number
     /// hardcoded somewhere.
     parent: i32,
+    /// The status this process terminated with, while nobody has
+    /// collected it yet -- `mp_exitstatus` in `servers/pm/mproc.h`, and
+    /// the payload a zombie slot (`rts::ZOMBIE`) exists to hold.
+    exit_status: Option<i32>,
+    /// A terminated child's `(proc_nr, status)`, handed to this process
+    /// by the child itself (`Scheduler::terminate`) because this process
+    /// was already blocked in `wait_for_child` when it happened. The
+    /// counterpart of `messbuf` for `wait` rather than IPC: the child
+    /// writes the answer where the waiter will look for it, then wakes
+    /// it, so no zombie needs to exist in this (much more common) case.
+    wait_result: Option<(i32, i32)>,
     /// The tick (`Scheduler::ticks`) at which this task's watchdog alarm
     /// (`sys_setalarm`, `crate::calls`) should fire, if one is pending.
     /// Analogous to `kernel/clock.c`'s per-process alarm timer, minus the
@@ -212,6 +235,8 @@ impl Proc {
             cr3: None,
             mem_map: MemMap::EMPTY,
             parent: com::NONE,
+            exit_status: None,
+            wait_result: None,
             alarm: None,
         }
     }
@@ -354,6 +379,82 @@ impl Scheduler {
         self.procs[idx].cr3.map_or(self.kernel_cr3, |frame| (frame, self.kernel_cr3.1))
     }
 
+    /// Hand a process-table slot back: it holds no process, and
+    /// `alloc_proc_nr` may give its number to a new one. Wholesale
+    /// rather than field-by-field, so a slot can never be half-freed --
+    /// `spawn`/`fork_current` overwrite every field anyway when they
+    /// fill one in.
+    fn free_slot(&mut self, idx: usize) {
+        self.procs[idx] = Proc::empty();
+    }
+
+    /// The bookkeeping shared by the two ways a process stops existing:
+    /// `exit_now` (it asked to) and `kill` (it faulted). Ported in
+    /// spirit from `servers/pm/forkexit.c`'s `do_exit`, which is also
+    /// where the exit/crash distinction lives in real MINIX -- there PM
+    /// reaches this path either from an `exit()` call or from the
+    /// kernel's `SYS_SIG` notification about a fatal signal.
+    ///
+    /// Takes the slot off every ready queue, detaches its address space
+    /// and memory map, and then decides what happens to the *status*,
+    /// which is the part that actually needs a policy:
+    ///
+    /// - A parent already blocked in `wait_for_child` gets the status
+    ///   handed straight to it and is woken; the slot is freed outright,
+    ///   so no zombie is created at all. This is the common case, and
+    ///   the reason `wait_result` exists.
+    /// - A live parent that isn't waiting yet leaves the slot a zombie
+    ///   (`rts::ZOMBIE`) holding the status until it is collected. The
+    ///   process number stays allocated for exactly as long as that
+    ///   takes, which is what a zombie *is*.
+    /// - No live parent (a member of the fixed system image, or an
+    ///   orphan) frees the slot immediately: nothing can ever collect a
+    ///   status nobody is related to, and keeping the slot would leak a
+    ///   process number for good.
+    ///
+    /// Returns the address space to reclaim, which the caller has to do
+    /// outside the scheduler lock (and, if the dying process is the
+    /// running one, after moving `CR3` off it).
+    fn terminate(&mut self, idx: usize, status: i32, crashed: bool) -> Option<PhysFrame> {
+        if self.procs[idx].rts_flags == 0 {
+            self.dequeue(idx); // already repicks if idx was current/next_ptr
+        }
+        if crashed {
+            self.procs[idx].rts_flags |= rts::DEAD;
+        }
+        if self.current == idx {
+            self.pick_proc();
+        }
+        // Detached here, under the lock, so nothing can observe a
+        // terminated slot still pointing at memory that is about to be
+        // handed back.
+        let address_space = self.procs[idx].cr3.take();
+        self.procs[idx].mem_map = MemMap::EMPTY;
+
+        let proc_nr = self.procs[idx].proc_nr;
+        let live_parent = Some(self.procs[idx].parent)
+            .filter(|&parent| parent != com::NONE)
+            .map(com::slot)
+            .filter(|&parent| self.procs[parent].rts_flags & rts::SLOT_FREE == 0);
+
+        match live_parent {
+            Some(parent) if self.procs[parent].rts_flags & rts::WAITING != 0 => {
+                self.procs[parent].wait_result = Some((proc_nr, status));
+                self.procs[parent].rts_flags &= !rts::WAITING;
+                if self.procs[parent].rts_flags == 0 {
+                    self.enqueue(parent);
+                }
+                self.free_slot(idx);
+            }
+            Some(_) => {
+                self.procs[idx].exit_status = Some(status);
+                self.procs[idx].rts_flags |= rts::ZOMBIE;
+            }
+            None => self.free_slot(idx),
+        }
+        address_space
+    }
+
     /// Deliver a notification (`m_type`, appearing to come from
     /// `src_proc_nr`) to `dst_idx` if it's currently blocked in
     /// `mini_receive` waiting for one; returns whether it was delivered.
@@ -470,6 +571,8 @@ pub fn spawn(
             cr3: address_space.map(|space| space.pml4),
             mem_map: address_space.map_or(MemMap::EMPTY, |space| space.map),
             parent: com::NONE,
+            exit_status: None,
+            wait_result: None,
             alarm: None,
         };
         sched.enqueue(idx);
@@ -709,6 +812,8 @@ pub fn fork_current(
             cr3: Some(address_space.pml4),
             mem_map: address_space.map,
             parent: parent_proc_nr,
+            exit_status: None,
+            wait_result: None,
             alarm: None,
         };
         sched.enqueue(idx);
@@ -879,41 +984,162 @@ pub fn uptime_ticks() -> u64 {
     with_scheduler(|sched| sched.ticks)
 }
 
-/// Permanently stop scheduling `proc_nr`: dequeue it (if it was ready) and
-/// mark it `DEAD` so `spawn()` is the only thing that can ever bring the
-/// slot back, then notify `RS` (`com::proc_died`) so it can decide
-/// whether to restart it (`crate::rs`). Called from `crate::interrupts`
-/// when a *ring-3* task takes a CPU exception -- the kernel's own stand-in
-/// for real MINIX converting a user-process fault into a fatal signal
+/// The status `wait_for_child` reports for a process that didn't exit on
+/// its own terms but was killed by a fault (`kill`). Real MINIX keeps
+/// the exit status and the terminating signal in two separate `mproc`
+/// fields, and POSIX packs both into one `int` behind
+/// `WIFEXITED`/`WTERMSIG`; this port has no signal numbers to put in
+/// there yet, so one reserved value stands in for "did not exit".
+pub const STATUS_KILLED: i32 = -1;
+
+/// `exit()`: the calling process terminates with `status`. Ported in
+/// spirit from `servers/pm/forkexit.c`'s `do_exit` -- `Scheduler::
+/// terminate` holds the part the two callers share, and this is the "it
+/// asked to" half (`kill` is the other).
+///
+/// Never returns, and not because it loops: by the time `reschedule()`
+/// is reached this slot is off every ready queue, so the switch away
+/// from it is permanent. Its kernel stack (`STACKS`, static per slot) is
+/// simply abandoned where it is, and rebuilt from the top if something
+/// ever `spawn`s into the slot again.
+///
+/// Interrupts stay off from here to that final `reschedule()`, and that
+/// is load-bearing rather than tidy. `terminate` can release this slot,
+/// and `switch_to` has not yet saved this (dead) task's stack pointer
+/// into it -- so a timer tick landing in between could switch to a task
+/// that forks, hand it *this* number, and have `switch_to` then
+/// overwrite the brand-new process's `rsp` with a dead stack. Nothing
+/// re-enables interrupts on the way out: whichever task is switched to
+/// restores its own `RFLAGS` (`switch_to`'s `popfq`).
+pub fn exit_now(status: i32) -> ! {
+    disable();
+    let (proc_nr, name, address_space, kernel_cr3) = with_scheduler(|sched| {
+        let idx = sched.current;
+        let proc_nr = sched.procs[idx].proc_nr;
+        let name = sched.procs[idx].name;
+        (proc_nr, name, sched.terminate(idx, status, false), sched.kernel_cr3)
+    });
+    crate::serial_println!("[proc] {} (proc_nr {}) exited with status {}", name, proc_nr, status);
+    reclaim(address_space, true, kernel_cr3, name, proc_nr);
+    reschedule();
+    unreachable!("a process that has exited was scheduled again")
+}
+
+/// `wait()`: block until one of the calling process's children
+/// terminates, and collect it. Returns the child's `(proc_nr, status)`,
+/// or `None` if the caller has no children at all (POSIX `ECHILD`).
+/// Ported in spirit from `servers/pm/forkexit.c`'s `do_waitpid`, minus
+/// the `waitpid` half of it -- there is no way to ask for one specific
+/// child, or to poll without blocking (`WNOHANG`).
+///
+/// Collecting happens here rather than in the exiting process because
+/// this is the side that knows the answer was wanted: a zombie
+/// (`rts::ZOMBIE`, a child that terminated before anyone asked) has its
+/// status read out and its slot -- and process number -- released, which
+/// is the only thing that ever reclaims one in this port.
+pub fn wait_for_child() -> Option<(i32, i32)> {
+    enum Outcome {
+        /// `(child, status, came_from_a_zombie_slot)` -- the flag only
+        /// feeds the log line below, but which of the two paths a
+        /// collection took is exactly what the timing of a real run is
+        /// otherwise silent about.
+        Collected(i32, i32, bool),
+        NoChildren,
+        Blocked,
+    }
+    loop {
+        let outcome = with_scheduler(|sched| {
+            let idx = sched.current;
+            let me = sched.procs[idx].proc_nr;
+
+            // Handed to us directly by a child that terminated while we
+            // were already blocked here (`Scheduler::terminate`).
+            if let Some((child, status)) = sched.procs[idx].wait_result.take() {
+                return Outcome::Collected(child, status, false);
+            }
+            // Or a child that terminated before we asked, and has been
+            // holding its status in a zombie slot since.
+            let zombie = (0..NR_PROCS).find(|&i| {
+                sched.procs[i].parent == me && sched.procs[i].exit_status.is_some()
+            });
+            if let Some(child_idx) = zombie {
+                let child = sched.procs[child_idx].proc_nr;
+                let status = sched.procs[child_idx].exit_status.expect("zombie without a status");
+                sched.free_slot(child_idx);
+                return Outcome::Collected(child, status, true);
+            }
+            // Nothing to collect. Is there anything that *could* be?
+            let any_children = (0..NR_PROCS)
+                .any(|i| sched.procs[i].parent == me && sched.procs[i].rts_flags & rts::SLOT_FREE == 0);
+            if !any_children {
+                return Outcome::NoChildren;
+            }
+            if sched.procs[idx].rts_flags == 0 {
+                sched.dequeue(idx);
+            }
+            sched.procs[idx].rts_flags |= rts::WAITING;
+            Outcome::Blocked
+        });
+        match outcome {
+            // Logged out here rather than inside the closure above:
+            // `with_scheduler` runs with interrupts disabled, and a
+            // serial write is slow enough (milliseconds, at 115200 baud)
+            // that doing one in there would start costing timer ticks.
+            Outcome::Collected(child, status, from_zombie) => {
+                crate::serial_println!(
+                    "[proc] proc_nr {} collected child proc_nr {} (status {}) {}",
+                    current_proc_nr(),
+                    child,
+                    status,
+                    if from_zombie {
+                        "out of a zombie slot, which is now free again"
+                    } else {
+                        "handed over directly -- it was still blocked here when the child exited"
+                    }
+                );
+                return Some((child, status));
+            }
+            Outcome::NoChildren => return None,
+            // Same shape as `mini_receive`: switch away now that we're
+            // blocked, and come back around the loop once a terminating
+            // child wakes us -- by which point `wait_result` is set.
+            Outcome::Blocked => reschedule(),
+        }
+    }
+}
+
+/// Permanently stop scheduling `proc_nr` because it faulted: the `kill`
+/// half of the pair `Scheduler::terminate` serves (`exit_now` is the
+/// other). On top of the shared bookkeeping it marks the slot
+/// `rts::DEAD` -- "terminated by a fault, not by choice", the one thing
+/// a collected status can't say in this port -- and notifies `RS`
+/// (`com::proc_died`) so it can decide whether to restart the service
+/// (`crate::rs`). Called from `crate::interrupts` when a *ring-3* task
+/// takes a CPU exception; the kernel's own stand-in for real MINIX
+/// converting a user-process fault into a fatal signal
 /// (`kernel/exception.c`) and `PM` reporting the exit to `RS`
 /// (`servers/rs/manager.c`), collapsed into one direct call since this
 /// port has neither signals nor `PM`'s exit path yet.
 ///
-/// Idempotent: a process that's already `DEAD` (e.g. a second fault
-/// landing before `RS` gets around to restarting it -- shouldn't happen
-/// with how `crate::rs` is written, but costs nothing to guard against)
-/// is left alone rather than notifying `RS` twice.
+/// A parent blocked in `wait_for_child` is woken with `STATUS_KILLED`,
+/// same as for a voluntary exit -- otherwise a crashing child would
+/// leave its parent blocked forever, which is the one way this pair can
+/// deadlock a process that did nothing wrong.
+///
+/// Idempotent: a process that has already terminated (or a slot that
+/// never held one) is left alone rather than notifying `RS` twice.
 pub fn kill(proc_nr: i32, reason: &str) {
     let idx = com::slot(proc_nr);
+    let already_gone = rts::SLOT_FREE | rts::DEAD | rts::ZOMBIE;
     let dying = with_scheduler(|sched| {
-        if sched.procs[idx].rts_flags & rts::DEAD != 0 {
+        if sched.procs[idx].rts_flags & already_gone != 0 {
             return None;
         }
-        if sched.procs[idx].rts_flags == 0 {
-            sched.dequeue(idx); // already repicks if idx was current/next_ptr
-        }
-        sched.procs[idx].rts_flags |= rts::DEAD;
+        let name = sched.procs[idx].name;
         let was_current = sched.current == idx;
-        if was_current {
-            sched.pick_proc();
-        }
+        let address_space = sched.terminate(idx, STATUS_KILLED, true);
         sched.try_deliver_notification(com::slot(com::RS_PROC_NR), com::KERNEL, com::proc_died(proc_nr));
-        // Detach the address space here, under the lock, so nothing can
-        // observe a dead slot still pointing at memory that is about to
-        // be handed back.
-        let address_space = sched.procs[idx].cr3.take();
-        sched.procs[idx].mem_map = MemMap::EMPTY;
-        Some((sched.procs[idx].name, address_space, was_current, sched.kernel_cr3))
+        Some((name, address_space, was_current, sched.kernel_cr3))
     });
 
     let (name, address_space, was_current, kernel_cr3) = match dying {
@@ -921,22 +1147,35 @@ pub fn kill(proc_nr: i32, reason: &str) {
         None => return,
     };
     crate::serial_println!("[proc] {} (proc_nr {}) killed: {}", name, proc_nr, reason);
+    reclaim(address_space, was_current, kernel_cr3, name, proc_nr);
+}
 
-    if let Some(address_space) = address_space {
-        // If the process that just died is the one whose page tables are
-        // currently loaded -- the usual case, since `kill` is called from
-        // the CPU exception its own code raised -- `CR3` has to move off
-        // them before they can be freed. The kernel's own address space
-        // is always a safe place to stand: this code, this stack and the
-        // physical-memory window are mapped there identically.
-        if was_current {
-            unsafe { Cr3::write(kernel_cr3.0, kernel_cr3.1) };
-        }
-        // Safety: detached from the process table above and no longer in
-        // `CR3`.
-        let freed = unsafe { crate::memory::free_address_space(address_space, kernel_cr3.0) };
-        crate::serial_println!("[proc] reclaimed {} frames from {} (proc_nr {})", freed, name, proc_nr);
+/// Hand a terminated process's address space back, outside the
+/// scheduler lock. Shared by `exit_now` and `kill`, which differ only in
+/// how they got here.
+///
+/// If the process that just terminated is the one whose page tables are
+/// currently loaded -- always, for `exit_now`, and the usual case for
+/// `kill`, which runs from the CPU exception the process's own code
+/// raised -- `CR3` has to move off them before they can be freed. The
+/// kernel's own address space is always a safe place to stand: this
+/// code, this stack and the physical-memory window are mapped there
+/// identically.
+fn reclaim(
+    address_space: Option<PhysFrame>,
+    was_current: bool,
+    kernel_cr3: (PhysFrame, Cr3Flags),
+    name: &str,
+    proc_nr: i32,
+) {
+    let Some(address_space) = address_space else { return };
+    if was_current {
+        unsafe { Cr3::write(kernel_cr3.0, kernel_cr3.1) };
     }
+    // Safety: detached from the process table by `Scheduler::terminate`
+    // and no longer in `CR3`.
+    let freed = unsafe { crate::memory::free_address_space(address_space, kernel_cr3.0) };
+    crate::serial_println!("[proc] reclaimed {} frames from {} (proc_nr {})", freed, name, proc_nr);
 }
 
 /// The `(PhysFrame, Cr3Flags)` `proc_nr`'s address space is rooted at --

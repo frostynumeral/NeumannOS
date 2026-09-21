@@ -109,6 +109,8 @@ pub const SYS_READ_LINE: u64 = 9;
 pub const SYS_VIRCOPY: u64 = 10;
 pub const SYS_FORK: u64 = 11;
 pub const SYS_EXEC: u64 = 12;
+pub const SYS_EXIT: u64 = 13;
+pub const SYS_WAIT: u64 = 14;
 
 /// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
 /// a sanity bound on an untrusted `len` from ring 3 -- matches the size
@@ -172,6 +174,16 @@ pub const ERR_NO_FREE_PROC: u64 = (-8i64) as u64;
 /// one POSIX calls `ENOMEM`; the caller is left exactly as it was and no
 /// process is created either way.
 pub const ERR_FORK_FAILED: u64 = (-9i64) as u64;
+/// `SYS_WAIT` from a process with no children to wait for -- POSIX's
+/// `ECHILD`, and the one answer `wait` can give immediately that isn't a
+/// terminated child.
+pub const ERR_NO_CHILDREN: u64 = (-10i64) as u64;
+/// `SYS_EXIT`/`SYS_WAIT` from a caller that wasn't in ring 3, checked
+/// for the same reason `ERR_EXEC_NOT_RING3` is: `exit` would tear down a
+/// *kernel* task's slot from under it, mid-trap, and the kernel tasks
+/// here are the ones the system is made of. Kernel-side code that really
+/// wants these calls the `crate::proc` functions directly.
+pub const ERR_NOT_RING3: u64 = (-11i64) as u64;
 
 /// The actual dispatch, called by `entry` (via `core::arch::naked_asm!`'s
 /// `sym` operand) with the caller's original `rax` (as `call_num`),
@@ -405,6 +417,55 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                     ERR_FORK_FAILED
                 }
             }
+        }
+        SYS_EXIT => {
+            // Same reasoning as `SYS_EXEC`'s ring check below, and more
+            // load-bearing: this one doesn't come back at all, so a
+            // kernel task reaching it would lose its slot mid-trap.
+            // Safety: see `SYS_FORK`'s use of `frame_ptr` above.
+            let caller_cs = unsafe { (*(frame_ptr as *const proc::TrapFrame)).cs };
+            if caller_cs & 3 != 3 {
+                serial_println!("[syscall] proc {}: SYS_EXIT from ring {}, refusing", caller, caller_cs & 3);
+                return ERR_NOT_RING3;
+            }
+            serial_println!("[syscall] proc {}: SYS_EXIT({})", caller, arg1 as i32);
+            // Never returns -- this trap has no `iretq` to reach, since
+            // the process it would return to no longer exists.
+            proc::exit_now(arg1 as i32)
+        }
+        SYS_WAIT => {
+            // Safety: see `SYS_FORK`'s use of `frame_ptr` above.
+            let caller_cs = unsafe { (*(frame_ptr as *const proc::TrapFrame)).cs };
+            if caller_cs & 3 != 3 {
+                serial_println!("[syscall] proc {}: SYS_WAIT from ring {}, refusing", caller, caller_cs & 3);
+                return ERR_NOT_RING3;
+            }
+            // Blocks for as long as it takes a child to terminate, which
+            // is unbounded -- the same "block inside the trap and resume
+            // in ring 3 afterwards" shape `SYS_WAIT_ALARM` and
+            // `SYS_READ_LINE` already have.
+            let Some((child, status)) = proc::wait_for_child() else {
+                serial_println!("[syscall] proc {}: SYS_WAIT -> no children", caller);
+                return ERR_NO_CHILDREN;
+            };
+            serial_println!(
+                "[syscall] proc {}: SYS_WAIT -> child proc_nr {} terminated with status {}",
+                caller,
+                child,
+                status
+            );
+            // `arg1` is where the caller wants the status written, or 0
+            // for "don't bother" (POSIX lets `wait(NULL)` do that).
+            // Safety: the caller's own address space is active again by
+            // now -- this task is running, so `CR3` is its own -- so this
+            // is the same direct write `SYS_WRITE_LINE`'s read relies on.
+            // Unlike `SYS_READ_LINE`, no other task ever touches this
+            // pointer: `wait_for_child` returns the status through the
+            // process table, not through a buffer.
+            if arg1 != 0 {
+                unsafe { (arg1 as *mut i32).write_unaligned(status) };
+            }
+            child as u64
         }
         SYS_EXEC => {
             if arg2 as usize > MAX_FS_BUF {

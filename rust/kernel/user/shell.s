@@ -48,6 +48,34 @@
 # /shell_fork.bin, so exec_verify can check that ring 3's idea of which
 # process its child is matches the kernel's own (crate::proc::child_of).
 #
+# After that it forks twice more, and those two children are what
+# exercise the other end of a process's life: SYS_EXIT (crate::proc's
+# exit_now) and SYS_WAIT (wait_for_child). Neither of them execs -- they
+# run this same inherited image, write a file to prove they really got
+# scheduled, and exit with a status this program then collects. The
+# child that execs deliberately does *not* exit, because crate::main's
+# exec_verify has to read its address space long afterwards to prove the
+# exec landed in the right process; a reaped child has no address space
+# to read.
+#
+# The two are separated on purpose, because there are two distinct paths
+# through a terminating child and only the timing tells them apart:
+#
+#   child B: forked, then waited for immediately. The parent is already
+#     blocked in SYS_WAIT when B exits, so B hands its status straight
+#     over and no zombie is ever created (Scheduler::terminate's
+#     wait_result path). Status 42.
+#   child C: forked, then given three real ticks to finish (a genuine
+#     SYS_SET_ALARM/SYS_WAIT_ALARM sleep) before the parent waits at all.
+#     C is a zombie by then -- terminated, slot and process number still
+#     allocated, holding its status -- and the wait collects it and frees
+#     the slot. Status 7.
+#
+# If the timing ever went the other way round, C would simply take B's
+# path and both waits would still return the right answers; the sleep
+# makes the zombie path *likely*, not load-bearing. Each wait's
+# (proc_nr, status) pair goes to its own file for exec_verify to check.
+#
 # The child's exec call sits in a bounded retry loop rather than being a
 # straight-line call, and that is deliberate. /bin/echo has to be in
 # `fs` before it can be exec'd, and it gets there at runtime (crate::main's
@@ -148,6 +176,45 @@ _start:
     mov $7, %eax        # SYS_FS_WRITE
     int $0x80
 
+    # --- child B: fork one that exits, and wait for it right away ---
+    mov $11, %eax       # SYS_FORK
+    int $0x80
+    test %rax, %rax
+    jz 4f               # child B
+
+    # Parent: block in SYS_WAIT (rdi = where to write the status).
+    # B hasn't run yet, so this genuinely blocks and B's exit is what
+    # wakes it -- no zombie in between.
+    lea wait_status(%rip), %rdi
+    mov $14, %eax       # SYS_WAIT (crate::syscall::SYS_WAIT)
+    int $0x80
+    mov %rax, wait_child(%rip)
+    lea wait1_path(%rip), %rdi
+    mov $wait1_path_len, %esi
+    call write_pair
+
+    # --- child C: fork one that exits, but let it become a zombie ---
+    mov $11, %eax       # SYS_FORK
+    int $0x80
+    test %rax, %rax
+    jz 5f               # child C
+
+    # Parent: sleep three real ticks first, so C has long since exited
+    # and is sitting in a zombie slot by the time we ask for it.
+    mov $3, %edi        # delay_ticks = 3
+    mov $4, %eax        # SYS_SET_ALARM
+    int $0x80
+    mov $5, %eax        # SYS_WAIT_ALARM
+    int $0x80
+
+    lea wait_status(%rip), %rdi
+    mov $14, %eax       # SYS_WAIT
+    int $0x80
+    mov %rax, wait_child(%rip)
+    lea wait2_path(%rip), %rdi
+    mov $wait2_path_len, %esi
+    call write_pair
+
     lea still_shell(%rip), %rdi
     mov $still_shell_len, %esi
     mov $2, %eax        # SYS_WRITE_LINE
@@ -157,6 +224,44 @@ _start:
     int $0x80
     # unreachable: the parent waits here forever, still running this
     # image -- which is exactly what exec_verify checks it is.
+
+4:  # --- child B (rax == 0): prove we ran, then exit with 42 ---
+    lea childb_path(%rip), %rdi
+    mov $childb_path_len, %esi
+    mov $6, %eax        # SYS_FS_OPEN
+    int $0x80
+    mov %rax, %r8
+
+    mov %r8, %rdi
+    lea childb_message(%rip), %rsi
+    mov $childb_message_len, %edx
+    mov $7, %eax        # SYS_FS_WRITE
+    int $0x80
+
+    mov $42, %edi
+    mov $13, %eax       # SYS_EXIT (crate::syscall::SYS_EXIT)
+    int $0x80
+    # unreachable: SYS_EXIT's handler never returns -- this process is
+    # gone by the time the trap would have.
+
+5:  # --- child C (rax == 0): exit straight away with 7 ---
+    mov $7, %edi
+    mov $13, %eax       # SYS_EXIT
+    int $0x80
+    # unreachable, same as above.
+
+# Write the (proc_nr, status) pair SYS_WAIT just produced to the path in
+# rdi/rsi -- sixteen bytes, wait_child followed by wait_status, which sit
+# next to each other in .data precisely so one write covers both.
+write_pair:
+    mov $6, %eax        # SYS_FS_OPEN
+    int $0x80
+    mov %rax, %rdi
+    lea wait_child(%rip), %rsi
+    mov $16, %edx
+    mov $7, %eax        # SYS_FS_WRITE
+    int $0x80
+    ret
 2:
     # --- child path: replace this inherited image with /bin/echo ---
     mov $ATTEMPTS, %r12d
@@ -217,8 +322,25 @@ gave_up_len = . - gave_up
 fork_path:
     .ascii "/shell_fork.bin"
 fork_path_len = . - fork_path
+wait1_path:
+    .ascii "/shell_wait1.bin"
+wait1_path_len = . - wait1_path
+wait2_path:
+    .ascii "/shell_wait2.bin"
+wait2_path_len = . - wait2_path
+childb_path:
+    .ascii "/from_exited_child.txt"
+childb_path_len = . - childb_path
+childb_message:
+    .ascii "written by a forked child that then exited with a real status"
+childb_message_len = . - childb_message
     .align 8
 fork_child_nr:
+    .quad 0
+# Adjacent on purpose: write_pair above writes both in one SYS_FS_WRITE.
+wait_child:
+    .quad 0
+wait_status:
     .quad 0
 prog:
     .ascii "/bin/echo"

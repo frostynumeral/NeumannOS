@@ -312,6 +312,7 @@ fn idle_task() -> ! {
     fork_child_verify();
     exec_verify();
     proc_slot_pool_check();
+    wait_without_children_check();
     runtime_reclaim_check();
     serial_println!("[idle] no other task is ready, halting (uptime: {} ticks)", proc::uptime_ticks());
     halt_loop()
@@ -510,7 +511,18 @@ fn fork_child_verify() {
 ///    image it was running. An `exec` that reached the wrong process
 ///    table slot -- the caller's parent rather than the caller -- would
 ///    fail here, and nothing else in this port would notice.
-/// 8. That same marker page is *unmapped in the child*: reading it back
+/// 8. `/from_exited_child.txt`, `/shell_wait1.bin` and
+///    `/shell_wait2.bin` cover the *other* end of a process's life.
+///    `shell` forks two more children that don't exec at all: each
+///    terminates with `SYS_EXIT` and a status of its own, and `shell`
+///    collects both with `SYS_WAIT`, parking each `(proc_nr, status)`
+///    pair in a file. Checked here: the statuses are exactly `42` and
+///    `7`, and the process numbers are ones `proc::alloc_proc_nr`
+///    handed out and has since taken back, since collecting a status is
+///    what frees the slot (`user/shell.s` explains why the two children
+///    are separated -- one is waited for immediately, the other left to
+///    become a zombie first).
+/// 9. That same marker page is *unmapped in the child*: reading it back
 ///    has to fail with `CopyError::SrcNotMapped`. The child demonstrably
 ///    had it a moment ago (it inherited a copy from the fork, and
 ///    `shell` had already written to it), so this is what proves exec
@@ -637,6 +649,47 @@ fn exec_verify() {
         "shell's own .data marker is gone -- its child's exec reached the parent's address space"
     );
 
+    let expected_child = b"written by a forked child that then exited with a real status";
+    let mut child_buf = [0u8; 96];
+    let child_n = read_when_available("/from_exited_child.txt", &mut child_buf);
+    serial_println!(
+        "[idle] read back {:?} from /from_exited_child.txt (written by a child that then exited with a status)",
+        core::str::from_utf8(&child_buf[..child_n.max(0) as usize]).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(
+        &child_buf[..child_n.max(0) as usize],
+        expected_child,
+        "fs content doesn't match what shell's exiting child wrote"
+    );
+
+    for (path, expected_status) in [("/shell_wait1.bin", 42), ("/shell_wait2.bin", 7)] {
+        let (child, status) = read_wait_result(path);
+        serial_println!(
+            "[idle] read back (proc_nr {}, status {}) from {} -- collected by shell's own SYS_WAIT (expected status {})",
+            child,
+            status,
+            path,
+            expected_status
+        );
+        assert_eq!(status, expected_status, "{} holds the wrong exit status", path);
+        assert!(
+            child >= com::FIRST_DYNAMIC_PROC_NR,
+            "{} names proc_nr {}, which isn't a dynamically allocated one",
+            path,
+            child
+        );
+        // Collecting a status is what releases the slot, so by now the
+        // number is free again -- and demonstrably reusable, which
+        // `proc_slot_pool_check` goes on to confirm for the pool as a
+        // whole.
+        assert_eq!(
+            proc::mem_map_of(child).total_pages(),
+            0,
+            "proc_nr {} still has a memory map after being waited for",
+            child
+        );
+    }
+
     let mut stale_buf = [0u8; 4];
     let stale = calls::sys_vircopy(
         child,
@@ -654,6 +707,34 @@ fn exec_verify() {
         matches!(stale, Err(memory::CopyError::SrcNotMapped)),
         "the image the child inherited from shell is still mapped after exec -- the old image wasn't replaced, only added to"
     );
+}
+
+/// `wait`'s one non-blocking answer: a process with no children at all
+/// has to be told so (POSIX `ECHILD`, `crate::syscall`'s
+/// `ERR_NO_CHILDREN`) rather than blocking forever on something that can
+/// never happen. `IDLE` has never forked, so it is the right process to
+/// ask -- and if `wait_for_child` got this wrong, this call would hang
+/// the whole system rather than fail quietly, which is precisely why the
+/// case is worth pinning down.
+fn wait_without_children_check() {
+    let result = proc::wait_for_child();
+    serial_println!("[idle] wait_for_child() with no children -> {:?} (expected None)", result);
+    assert!(result.is_none(), "wait must report having no children instead of blocking");
+}
+
+/// Read one of `user/shell.s`'s `(proc_nr, status)` pairs back out of
+/// `fs`: sixteen bytes, written straight out of that program's `.data`
+/// by a single `SYS_FS_WRITE` over two adjacent 8-byte slots. The status
+/// occupies only the first four of its own eight, since `SYS_WAIT`
+/// writes an `i32` through the pointer it's given and `shell` zeroes the
+/// rest at link time.
+fn read_wait_result(path: &str) -> (i32, i32) {
+    let mut buf = [0u8; 16];
+    let n = read_when_available(path, &mut buf);
+    assert_eq!(n, 16, "wrong length read back from {}", path);
+    let child = u64::from_le_bytes(buf[..8].try_into().unwrap()) as i32;
+    let status = i32::from_le_bytes(buf[8..12].try_into().unwrap());
+    (child, status)
 }
 
 /// Exercises the two ends of the dynamic process-number pool
