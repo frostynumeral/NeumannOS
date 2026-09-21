@@ -53,6 +53,7 @@ use x86_64::VirtAddr;
 use crate::com;
 use crate::gdt;
 use crate::ipc::Message;
+use crate::memory::MemMap;
 
 pub const NR_SCHED_QUEUES: usize = 16;
 pub const TASK_Q: u8 = 0;
@@ -63,7 +64,7 @@ const STACK_SIZE: usize = 4096 * 8;
 /// One slot per schedulable kernel task, plus one reserved slot for the
 /// bootstrap context (`kernel_main`'s own stack, abandoned once it hands
 /// off to the first task via `start()`).
-const NR_PROCS: usize = com::NR_BOOT_PROCS + 1;
+const NR_PROCS: usize = com::NR_PROC_SLOTS + 1;
 const BOOTSTRAP: usize = NR_PROCS - 1;
 
 /// Bits for `Proc::rts_flags`, mirroring `SLOT_FREE`/`SENDING`/`RECEIVING`
@@ -81,6 +82,26 @@ pub mod rts {
     /// step (no memory to free -- see `crate::rs`), so `DEAD` just marks
     /// "never schedule this slot again" until it's respawned.
     pub const DEAD: u8 = 0x10;
+    /// Claimed by `crate::proc::alloc_proc_nr` but not yet filled in by
+    /// the `spawn`/`fork_current` that asked for it: not free (so a
+    /// second allocation skips it) and not runnable (so the scheduler
+    /// never picks a slot that holds nothing). No MINIX counterpart --
+    /// there, `PM` owns process-slot allocation and the kernel only ever
+    /// sees a slot that is already a real process.
+    pub const RESERVED: u8 = 0x20;
+}
+
+/// Everything a process's own address space consists of: the top-level
+/// page table to load into `CR3`, and the memory map
+/// (`crate::memory::MemMap`) saying which pages in it are the process's
+/// own rather than the kernel's. The two travel together everywhere --
+/// whoever builds an address space (`crate::usermode`, `crate::elf`)
+/// knows both, and `fork` needs both -- so they are one value rather
+/// than two parallel arguments that could get out of step.
+#[derive(Clone, Copy)]
+pub struct AddressSpace {
+    pub pml4: PhysFrame,
+    pub map: MemMap,
 }
 
 pub struct Proc {
@@ -137,6 +158,22 @@ pub struct Proc {
     /// `start` load this (or the kernel's own, if `None`) into `CR3`
     /// whenever this task becomes current.
     cr3: Option<PhysFrame>,
+    /// Which pages of `cr3`'s address space belong to this process
+    /// rather than to the kernel -- `MemMap::EMPTY` for a task with no
+    /// address space of its own. The Rust counterpart of `mp_seg[]` in
+    /// `servers/pm/mproc.h`, kept in the process table here rather than
+    /// in a `pm` of its own because `fork` is a kernel call in this port
+    /// (`crate::calls::sys_fork_from_frame`) and the kernel is therefore
+    /// who needs to read it.
+    mem_map: MemMap,
+    /// The process that forked this one, or `com::NONE` for every
+    /// process in the fixed system image (`crate::table`), which nothing
+    /// created. `mp_parent` in `servers/pm/mproc.h`; here it exists so
+    /// that a process whose number was handed out at runtime
+    /// (`alloc_proc_nr`) can still be found from outside by asking who
+    /// its parent is (`child_of`), rather than needing its number
+    /// hardcoded somewhere.
+    parent: i32,
     /// The tick (`Scheduler::ticks`) at which this task's watchdog alarm
     /// (`sys_setalarm`, `crate::calls`) should fire, if one is pending.
     /// Analogous to `kernel/clock.c`'s per-process alarm timer, minus the
@@ -173,6 +210,8 @@ impl Proc {
             messbuf: ptr::null_mut(),
             entry: never_spawned,
             cr3: None,
+            mem_map: MemMap::EMPTY,
+            parent: com::NONE,
             alarm: None,
         }
     }
@@ -388,7 +427,7 @@ pub fn spawn(
     priority: u8,
     quantum: i32,
     preemptible: bool,
-    address_space: Option<PhysFrame>,
+    address_space: Option<AddressSpace>,
 ) {
     let idx = com::slot(proc_nr);
     // Build the initial stack frame that `switch_to`'s epilogue will pop:
@@ -428,11 +467,96 @@ pub fn spawn(
             send_to: com::NONE,
             messbuf: ptr::null_mut(),
             entry,
-            cr3: address_space,
+            cr3: address_space.map(|space| space.pml4),
+            mem_map: address_space.map_or(MemMap::EMPTY, |space| space.map),
+            parent: com::NONE,
             alarm: None,
         };
         sched.enqueue(idx);
     });
+}
+
+/// Hand out a process number for a process that is being created *now*,
+/// rather than one reserved in `crate::com` for a known member of the
+/// system image: the first slot in the dynamic range
+/// (`com::FIRST_DYNAMIC_PROC_NR`) that is free, marked `rts::RESERVED`
+/// so the same number can't be handed out twice and so the scheduler
+/// never picks a slot that has nothing in it yet.
+///
+/// Claiming the slot here rather than in the following `fork_current` is
+/// what makes the pair safe against the timer: the two calls are several
+/// frame-allocating steps apart (`crate::memory::fork_address_space`), a
+/// tick can land in the gap and switch to a task that forks too, and an
+/// allocator that only *looked* would then hand that task the same
+/// number and have it overwrite a half-built process.
+///
+/// `None` when the dynamic range is full. Real MINIX's counterpart is
+/// `servers/pm/forkexit.c`'s scan of `mproc[]` for a `!(mp_flags &
+/// IN_USE)` slot, which reports the same condition as `EAGAIN`.
+pub fn alloc_proc_nr() -> Option<i32> {
+    with_scheduler(|sched| {
+        let free = (0..com::NR_DYNAMIC_PROCS as i32)
+            .map(|i| com::FIRST_DYNAMIC_PROC_NR + i)
+            .find(|&nr| sched.procs[com::slot(nr)].rts_flags & rts::SLOT_FREE != 0)?;
+        sched.procs[com::slot(free)].rts_flags = rts::RESERVED;
+        Some(free)
+    })
+}
+
+/// Give a number from `alloc_proc_nr` back unused -- for the caller that
+/// claimed one and then failed to build the process (out of physical
+/// frames, say). Without this a failed `fork` would cost a process
+/// number permanently.
+pub fn release_proc_nr(proc_nr: i32) {
+    with_scheduler(|sched| {
+        let idx = com::slot(proc_nr);
+        debug_assert_eq!(
+            sched.procs[idx].rts_flags,
+            rts::RESERVED,
+            "releasing a process number that isn't merely reserved"
+        );
+        sched.procs[idx].rts_flags = rts::SLOT_FREE;
+    });
+}
+
+/// The memory map of `proc_nr`'s own address space (`Proc::mem_map`) --
+/// empty for a task that runs in the kernel's. What `fork` reads to find
+/// out which pages it has to copy, in place of the per-caller hardcoded
+/// list `crate::syscall`'s `SYS_FORK` handler used to carry.
+pub fn mem_map_of(proc_nr: i32) -> MemMap {
+    with_scheduler(|sched| sched.procs[com::slot(proc_nr)].mem_map)
+}
+
+/// The scheduling parameters `proc_nr` is running with:
+/// `(priority, quantum, preemptible)`. A forked child inherits its
+/// parent's rather than being given fresh ones by whoever implements the
+/// call -- which is both what real `fork()` does (`servers/pm`'s child
+/// inherits the parent's scheduling state) and one less hardcoded
+/// constant in `crate::syscall`'s `SYS_FORK` handler.
+pub fn sched_params_of(proc_nr: i32) -> (u8, i32, bool) {
+    with_scheduler(|sched| {
+        let p = &sched.procs[com::slot(proc_nr)];
+        (p.max_priority, p.quantum_size, p.preemptible)
+    })
+}
+
+/// The process `parent` forked, if it still has one (`Proc::parent`).
+/// Lets a runtime-created process be found by its relationship rather
+/// than by a process number reserved for it in advance -- which is the
+/// whole point of `alloc_proc_nr`, and what `crate::main`'s fork/exec
+/// verification uses now that no such number exists.
+///
+/// Returns the lowest-numbered such slot; no current caller forks twice
+/// from the same parent, and a real `wait()`-shaped API (which this is
+/// not) would need to enumerate rather than pick.
+pub fn child_of(parent: i32) -> Option<i32> {
+    with_scheduler(|sched| {
+        sched
+            .procs
+            .iter()
+            .find(|p| p.parent == parent && p.rts_flags & rts::SLOT_FREE == 0)
+            .map(|p| p.proc_nr)
+    })
 }
 
 /// A saved trap frame: the 15 general-purpose registers `crate::syscall`'s
@@ -536,13 +660,15 @@ impl TrapFrame {
 /// same as an ordinary trap return -- so from ring 3's perspective, this
 /// task simply *is* the parent, one instruction further along, with `rax`
 /// reading `0`.
+#[allow(clippy::too_many_arguments)]
 pub fn fork_current(
+    parent_proc_nr: i32,
     child_proc_nr: i32,
     name: &'static str,
     priority: u8,
     quantum: i32,
     preemptible: bool,
-    address_space: PhysFrame,
+    address_space: AddressSpace,
     frame: &TrapFrame,
 ) {
     let idx = com::slot(child_proc_nr);
@@ -580,7 +706,9 @@ pub fn fork_current(
             send_to: com::NONE,
             messbuf: ptr::null_mut(),
             entry: never_spawned, // never used -- this task's first resume bypasses `trampoline`
-            cr3: Some(address_space),
+            cr3: Some(address_space.pml4),
+            mem_map: address_space.map,
+            parent: parent_proc_nr,
             alarm: None,
         };
         sched.enqueue(idx);
@@ -784,6 +912,7 @@ pub fn kill(proc_nr: i32, reason: &str) {
         // observe a dead slot still pointing at memory that is about to
         // be handed back.
         let address_space = sched.procs[idx].cr3.take();
+        sched.procs[idx].mem_map = MemMap::EMPTY;
         Some((sched.procs[idx].name, address_space, was_current, sched.kernel_cr3))
     });
 
@@ -852,17 +981,22 @@ pub fn kernel_cr3() -> PhysFrame {
 /// done while the scheduler lock is held -- the walk touches hundreds of
 /// frames -- and the old space is unreachable from the process table by
 /// then, so nothing can pick it up in between.
-pub fn set_address_space(proc_nr: i32, address_space: PhysFrame) {
+pub fn set_address_space(proc_nr: i32, address_space: AddressSpace) {
     let idx = com::slot(proc_nr);
     let interrupts_were_enabled = are_enabled();
     disable();
     let (previous, load_now, kernel_pml4) = with_scheduler(|sched| {
         let previous = sched.procs[idx].cr3;
-        sched.procs[idx].cr3 = Some(address_space);
+        sched.procs[idx].cr3 = Some(address_space.pml4);
+        // The map has to move with the page table: it describes what is
+        // in *this* address space, so leaving the old image's behind
+        // would have a later `fork` of this process copy pages that no
+        // longer exist.
+        sched.procs[idx].mem_map = address_space.map;
         (previous, (sched.current == idx).then_some(sched.kernel_cr3.1), sched.kernel_cr3.0)
     });
     if let Some(flags) = load_now {
-        unsafe { Cr3::write(address_space, flags) };
+        unsafe { Cr3::write(address_space.pml4, flags) };
     }
     if interrupts_were_enabled {
         enable();

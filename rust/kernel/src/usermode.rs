@@ -18,9 +18,10 @@
 //! spaces the way this does), not a ported feature.
 
 use crate::gdt;
-use crate::memory::{self, GlobalFrameAllocator};
+use crate::memory::{self, GlobalFrameAllocator, MemMap};
+use crate::proc::AddressSpace;
 use crate::syscall;
-use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame};
+use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags};
 use x86_64::VirtAddr;
 
 /// Arbitrary, fixed addresses for the demo's one code page and one stack
@@ -57,18 +58,20 @@ pub const USER_CODE: [u8; 28] = [
 /// page into *that* table (with `USER_ACCESSIBLE`, without which the CPU
 /// refuses to execute or touch them at CPL 3 at all -- a `#PF`, not a
 /// `#GP`) -- never into the kernel's own mapper, which is the whole point
-/// of this module. Returns the new address space's top-level page table
-/// frame, for `crate::proc::spawn` to record as this task's `CR3`.
-/// Shared by `create_address_space` (this module's own demo) and
-/// `crate::rs`'s `flaky` (a second, independent ring-3 task at different
-/// addresses) so the address-space-building logic only needs to be
-/// correct once.
+/// of this module. Returns the new address space -- its top-level page
+/// table frame for `crate::proc::spawn` to record as this task's `CR3`,
+/// and the memory map naming the two pages as this task's own, so that
+/// `fork` can find them without anyone hardcoding them a second time
+/// (`crate::memory::MemMap`). Shared by `create_address_space` (this
+/// module's own demo) and `crate::rs`'s `flaky` (a second, independent
+/// ring-3 task at different addresses) so the address-space-building
+/// logic only needs to be correct once.
 pub(crate) fn build_ring3_address_space(
     physical_memory_offset: VirtAddr,
     code_addr: u64,
     code: &[u8],
     stack_addr: u64,
-) -> PhysFrame {
+) -> AddressSpace {
     let (pml4_frame, mut mapper) = memory::new_address_space(physical_memory_offset);
     let flags =
         PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
@@ -105,13 +108,18 @@ pub(crate) fn build_ring3_address_space(
             .ignore();
     }
 
-    pml4_frame
+    let mut map = MemMap::EMPTY;
+    assert!(
+        map.push(VirtAddr::new(code_addr), 1) && map.push(VirtAddr::new(stack_addr), 1),
+        "a two-page memory map should always fit"
+    );
+    AddressSpace { pml4: pml4_frame, map }
 }
 
 /// Build this module's own demo address space (`USER_CODE` at
 /// `USER_CODE_ADDR`). Called once from `kernel_main`, before any tasks
 /// are spawned.
-pub fn create_address_space(physical_memory_offset: VirtAddr) -> PhysFrame {
+pub fn create_address_space(physical_memory_offset: VirtAddr) -> AddressSpace {
     build_ring3_address_space(physical_memory_offset, USER_CODE_ADDR, &USER_CODE, USER_STACK_ADDR)
 }
 

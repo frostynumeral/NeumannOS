@@ -139,11 +139,13 @@ pub const ERR_BAD_LENGTH: u64 = (-1i64) as u64;
 pub const ERR_BAD_UTF8: u64 = (-2i64) as u64;
 pub const ERR_VIRCOPY_FAILED: u64 = (-3i64) as u64;
 pub const ERR_UNKNOWN_CALL: u64 = (-4i64) as u64;
-/// `SYS_FORK` from a caller this port doesn't know a private-pages list
-/// for (see the `SYS_FORK` match arm below) -- a policy gap (this dispatch
-/// layer hardcodes which pages matter per caller, since there's no
-/// per-process memory-map bookkeeping yet, see `crate::calls::sys_fork`'s
-/// doc comment), not a mechanism failure.
+/// `SYS_FORK` from a caller with no address space of its own -- a kernel
+/// task, whose memory *is* the kernel's (`crate::proc::mem_map_of`
+/// returns an empty map). There is nothing to copy and nothing the child
+/// could safely run, so this is refused rather than given a meaning.
+/// It used to mean something much narrower and more embarrassing: "a
+/// caller this dispatch layer doesn't have a hardcoded private-pages
+/// list for", which was everyone except one known ring-3 task.
 pub const ERR_FORK_UNSUPPORTED_CALLER: u64 = (-5i64) as u64;
 /// `SYS_EXEC` found the file but it isn't a program this loader can run
 /// (`crate::elf::ElfError` -- bad magic, a segment outside user space,
@@ -158,6 +160,18 @@ pub const ERR_BAD_ELF: u64 = (-6i64) as u64;
 /// for: `exec` would swap a *kernel* task's address space out from under
 /// it and `iretq` it into a ring-3 entry point with a kernel `CS`.
 pub const ERR_EXEC_NOT_RING3: u64 = (-7i64) as u64;
+/// `SYS_FORK` with every dynamically allocatable process number already
+/// taken (`crate::proc::alloc_proc_nr`, `com::NR_DYNAMIC_PROCS`). Real
+/// MINIX reports the same condition -- `mproc[]` full -- as POSIX's
+/// `EAGAIN`.
+pub const ERR_NO_FREE_PROC: u64 = (-8i64) as u64;
+/// `SYS_FORK` couldn't build the child's address space: out of physical
+/// frames, or the parent's memory map named a page its page tables don't
+/// actually have (`crate::memory::fork_address_space`). Unlike
+/// `ERR_FORK_UNSUPPORTED_CALLER` this is a real resource failure, the
+/// one POSIX calls `ENOMEM`; the caller is left exactly as it was and no
+/// process is created either way.
+pub const ERR_FORK_FAILED: u64 = (-9i64) as u64;
 
 /// The actual dispatch, called by `entry` (via `core::arch::naked_asm!`'s
 /// `sym` operand) with the caller's original `rax` (as `call_num`),
@@ -337,22 +351,26 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             }
         }
         SYS_FORK => {
-            // The private pages that matter for *this* caller specifically
-            // (see ERR_FORK_UNSUPPORTED_CALLER's doc comment): `tty`'s
-            // writable data page (elf::COUNTER_ADDR -- also covers
-            // vircopy_buf/err_result, all in the same page) and its stack.
-            // Its read-only code page is deliberately
-            // *not* listed -- neither side ever writes it, so leaving it
-            // shared (inherited from the whole-PML4 copy
-            // memory::fork_address_space already does) is both cheaper and
-            // closer to real fork()'s own copy-on-write treatment of
-            // unmodified pages than copying it would be.
-            let private_pages = match caller {
-                com::TTY_PROC_NR => {
-                    [VirtAddr::new(elf::COUNTER_ADDR), VirtAddr::new(elf::STACK_ADDR)]
-                }
-                _ => return ERR_FORK_UNSUPPORTED_CALLER,
+            // Which pages the child needs its own copy of comes from the
+            // caller's own memory map now (`crate::memory::MemMap`,
+            // filled in by whoever built its address space), not from a
+            // list this dispatch layer keeps per known caller. A caller
+            // with no map has no address space of its own -- a kernel
+            // task -- and there is nothing to fork.
+            if proc::mem_map_of(caller).is_empty() {
+                return ERR_FORK_UNSUPPORTED_CALLER;
+            }
+            // Claimed before anything is built, and given back below if
+            // building fails: see `proc::alloc_proc_nr` for why the claim
+            // can't wait until the child is ready.
+            let child = match proc::alloc_proc_nr() {
+                Some(child) => child,
+                None => return ERR_NO_FREE_PROC,
             };
+            // A forked child inherits its parent's scheduling parameters
+            // rather than being handed fresh ones here, the same way a
+            // real `fork()` does.
+            let (priority, quantum, preemptible) = proc::sched_params_of(caller);
             // Safety: `frame_ptr` points at the 15 general-purpose
             // registers `entry` pushed for *this* trap, immediately
             // followed by the untouched hardware iretq frame -- see the
@@ -361,18 +379,32 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             let frame = unsafe { &*(frame_ptr as *const proc::TrapFrame) };
             let mut child_frame = *frame;
             child_frame.rax = 0; // fork()'s own convention: the child sees 0
-            let child = calls::sys_fork_from_frame(
+            match calls::sys_fork_from_frame(
                 caller,
-                &private_pages,
-                com::FORK_CHILD_PROC_NR,
-                "fork_child (from tty)",
-                5,
-                24,
-                true,
+                child,
+                com::dynamic_proc_name(child),
+                priority,
+                quantum,
+                preemptible,
                 &child_frame,
-            );
-            serial_println!("[syscall] proc {}: SYS_FORK -> child proc_nr {}", caller, child);
-            child as u64
+            ) {
+                Some(child) => {
+                    serial_println!(
+                        "[syscall] proc {}: SYS_FORK -> child proc_nr {}",
+                        caller,
+                        child
+                    );
+                    child as u64
+                }
+                None => {
+                    serial_println!(
+                        "[syscall] proc {}: SYS_FORK -> failed to build the child's address space",
+                        caller
+                    );
+                    proc::release_proc_nr(child);
+                    ERR_FORK_FAILED
+                }
+            }
         }
         SYS_EXEC => {
             if arg2 as usize > MAX_FS_BUF {

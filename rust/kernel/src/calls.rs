@@ -66,37 +66,63 @@ pub const SYN_ALARM: i32 = com::SYN_ALARM;
 /// `sys_fork()`: create a new task (`child_proc_nr`) whose address space
 /// starts as an independent copy of `src_proc`'s -- not just a structural
 /// clone that still aliases the parent's existing pages
-/// (`memory::new_address_space` alone), but a real, deep copy of each
-/// address in `private_pages`, so a write to one side is invisible to the
+/// (`memory::new_address_space` alone), but a real, deep copy of every
+/// page the parent owns, so a write to one side is invisible to the
 /// other. Ported in spirit from `kernel/proc.c`'s `do_fork()` (called via
 /// `PM_PROC_NR`'s `SYS_FORK`), which duplicates the parent's memory map
 /// for the real thing; bundles what real MINIX splits across a kernel call
 /// (duplicate the memory) and a separate scheduling step (make it
 /// runnable), since nothing in this port needs them separated yet.
 ///
+/// Which pages to copy is no longer an argument: it comes from
+/// `src_proc`'s own memory map (`proc::mem_map_of`, filled in by whoever
+/// built that address space), so this works for any process with an
+/// address space of its own rather than only for a caller someone has
+/// hardcoded a page list for.
+///
 /// Simplification: this version starts the child at a fixed `fn() -> !`
 /// entry point (see `crate::proc::spawn`), not "wherever the caller was" --
 /// fine for `pm`'s own demo (a plain kernel-side child), but not real
 /// `fork()` semantics. `sys_fork_from_frame` below is the ring-3-reachable
 /// sibling that actually resumes at the caller's exact trapped
-/// instruction. `private_pages` also has to be passed explicitly rather
-/// than discovered by walking the parent's entire user-accessible range,
-/// since there's no per-process memory-map bookkeeping (`kernel/kernel.h`'s
-/// `struct mem_map`) to read it back out of yet.
+/// instruction.
+///
+/// `false` if the address space couldn't be built (see
+/// `memory::fork_address_space`); no process is created in that case.
 #[allow(clippy::too_many_arguments)]
 pub fn sys_fork(
     src_proc: i32,
-    private_pages: &[VirtAddr],
     child_proc_nr: i32,
     name: &'static str,
     entry: fn() -> !,
     priority: u8,
     quantum: i32,
     preemptible: bool,
-) {
+) -> bool {
+    match fork_child_address_space(src_proc) {
+        Some(space) => {
+            proc::spawn(child_proc_nr, name, entry, priority, quantum, preemptible, Some(space));
+            true
+        }
+        None => false,
+    }
+}
+
+/// The address space half of both `fork` entry points: a fresh,
+/// independent copy of `src_proc`'s, described by the same memory map.
+///
+/// The new address space is derived from the *kernel's* PML4, not the
+/// parent's, for the same reason `sys_exec` is (see
+/// `memory::new_address_space_from`): the only things a child should
+/// inherit are the kernel mappings every address space shares, plus its
+/// own copy of the pages the map names. Deriving from the parent would
+/// additionally leave the child aliasing whatever else happened to be in
+/// the parent's top-level slots.
+fn fork_child_address_space(src_proc: i32) -> Option<proc::AddressSpace> {
+    let map = proc::mem_map_of(src_proc);
     let (src_cr3, _) = proc::cr3_of(src_proc);
-    let child_pml4 = memory::fork_address_space(src_cr3, private_pages);
-    proc::spawn(child_proc_nr, name, entry, priority, quantum, preemptible, Some(child_pml4));
+    let pml4 = memory::fork_address_space(src_cr3, proc::kernel_cr3(), &map)?;
+    Some(proc::AddressSpace { pml4, map })
 }
 
 /// `sys_fork`'s real-fork-semantics sibling: same deep-copy-then-schedule
@@ -107,21 +133,22 @@ pub fn sys_fork(
 /// parent sees this function's return value (the child's `proc_nr`) --
 /// genuine `fork()` semantics, reachable from ring 3 through the syscall
 /// ABI (`crate::syscall::SYS_FORK`).
+///
+/// `None` -- with no process created and the caller left exactly as it
+/// was -- if the child's address space couldn't be built.
 #[allow(clippy::too_many_arguments)]
 pub fn sys_fork_from_frame(
     src_proc: i32,
-    private_pages: &[VirtAddr],
     child_proc_nr: i32,
     name: &'static str,
     priority: u8,
     quantum: i32,
     preemptible: bool,
     frame: &proc::TrapFrame,
-) -> i32 {
-    let (src_cr3, _) = proc::cr3_of(src_proc);
-    let child_pml4 = memory::fork_address_space(src_cr3, private_pages);
-    proc::fork_current(child_proc_nr, name, priority, quantum, preemptible, child_pml4, frame);
-    child_proc_nr
+) -> Option<i32> {
+    let space = fork_child_address_space(src_proc)?;
+    proc::fork_current(src_proc, child_proc_nr, name, priority, quantum, preemptible, space, frame);
+    Some(child_proc_nr)
 }
 
 /// `sys_exec()`: throw away everything `proc_nr` was running and give it
@@ -157,6 +184,6 @@ pub fn sys_fork_from_frame(
 /// POSIX `exec` without it).
 pub fn sys_exec(proc_nr: i32, image: &[u8]) -> Result<elf::LoadedImage, elf::ElfError> {
     let loaded = elf::load_image(proc::kernel_cr3(), image)?;
-    proc::set_address_space(proc_nr, loaded.pml4);
+    proc::set_address_space(proc_nr, proc::AddressSpace { pml4: loaded.pml4, map: loaded.map });
     Ok(loaded)
 }

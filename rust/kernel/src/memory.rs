@@ -21,9 +21,10 @@
 
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
 use spin::Mutex;
+use x86_64::structures::paging::mapper::{MappedFrame, TranslateResult};
 use x86_64::structures::paging::{
-    FrameAllocator, FrameDeallocator, OffsetPageTable, PageTable, PageTableFlags, PhysFrame,
-    Size4KiB, Translate,
+    FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
+    PhysFrame, Size4KiB, Translate,
 };
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -176,10 +177,10 @@ pub fn new_address_space(
 /// the caller may be `sys_exec`, acting for a ring-3 process, and this
 /// is the first of three allocations on that path -- the other two
 /// (`crate::elf`'s segment and stack mappings) already degrade to
-/// `ElfError::MappingFailed`. Frames only ever get scarcer here (there
-/// is no deallocator, and every `exec` leaks the image it replaces), so
-/// "running out" is a state the system can genuinely reach, and a
-/// ring-3 caller reaching it should lose its `exec`, not the machine.
+/// `ElfError::MappingFailed`. Frames do come back now
+/// (`free_address_space`), but "running out" is still a state the system
+/// can genuinely reach, and a ring-3 caller reaching it should lose its
+/// `exec`, not the machine.
 pub fn new_address_space_from(
     src_pml4: PhysFrame,
     physical_memory_offset: VirtAddr,
@@ -225,84 +226,211 @@ pub fn pml4_slots_unused(pml4: PhysFrame, start: VirtAddr, end_inclusive: VirtAd
     (first..=last).all(|i| table[i as usize].is_unused())
 }
 
-/// Fork `src_pml4` into a brand-new, independent address space: like
-/// `new_address_space`, everything is shared by default (aliasing the
-/// same lower-level tables) -- but for each address in `private_pages`,
-/// this also walks that address's *entire* page-table path fresh,
-/// duplicating any table level still shared with `src_pml4` (so modifying
-/// it can never modify the original), and deep-copies the leaf page's
-/// *contents* into a freshly allocated frame. This is what
-/// `new_address_space` alone can't do: it only ever shares an existing
-/// mapping or adds a brand-new one, never disentangles an address the
-/// source already had mapped -- which real `fork()` needs for every page
-/// the parent already had (its stack, its data), not just future ones.
+/// One contiguous run of pages a process privately owns: the unit a
+/// `MemMap` is built out of.
 ///
-/// `crate::calls::sys_fork` is the first (and so far only) caller;
-/// `private_pages` there is `usermode`'s two demo pages, since that's the
-/// only address space this port creates. A real `fork()` would instead
-/// walk the *entire* user-accessible range of the parent's page tables,
-/// rather than needing an explicit list.
-pub fn fork_address_space(src_pml4: PhysFrame, private_pages: &[VirtAddr]) -> PhysFrame {
-    let offset = physical_memory_offset();
-
-    // Start the same way `new_address_space` does: an exact top-level copy.
-    let dst_pml4_frame = GlobalFrameAllocator
-        .allocate_frame()
-        .expect("out of physical frames for fork's PML4");
-    unsafe {
-        let src_ptr: *const PageTable = (offset + src_pml4.start_address().as_u64()).as_ptr();
-        let dst_ptr: *mut PageTable =
-            (offset + dst_pml4_frame.start_address().as_u64()).as_mut_ptr();
-        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 1);
-    }
-
-    for &addr in private_pages {
-        unsafe { fork_one_page(dst_pml4_frame, addr, offset) };
-    }
-
-    dst_pml4_frame
+/// The closest thing in the C tree is `include/minix/type.h`'s
+/// `struct mem_map`, three of which (`mp_seg[T]`/`[D]`/`[S]` --  text,
+/// data, stack) describe a MINIX process's whole memory layout in
+/// `servers/pm/mproc.h`. That version carries a physical base as well as
+/// a virtual one, because 2005-era MINIX has no paging: a segment *is* a
+/// contiguous run of physical memory. Here the page tables already record
+/// where each page physically lives, so a segment only needs to say which
+/// virtual pages belong to the process -- the rest is a page-table walk
+/// away (`fork_address_space`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub base: VirtAddr,
+    pub pages: usize,
 }
 
-/// Walk from `pml4_frame` down to the leaf (page table) entry for `addr`,
-/// duplicating each intermediate level along the way (so it stops being
-/// shared with wherever it was cloned from), then replace the final leaf
-/// entry with a fresh frame holding a copy of the original page's bytes.
-unsafe fn fork_one_page(pml4_frame: PhysFrame, addr: VirtAddr, offset: VirtAddr) {
-    let mut table_frame = pml4_frame;
-    for index in [addr.p4_index(), addr.p3_index(), addr.p2_index()] {
-        let table: &mut PageTable =
-            &mut *((offset + table_frame.start_address().as_u64()).as_mut_ptr());
-        let entry = &mut table[index];
-        let next_frame = entry
-            .frame()
-            .expect("fork_one_page: intermediate page table not present");
+/// How many segments one `MemMap` holds. Has to be at least one more
+/// than the number of `PT_LOAD` segments `crate::elf` will load (it adds
+/// a stack segment of its own on top); `crate::elf` asserts exactly that
+/// at compile time, so an image that passes `elf::validate` can never
+/// overflow a map.
+pub const MAX_SEGMENTS: usize = 17;
 
-        // Duplicate this level so modifying it (here, or one level down)
-        // can never affect whoever it was shared with.
-        let fresh_frame = GlobalFrameAllocator
-            .allocate_frame()
-            .expect("out of physical frames for fork");
-        let src_ptr: *const PageTable = (offset + next_frame.start_address().as_u64()).as_ptr();
-        let dst_ptr: *mut PageTable = (offset + fresh_frame.start_address().as_u64()).as_mut_ptr();
-        core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 1);
-        entry.set_frame(fresh_frame, entry.flags());
+/// Which pages a process's address space holds that are *its own* --
+/// everything `fork()` has to duplicate and `exec()` throws away, as
+/// opposed to the kernel mappings every address space shares.
+///
+/// This is the bookkeeping whose absence used to make `fork` a
+/// special case per caller: `crate::syscall`'s `SYS_FORK` handler
+/// hardcoded a list of pages for the one ring-3 task known to call it,
+/// and refused anyone else (`ERR_FORK_UNSUPPORTED_CALLER`). Whoever
+/// *builds* an address space knows this already -- `crate::elf`'s loader
+/// has just walked the program headers, `crate::usermode` has just
+/// mapped its two demo pages -- so the map is filled in there and
+/// carried in the process table (`crate::proc::Proc::mem_map`) for
+/// `fork` to read back.
+#[derive(Clone, Copy)]
+pub struct MemMap {
+    segments: [Segment; MAX_SEGMENTS],
+    len: usize,
+}
 
-        table_frame = fresh_frame;
+impl MemMap {
+    /// The map of a process with no private memory at all: every kernel
+    /// task, which runs in the kernel's own address space.
+    pub const EMPTY: MemMap =
+        MemMap { segments: [Segment { base: VirtAddr::zero(), pages: 0 }; MAX_SEGMENTS], len: 0 };
+
+    /// Record one more run of `pages` pages starting at `base`. `false`
+    /// if the map is already full, which callers must treat as a failure
+    /// to build the address space rather than ignore -- a map missing a
+    /// segment is worse than no map, since `fork` would silently hand a
+    /// child a page still shared with its parent.
+    pub fn push(&mut self, base: VirtAddr, pages: usize) -> bool {
+        if self.len >= MAX_SEGMENTS {
+            return false;
+        }
+        self.segments[self.len] = Segment { base, pages };
+        self.len += 1;
+        true
     }
 
-    // `table_frame` is now our own, independent page table (not aliased
-    // with the source for this address). Replace its leaf entry with a
-    // fresh frame holding a copy of the original page's contents.
-    let pt: &mut PageTable = &mut *((offset + table_frame.start_address().as_u64()).as_mut_ptr());
-    let leaf = &mut pt[addr.p1_index()];
-    let original_frame = leaf.frame().expect("fork_one_page: page not present");
-    let fresh_data_frame = GlobalFrameAllocator
-        .allocate_frame()
-        .expect("out of physical frames for fork");
-    let src_ptr: *const u8 = (offset + original_frame.start_address().as_u64()).as_ptr();
-    let dst_ptr: *mut u8 = (offset + fresh_data_frame.start_address().as_u64()).as_mut_ptr();
-    core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, 4096);
-    leaf.set_frame(fresh_data_frame, leaf.flags());
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments[..self.len]
+    }
+
+    pub fn total_pages(&self) -> usize {
+        self.segments().iter().map(|s| s.pages).sum()
+    }
+
+    /// Every page this map covers, one segment after another.
+    pub fn pages(&self) -> impl Iterator<Item = Page<Size4KiB>> + '_ {
+        self.segments().iter().copied().flat_map(|seg| {
+            (0..seg.pages as u64).map(move |i| Page::containing_address(seg.base + i * PAGE_SIZE))
+        })
+    }
+}
+
+const PAGE_SIZE: u64 = 4096;
+
+/// Fork the address space rooted at `src_pml4` into a brand-new,
+/// independent one: it shares `base_pml4`'s mappings (the kernel image,
+/// the heap, the physical-memory window) the same way every address space
+/// here does, and gets a freshly allocated, byte-for-byte copy of every
+/// page in `map` -- so a write on either side is invisible to the other,
+/// which is the whole substance of `fork()`.
+///
+/// Ported in spirit from `kernel/proc.c`'s `do_fork()` and the copy
+/// `servers/pm/forkexit.c`'s `do_fork()` asks the kernel for: real MINIX
+/// duplicates the parent's `mp_seg` memory map and then copies the
+/// memory it describes, which (with no paging in that kernel) is exactly
+/// a contiguous physical copy. `map` is the `mp_seg` equivalent, and
+/// `crate::proc::mem_map_of` is where the caller gets it.
+///
+/// Copying *every* page in the map, rather than sharing the read-only
+/// ones, is deliberate and was a correctness fix rather than a
+/// simplification. An earlier version of this function built the child
+/// out of the parent's own page tables -- duplicating table levels along
+/// the path to each page it was told to copy, and leaving every other
+/// leaf entry pointing at the parent's frames. Two things were wrong with
+/// that. A page left shared has two address spaces referring to one
+/// frame, and nothing in this port counts references, so the first
+/// `free_address_space` of either side (an `exec`, a crash,
+/// `crate::proc::kill`) would hand the *other* process's live page back
+/// to the allocator. And duplicating table levels per page leaked one
+/// table frame per level every time two copied pages shared a path --
+/// which is every image whose text and data sit in the same 2 MiB
+/// region. Sharing read-only pages is worth having back once frames are
+/// reference-counted (it is what makes real `fork` cheap, and the first
+/// step toward copy-on-write); until then, a full copy is the version
+/// that is actually sound.
+///
+/// `None` if any part of it fails -- no frame left for a page or a page
+/// table, a page in `map` that isn't actually mapped in the parent, or a
+/// page whose PML4 slot `base_pml4` already uses (the
+/// `pml4_slots_unused` rule: mapping there would edit the *base's* own
+/// lower-level tables rather than the child's). A failed fork leaves
+/// nothing behind: the partially built address space is torn back down
+/// before returning.
+pub fn fork_address_space(
+    src_pml4: PhysFrame,
+    base_pml4: PhysFrame,
+    map: &MemMap,
+) -> Option<PhysFrame> {
+    let offset = physical_memory_offset();
+    // Safety: same contract as `copy_between_address_spaces`, which
+    // likewise holds two of these at once -- both are PML4 frames this
+    // module handed out, reached through the physical-memory window, and
+    // they are different address spaces (the parent's and a brand-new
+    // one), so the `&mut` they each hand out don't alias.
+    let src = unsafe { page_table_for(src_pml4) };
+    let (child_pml4, mut child) = new_address_space_from(base_pml4, offset)?;
+
+    match copy_pages_into(&src, &mut child, base_pml4, map, offset) {
+        Ok(()) => Some(child_pml4),
+        Err(()) => {
+            // Safety: built here, never loaded into `CR3`, referenced by
+            // nothing else -- and derived from `base_pml4`, so the
+            // private/shared split `free_address_space` relies on holds.
+            unsafe { free_address_space(child_pml4, base_pml4) };
+            None
+        }
+    }
+}
+
+/// Give `child` its own copy of every page in `map`, reading the
+/// originals out of `src`. Factored out of `fork_address_space` so that
+/// one place can tear the half-built address space down on *any*
+/// failure, rather than every `?` needing to remember to.
+fn copy_pages_into(
+    src: &OffsetPageTable<'static>,
+    child: &mut OffsetPageTable<'static>,
+    base_pml4: PhysFrame,
+    map: &MemMap,
+    offset: VirtAddr,
+) -> Result<(), ()> {
+    let mut allocator = GlobalFrameAllocator;
+    for page in map.pages() {
+        let start = page.start_address();
+        if !pml4_slots_unused(base_pml4, start, start + (PAGE_SIZE - 1)) {
+            return Err(());
+        }
+        let (original, flags) = match src.translate(start) {
+            TranslateResult::Mapped { frame: MappedFrame::Size4KiB(frame), flags, .. } => {
+                (frame, flags)
+            }
+            // Not mapped, or mapped by a huge page this port never
+            // creates: either way the map disagrees with the page tables
+            // it claims to describe, which is a bug to report rather than
+            // paper over.
+            _ => return Err(()),
+        };
+        let fresh = allocator.allocate_frame().ok_or(())?;
+        // Safety: `original` is mapped in `src` (just translated) and
+        // `fresh` was handed out by the allocator a line ago; both are
+        // reachable through the physical-memory window, and 4 KiB is
+        // exactly one frame.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (offset + original.start_address().as_u64()).as_ptr::<u8>(),
+                (offset + fresh.start_address().as_u64()).as_mut_ptr::<u8>(),
+                PAGE_SIZE as usize,
+            );
+        }
+        // Safety: `page` is unmapped in `child` (a fresh address space
+        // whose only non-empty PML4 slots are `base_pml4`'s, which the
+        // check above excluded) and `fresh` is not mapped anywhere else.
+        // `.ignore()` rather than `.flush()`: this address space isn't in
+        // `CR3`, so there's nothing cached to invalidate.
+        match unsafe { child.map_to(page, fresh, flags, &mut allocator) } {
+            Ok(flush) => flush.ignore(),
+            Err(_) => {
+                // Safety: allocated just above, never mapped anywhere.
+                unsafe { deallocate_frame(fresh) };
+                return Err(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Give back every frame that belongs to the address space rooted at

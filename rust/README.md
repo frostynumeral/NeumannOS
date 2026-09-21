@@ -119,6 +119,28 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   `RS` (`crate::rs`). Called from `crate::interrupts` when a ring-3 task
   takes a CPU exception; this port's stand-in for real MINIX turning a
   user-process fault into a signal and `PM` reporting the exit to `RS`.
+  Two of `struct proc`'s neighbours from `servers/pm/mproc.h` live here
+  too, since `fork` is a kernel call in this port and the kernel is
+  therefore who needs them: `Proc::mem_map` (`mp_seg[]`, which pages this
+  process owns -- see `src/memory.rs`'s `MemMap`) and `Proc::parent`
+  (`mp_parent`, who forked it). They travel with the page table as one
+  `AddressSpace` value rather than as parallel arguments, so the map and
+  the `CR3` it describes cannot get out of step -- `exec`
+  (`set_address_space`) replaces both together, and a process whose map
+  was left behind would have a later `fork` copying pages that no longer
+  exist. `alloc_proc_nr`/`release_proc_nr` hand out and take back the
+  process numbers above `com::FIRST_DYNAMIC_PROC_NR`, which is what lets
+  a process be created because something asked for one at runtime rather
+  than because `crate::com` reserved a number for it in advance
+  (`servers/pm/forkexit.c` scans `mproc[]` for a free slot and calls the
+  same condition `EAGAIN`). The claim happens up front, marking the slot
+  `rts::RESERVED`, precisely because the following `fork_current` is
+  several frame-allocating steps away: a timer tick landing in that gap
+  can switch to a task that forks too, and an allocator that merely
+  *looked* would hand it the same number and have it overwrite a
+  half-built process. `child_of` is the inverse of `parent`, and is how
+  anything outside a runtime-created process finds it now that no
+  constant names it.
 - `src/gdt.rs` — Global Descriptor Table and Task State Segment, ported from
   the segment/TSS setup in `kernel/protect.c`. Its only real job right now
   is giving the double-fault handler a dedicated stack (via the TSS's
@@ -202,13 +224,53 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   and copy page-at-a-time between two such address spaces -- this is
   where `sys_umap`/`sys_vircopy`'s actual job (translating between address
   spaces) applies; see `src/calls.rs` below for the kernel-call wrapper.
-  `fork_address_space` goes one step further than `new_address_space`
-  alone can: for each address in an explicit list, it walks that
-  address's *entire* page-table path fresh, duplicating any level still
-  shared with the source (so touching it can never modify the original)
-  and deep-copying the leaf page's contents into a newly allocated frame
-  -- what real `fork()` needs for every page the parent already had, not
-  just ones mapped after the fork. The physical frame allocator is now a
+  `MemMap` is the per-process memory map: a small, fixed-capacity list
+  of `Segment`s (a base address and a page count) naming the pages an
+  address space holds that are *the process's own*, as opposed to the
+  kernel mappings every address space shares. It is the Rust counterpart
+  of `include/minix/type.h`'s `struct mem_map`, three of which
+  (`mp_seg[T]`/`[D]`/`[S]`) describe a MINIX process's whole layout in
+  `servers/pm/mproc.h` -- minus the physical base, since here the page
+  tables already record where each page lives. Whoever *builds* an
+  address space fills it in, because that is where the answer is known:
+  `usermode::build_ring3_address_space` has just mapped its two demo
+  pages, and `elf::load_image` has just walked an image's program
+  headers (a compile-time assertion in `src/elf.rs` keeps `MAX_SEGMENTS`
+  big enough for every `PT_LOAD` segment `validate` will accept plus the
+  stack). The process table carries it from there
+  (`proc::AddressSpace`/`Proc::mem_map`), which is what makes `fork` a
+  general call rather than a special case per caller -- see the
+  `src/syscall.rs` bullet.
+  `fork_address_space` is what reads it: it builds a fresh address space
+  derived from the *kernel's* PML4 and gives the child an independently
+  allocated, byte-for-byte copy of every page in the map, carrying each
+  page's original permission flags across. `pml4_slots_unused` gates
+  every page, the same rule `exec` is held to, and a failure anywhere
+  (no frame left, a map naming a page its own page tables don't have)
+  tears the half-built address space back down and reports `None`, so a
+  failed `fork` costs nothing.
+  That copy-everything shape replaced a cleverer one, and the
+  replacement was a correctness fix rather than a simplification. The
+  earlier version built the child out of the *parent's* page tables:
+  duplicating table levels along the path to each page it was told to
+  copy, and leaving every other leaf entry pointing at the parent's own
+  frames -- read-only pages like a program's text deliberately left
+  shared, which is both cheaper and closer to what a real `fork` does.
+  Two things were wrong with it, neither observable in the one
+  fork this port used to perform. A shared page means two address spaces
+  referring to one frame with nothing counting references, so the first
+  `free_address_space` of *either* side -- an `exec`, a crash,
+  `proc::kill` -- would hand the other process's live page back to the
+  allocator; the fork/exec pair `user/shell.s` now performs walks
+  straight into that (the child frees the image it inherited the instant
+  it execs, 11 frames of it). And duplicating table levels per page
+  leaked one table frame per level whenever two copied pages shared a
+  path, which is every image whose text and data sit in the same 2 MiB
+  region -- again, not the one two-page fork that existed. Sharing
+  read-only pages is worth having back once frames are
+  reference-counted, and is the first step toward copy-on-write; until
+  then, a full copy is the version that is actually sound.
+  The physical frame allocator is now a
   global, lock-protected resource (`GlobalFrameAllocator`,
   `init_frame_allocator`) rather than a value threaded through
   `kernel_main`'s locals, since a kernel call like `sys_fork` needs to
@@ -364,6 +426,8 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   point and stack, a fresh `RFLAGS` of `0x202` (deliberately not
   inherited -- a new program shouldn't start with the direction flag its
   predecessor left set), and every general-purpose register zeroed.
+  `set_address_space` and `fork_current` both take that one
+  `AddressSpace` value now, rather than a bare PML4 frame.
 - `src/calls.rs` — the first kernel calls, ported from
   `kernel/system/do_copy.c` (`sys_vircopy`), `do_setalarm.c`
   (`sys_setalarm`), and `kernel/proc.c`'s `do_fork()` (`sys_fork`). Real
@@ -380,11 +444,16 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   a `Scheduler::try_deliver_notification` helper shared with
   `mini_notify`, since `clock_tick` is already inside the scheduler lock
   and can't re-enter it); `sys_fork` resolves a parent process number to
-  an address space, deep-copies the given pages into a brand new one
+  an address space *and its memory map* (`proc::mem_map_of`), deep-copies
+  every page the map names into a brand new one
   (`memory::fork_address_space`), and spawns a task into it
   (`proc::spawn`) -- bundling what real MINIX splits into a kernel call
   (duplicate the memory) and a separate scheduling step, since nothing in
-  this port needs them separated yet. `sys_fork_from_frame` is `sys_fork`'s
+  this port needs them separated yet. Which pages to copy used to be an
+  argument, passed in by whoever happened to know; both fork entry points
+  share one `fork_child_address_space` helper now that reads it out of
+  the process table instead, so "fork this process" is a complete
+  request. `sys_fork_from_frame` is `sys_fork`'s
   real-fork-semantics sibling: identical deep-copy step, but hands
   `proc::fork_current` a `proc::TrapFrame` snapshot instead of a fixed
   entry point (see the `src/proc.rs`/`src/syscall.rs` bullets above) --
@@ -669,8 +738,9 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   builds its address space in `kernel_main`, the same way `driver`'s is
   built) -- a real ELF64 binary (`user/hello.elf`) executing its own
   counter-increment/`SYS_GET_UPTIME` loop in ring 3 five times, then a real
-  `SYS_FORK`: `tty` forks itself into a genuine child process
-  (`com::FORK_CHILD_PROC_NR`) that resumes at that *exact* point too,
+  `SYS_FORK`: `tty` forks itself into a genuine child process (at a
+  process number allocated on the spot -- `proc::alloc_proc_nr`) that
+  resumes at that *exact* point too,
   diverging only in `SYS_FORK`'s own return value -- the parent (seeing
   its child's nonzero `proc_nr`) falls through to continue the sequence
   below unchanged, while the child (seeing `0`) writes a canary into its
@@ -794,8 +864,9 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 ### Known simplifications in the syscall ABI
 
 - **Twelve calls exist**, and all but the unrecognized-call-number
-  fallback reach real server/kernel-call logic, including `SYS_FORK` now
-  (see the `src/syscall.rs`/`src/proc.rs` bullets above). Real enough to
+  fallback reach real server/kernel-call logic, including `SYS_FORK`
+  from any ring-3 caller now (see the `src/syscall.rs`/`src/proc.rs`
+  bullets above). Real enough to
   write a genuine ring-3 program against (a demo user program can now get
   the time, print, sleep, do real file I/O, block for real keyboard
   input, read another process's memory, and fork itself), but still a
@@ -872,17 +943,30 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   real, independent copy -- not aliased with the parent's -- plus its own
   `SYS_FS_OPEN`/`SYS_FS_WRITE` to a distinct file, all checked back from
   `IDLE` afterward; see `fork_child_verify` in `src/main.rs`).
-- **`private_pages` must be listed explicitly**, rather than discovered
-  by walking the parent's entire user-accessible page-table range. There's
-  no per-process memory-map bookkeeping yet (`kernel/kernel.h`'s
-  `struct mem_map`) to read it back out of -- for `SYS_FORK` specifically,
-  this means `crate::syscall`'s dispatch hardcodes which pages matter per
-  *caller* (only `TTY_PROC_NR` is known at all; anyone else gets
-  `ERR_FORK_UNSUPPORTED_CALLER`), and there's exactly one reserved child
-  slot (`com::FORK_CHILD_PROC_NR`) -- a second fork before the first
-  child's slot is somehow freed would just overwrite it, the same
-  one-outstanding-instance simplification `crate::rs`'s `SERVICES` table
-  already has.
+- **Which pages to copy is read out of the process table now**, not
+  passed in by whoever happens to know. `Proc::mem_map`
+  (`crate::memory::MemMap`, filled in by whoever built the address space
+  -- see the `src/memory.rs` bullet above) is this port's `mp_seg[]`, so
+  `fork` is a call any process with an address space of its own can
+  make: `crate::syscall`'s dispatch no longer keeps a hardcoded page list
+  per *caller*, and `ERR_FORK_UNSUPPORTED_CALLER` now means the much
+  narrower "a kernel task asked to fork, and its memory is the kernel's"
+  rather than "this isn't the one task we know about". Child process
+  numbers are allocated at runtime too (`proc::alloc_proc_nr`,
+  `com::FIRST_DYNAMIC_PROC_NR`), so there is no single reserved child
+  slot for a second fork to overwrite. What's still missing is the part
+  that makes a real `fork` cheap: every page in the map is *copied*,
+  because sharing the read-only ones needs frame reference counts this
+  port doesn't have (see the `src/memory.rs` bullet for why the earlier,
+  sharing version was unsound rather than merely clever), and
+  copy-on-write for the writable ones needs the same plus a `#PF`
+  handler that resolves faults instead of reporting them. There's also
+  no `wait()`/exit-status side to it at all: `Proc::parent` records who
+  forked whom, but nothing can be waited for, and a dynamic process
+  number is never reclaimed once a child blocks forever, so the pool
+  (`com::NR_DYNAMIC_PROCS`, four) drains monotonically -- generous
+  against the three processes that fork today, and not a real process
+  lifecycle.
 - **`sys_vircopy` skips validation** real MINIX's `do_copy` does first:
   resolving `SELF` to the caller's own process number, and rejecting
   invalid process numbers. Every current caller already knows both real
@@ -1023,11 +1107,19 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   that can resume at a recovery address), which this port has nowhere
   yet; it is a pre-existing property of the whole syscall surface rather
   than of `exec`, but `exec` is a conspicuous place to meet it.
-- **Unlike `SYS_FORK`, it isn't hardcoded to one caller** -- `sys_exec`
-  works for any ring-3 process, since replacing an address space needs no
-  per-caller knowledge (`SYS_FORK` still needs an explicit private-pages
-  list, see "known simplifications in the kernel calls"). The demo only
-  exercises one caller, but the call itself is general.
+- **It composes with `fork` for real now.** `sys_exec` was always
+  general -- replacing an address space needs no per-caller knowledge --
+  but the demo used to have `shell` exec over *itself*, which proves exec
+  and makes a nonsense shell (the process that asks for a program is the
+  one that stops existing). `user/shell.s` forks first now, and the
+  child is what execs, which is the shape every real program launch has.
+  That combination is also what first made `fork`'s old page-sharing
+  unsound in practice rather than in theory: the child frees the image it
+  inherited the moment it execs. `crate::main`'s `exec_verify` checks
+  both address spaces afterward -- the exec'd image's `.data` is readable
+  in the child and unmapped in the parent, and `shell`'s own marker page
+  is the reverse -- so "exec reached the right process" is checked, not
+  assumed.
 
 ### Known simplifications in the VGA graphics
 
@@ -1208,9 +1300,14 @@ Roughly in the order the original kernel needs them:
    fixed-entry-point shape (verified by the child's canary write and its
    own independent `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
    `IDLE`). See "known simplifications" above for what's not implemented
-   yet (`sys_umap`, more of `kernel/system/do_*.c`, full POSIX fork/exec
-   continuation semantics for a *general* process, not just this one
-   hardcoded ring-3 caller).
+   yet (`sys_umap`, more of `kernel/system/do_*.c`, and `fork`'s missing
+   other halves -- copy-on-write, and a `wait()`/exit-status side that
+   would let a dynamic process number ever be reclaimed). Which pages a
+   fork copies and which process number its child gets are no longer
+   hardcoded per caller, though: both come from real bookkeeping now
+   (`crate::memory::MemMap` in `Proc::mem_map`, and
+   `proc::alloc_proc_nr`), so `SYS_FORK` works for any ring-3 process
+   rather than the one it was written for.
 10. ~~**A minimal ELF loader**~~ — done (`src/elf.rs`). Parses a real,
     statically linked ELF64 binary (`user/hello.elf`) and maps its
     `PT_LOAD` segments into a fresh address space at their own specified
@@ -1247,22 +1344,31 @@ Roughly in the order the original kernel needs them:
     hardcoded demo, launchable on demand via a console `run <name>`
     command (see the `src/rs.rs`/`src/keyboard.rs` bullets above).
     `sys_fork`'s "child resumes at the parent's exact call site" gap is
-    also closed now, for the one ring-3 caller that exercises it
-    (`crate::syscall`'s `SYS_FORK`/`sys_fork_from_frame`, see item 9
-    above), and so is its other half: `exec()` is real
-    (`crate::calls::sys_exec`, `crate::syscall`'s `SYS_EXEC`) -- `shell`
-    loads a *different* program out of `fs` by path and replaces its own
-    image with it, keeping its process number, priority, kernel stack and
-    open descriptors, and resuming in ring 3 at the new binary's entry
-    point on a freshly mapped stack, in an address space that no longer
-    contains a single page of what it used to be running (proven by
-    `crate::main`'s `exec_verify`, which requires reading the old image's
-    `.data` back to *fail*). A deliberately-failed exec of a non-ELF file
-    is checked too, since "a failed exec leaves the caller exactly as it
-    was" is the guarantee most easily broken here. Still missing: `argv`/
-    `envp` and freeing the replaced image (see "known simplifications in
-    `exec()`" above), a general per-process memory map so any caller (not
-    just a hardcoded, known one) can fork itself, and `fs`
+    closed (`crate::syscall`'s `SYS_FORK`/`sys_fork_from_frame`, see item
+    9 above), and so is its other half: `exec()` is real
+    (`crate::calls::sys_exec`, `crate::syscall`'s `SYS_EXEC`) -- a
+    process loads a *different* program out of `fs` by path and replaces
+    its own image with it, keeping its process number, priority, kernel
+    stack and open descriptors, and resuming in ring 3 at the new
+    binary's entry point on a freshly mapped stack, in an address space
+    that no longer contains a single page of what it used to be running
+    (proven by `crate::main`'s `exec_verify`, which requires reading the
+    old image's `.data` back to *fail*). A deliberately-failed exec of a
+    non-ELF file is checked too, since "a failed exec leaves the caller
+    exactly as it was" is the guarantee most easily broken here.
+    The two now compose the way a shell composes them, which is the point
+    of having both: `shell` (`user/shell.s`) *forks*, and its child is
+    what execs `/bin/echo`, while the parent goes on being `shell`. That
+    needed the last two things keeping `fork` from being a general call
+    -- a per-process memory map saying which pages a fork must copy
+    (`crate::memory::MemMap`, in `Proc::mem_map`), and a process number
+    handed out when the fork happens rather than reserved per caller in
+    `crate::com` (`proc::alloc_proc_nr`) -- so `SYS_FORK` is now
+    something any ring-3 process can call, as many times as there are
+    slots, instead of something one hardcoded task could do once. Still
+    missing: `argv`/`envp` (see "known simplifications in `exec()`"
+    above), copy-on-write and a `wait()`/exit-status side to `fork` (see
+    "known simplifications in the kernel calls"), and `fs`
     growing `readdir` and a real backing store (see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
     file/directory table. Ring-3 callers can now reach `fs` for real
@@ -1364,9 +1470,14 @@ Roughly in the order the original kernel needs them:
     and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
     `IDLE`. See "known simplifications in the syscall ABI" above for what's
     not a real syscall surface yet (twelve calls, one code per *kind* of
-    dispatch-level mistake rather than a real per-cause `errno` set,
-    `SYS_FORK` hardcoded to one known caller and one reserved child
-    slot). The twelfth is `SYS_EXEC`, which uses the same `frame_ptr`
+    dispatch-level mistake rather than a real per-cause `errno` set).
+    `SYS_FORK` is no longer restricted to one known caller with one
+    reserved child slot: the pages to copy come out of the caller's own
+    memory map (`crate::memory::MemMap`) and the child's process number
+    is allocated when the call happens (`crate::proc::alloc_proc_nr`),
+    so `shell` forks too -- three distinct forked processes in one boot,
+    where one reserved slot would have had the second overwrite the
+    first. The twelfth is `SYS_EXEC`, which uses the same `frame_ptr`
     plumbing `SYS_FORK` introduced for the opposite purpose: rather than
     copying the caller's trap into a new process, it overwrites the
     caller's own saved registers, so the trap returns into a different
@@ -1462,7 +1573,13 @@ then a second, independent instance of the ELF-loaded task (a new
 process, `APP1_PROC_NR`) running through its own full lifecycle --
 `SYS_GET_UPTIME`, a real alarm, `SYS_WRITE_LINE`, `fs` open/write, and
 finally blocking on its own `SYS_READ_LINE` -- entirely separately from
-`tty`'s boot-time run of the same binary.
+`tty`'s boot-time run of the same binary. That includes its own
+`SYS_FORK` (`[syscall] proc 10: SYS_FORK -> child proc_nr 14`), which is
+the clearest demonstration of what the dynamic process-number pool
+bought: with one reserved child slot, this second instance's fork would
+have overwritten `tty`'s child rather than becoming a fourth process.
+A repeat `run hello` answers `-> -2` (`RS_ALREADY_RUNNING`) -- `rs`
+tracks one instance per service, which is unrelated and unchanged.
 Expected output on COM1: a line confirming the LCARS demo panel
 was painted (`vga: painted the LCARS demo panel ...`, printed as early as
 possible -- before paging/heap/scheduler setup -- so the panel is on
@@ -1501,11 +1618,13 @@ and `tty` (a real ELF64 binary loaded by `crate::elf`) each making real,
 register-dispatched syscalls through `crate::syscall` --
 `[syscall] proc P: SYS_GET_UPTIME -> N` a few times each, `tty`
 additionally calling `SYS_FORK` right after its own loop
-(`[syscall] proc 5: SYS_FORK -> child proc_nr 11`) and genuinely forking
-itself: a real, separately-scheduled child (`proc_nr` 11) resumes at that
+(`[syscall] proc 5: SYS_FORK -> child proc_nr 13`) and genuinely forking
+itself: a real, separately-scheduled child (`proc_nr` 13 -- a number
+allocated at the moment of the fork, not reserved for it, so it depends
+on what has forked already) resumes at that
 same point seeing `0` instead, writes a canary into its own copy of
 `vircopy_buf`, and makes its own independent `SYS_FS_OPEN`/`SYS_FS_WRITE`
-(`[syscall] proc 11: SYS_FS_OPEN("/from_fork_child.txt") -> N`) before
+(`[syscall] proc 13: SYS_FS_OPEN("/from_fork_child.txt") -> N`) before
 blocking for good -- while `tty` itself (seeing its child's nonzero
 `proc_nr`) falls straight through to `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
 (`[syscall] proc 5: SYS_SET_ALARM(3 ticks)`, then, after genuinely
@@ -1530,7 +1649,7 @@ running other tasks when it showed up), `memory`'s demo task spinning
 through many quanta purely because the timer forces it to keep yielding
 and resuming (asynchronous preemption -- watch its counter resume from
 exactly where it left off every time), and finally, once everything else
-has blocked, `IDLE` running eleven independent checks against processes
+has blocked, `IDLE` running sixteen independent checks against processes
 that have long since gone quiet: `sys_vircopy`-ing `tty`'s `.data` counter
 back out and confirming it reads `5` (proving the loaded ELF binary's own
 code genuinely ran, not just that it trapped the right number of times --
@@ -1546,12 +1665,14 @@ to confirm `tty`'s `SYS_FS_OPEN`/`SYS_FS_WRITE` calls genuinely reached
 `SYS_VIRCOPY` call actually landed the right bytes, doing the same for
 `err_result` to confirm the deliberately-invalid second `SYS_VIRCOPY`
 came back exactly `ERR_BAD_LENGTH`, and finally two checks on the forked
-child specifically: `sys_vircopy`-ing *its* `vircopy_buf` (targeting
-`proc_nr` 11, not `tty`) to confirm it holds the canary and not `tty`'s
+child specifically: `sys_vircopy`-ing *its* `vircopy_buf` (targeting the
+child's own `proc_nr`, found via `proc::child_of(TTY_PROC_NR)` rather
+than a constant, since nothing reserves a number for it) to confirm it
+holds the canary and not `tty`'s
 own content -- proof fork's copy was genuinely independent, not
 aliased -- and reading back `/from_fork_child.txt` to confirm the
-child's own file write reached `fs` too, and finally five checks on the
-`exec()` demo: reading back `/from_exec.txt` (written by the *exec'd*
+child's own file write reached `fs` too, and finally eight checks on the
+fork/exec demo: reading back `/from_exec.txt` (written by the *exec'd*
 image, `user/echo.s`), reading `/exec_error.bin` and confirming it holds
 exactly `ERR_BAD_ELF` -- which `shell` could only have written after
 surviving its own deliberately-failed exec of a non-ELF file --
@@ -1560,24 +1681,39 @@ reading `/evil_exec_error.bin` and confirming it too holds
 from ring 3, to `exec` a hand-built ELF asking to be mapped onto the
 kernel's own heap (`[syscall] proc 12: SYS_EXEC("/evil") -> bad image:
 SegmentInSharedSlot` appears earlier in the log), which the first
-version of this loader's validation accepted --
-`sys_vircopy`-ing the exec'd image's `.data` counter out of `proc_nr`
-12's address space and confirming it reads `1` (the new program's own
-instructions ran, in the *caller's* process slot), and then the one
-check that has to fail: reading `shell`'s pre-exec marker page back out
-of that same process must come back `Err(SrcNotMapped)`
-(`[idle] reading shell's pre-exec marker page at 0x555555580000 back:
-Err(SrcNotMapped) ...`), since the image that wrote it no longer exists
-anywhere in that address space. Before all of that, watch `shell` itself
-(`proc_nr` 12) announce itself, fail an exec on purpose
-(`[syscall] proc 12: SYS_EXEC("/not_a_program") -> bad image: NotElf`),
-carry on regardless, and then stop being itself
+version of this loader's validation accepted -- then finding `shell`'s
+forked child in the process table and cross-checking it against
+`/shell_fork.bin`, the `proc_nr` `SYS_FORK` actually handed back to
+`shell` in ring 3 (`[idle] read back 12 from /shell_fork.bin -- the
+proc_nr SYS_FORK returned to shell in ring 3 (process table says 12)`),
+and then four reads that together pin down *which* address space
+changed: the exec'd image's `.data` counter reads `1` in the child and
+is `Err(SrcNotMapped)` in `shell`, while `shell`'s own marker page still
+reads `0xfeedface` in `shell` and is `Err(SrcNotMapped)` in the child
+(`[idle] reading shell's marker page at 0x555555580000 out of the
+*child* instead: Err(SrcNotMapped) ...`). The last of those is the
+strongest single line in the boot: the child had that page a moment
+ago -- it inherited a copy from the fork -- and `exec` freed 11 frames
+of that inherited image, so `shell`'s own copy still reading
+`0xfeedface` afterwards is also direct evidence that teardown didn't
+reach into the parent. Before all of that, watch `shell`
+(`proc_nr` 11) announce itself, fail an exec on purpose
+(`[syscall] proc 11: SYS_EXEC("/not_a_program") -> bad image: NotElf`),
+carry on regardless, and then fork
+(`[syscall] proc 11: SYS_FORK -> child proc_nr 12`) and go quiet with
+`shell: forked -- my child is becoming /bin/echo, and I am still shell`,
+while its child stops being that program entirely
 (`[syscall] proc 12: SYS_EXEC("/bin/echo") -> replaced its own image,
 entering at 0x666666660000 on a fresh stack`), with every line after
 that from `proc 12` coming from a completely different program. If
-`shell` runs before `pm` has installed `/bin/echo`, you'll also see a
+the child runs before `pm` has installed `/bin/echo`, you'll also see a
 few `-> fs error -2` (`ENOENT`) attempts a tick apart first: that's
-`user/shell.s`'s retry loop, not a failure. Finally `IDLE` reports that
+`user/shell.s`'s retry loop, not a failure. `IDLE` then exercises the
+dynamic process-number pool's own two edges, which no successful boot
+reaches on its own (`[idle] process-number pool: claimed the 2 remaining
+dynamic slot(s) ([14, 15]), then it correctly refused`): it claims every
+number left until the pool refuses, hands them all back, and checks the
+first one comes out again. Finally `IDLE` reports that
 it's halting. Just before that it reports the final frame accounting and
 re-runs three more address-space build/teardown cycles
 (`[idle] frames in use: N (free list M) -- unchanged after three more
@@ -1585,7 +1721,7 @@ address-space cycles: N ...`) -- the same balance check the boot-time
 one makes, but at the end of a real workload, once `flaky`'s kills have
 actually put frames on the free list and `exec` has returned an image.
 Watch too for `[proc] reclaimed 9 frames from flaky (crash demo)` after
-each of its four crashes and `[proc] shell (exec demo) (proc_nr 12)
+each of its four crashes and `[proc] forked child 1 (proc_nr 12)
 replaced its address space, freed 11 frames of the old one`; both of
 those were permanent leaks until the allocator learned to take memory
 back. Finally `IDLE` reports it is halting (with the accumulated tick

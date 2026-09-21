@@ -1,11 +1,22 @@
-# A freestanding ELF64 program whose whole purpose is to stop being
-# itself: it calls exec() (crate::syscall's SYS_EXEC) on /bin/echo and is
-# replaced, in place, by a completely different binary (user/echo.s) --
-# same process number, same kernel stack, same scheduler slot, brand new
-# address space and brand new code. fork() (user/hello.s) makes a second
-# process that *is* the caller; exec() keeps the one process and throws
-# away everything about what it was running. This file is the second half
-# of that pair.
+# A freestanding ELF64 program that does what a shell does: it forks
+# (crate::syscall's SYS_FORK), and the child replaces itself with a
+# completely different binary (user/echo.s) via exec()
+# (crate::syscall's SYS_EXEC) while the parent carries on being itself.
+# fork() makes a second process that *is* the caller; exec() keeps one
+# process and throws away everything about what it was running. Running
+# a program is the two of them composed, and that composition is what
+# this file is for.
+#
+# It didn't used to fork: this program used to exec /bin/echo over
+# itself, which proved exec but meant the process that asked for a
+# program was also the one that stopped existing -- no shell can work
+# that way, since it would have nothing left to return to a prompt.
+# Forking first needs two things this port didn't have: a process number
+# handed out at runtime rather than reserved per caller in crate::com
+# (crate::proc::alloc_proc_nr), and a per-process memory map saying which
+# pages a fork has to copy (crate::memory::MemMap) -- without the
+# latter, SYS_FORK only worked for one hardcoded caller, and this program
+# wasn't it.
 #
 # Before the real exec it deliberately gets one *wrong*, too: it creates
 # /not_a_program (an ordinary text file), tries to exec that, and carries
@@ -21,17 +32,23 @@
 # than staying in memory because the successful exec below is about to
 # throw this program's memory away.
 #
-# Before exec'ing it writes 0xfeedface into pre_exec_marker, the first
+# Before forking it writes 0xfeedface into pre_exec_marker, the first
 # thing in its own .data (0x555555580000, this file's --section-start
-# below). That marker is how crate::main's exec_verify proves the *old*
-# image is genuinely gone afterward rather than merely no longer running:
-# it sys_vircopy's that exact address out of this process once exec has
-# happened and requires the read to *fail* (CopyError::SrcNotMapped) --
-# the page isn't mapped in the new address space at all. A verification
-# that only checked "the new program ran" would pass just as happily if
-# exec had bolted a second image onto the side of the first.
+# below). That marker does double duty in crate::main's exec_verify,
+# because after the fork there are two address spaces to ask about it.
+# Read out of the *child*, it has to be gone (CopyError::SrcNotMapped):
+# the child inherited a copy of this image and exec threw it away, so a
+# verification that only checked "the new program ran" -- which would
+# pass just as happily if exec had bolted a second image onto the side of
+# the first -- isn't what's being checked. Read out of the *parent*, it
+# has to still be 0xfeedface: this process kept running its own image
+# while its child stopped running that image entirely.
 #
-# The exec call sits in a bounded retry loop rather than being a
+# The parent also writes the proc_nr SYS_FORK handed back to it into
+# /shell_fork.bin, so exec_verify can check that ring 3's idea of which
+# process its child is matches the kernel's own (crate::proc::child_of).
+#
+# The child's exec call sits in a bounded retry loop rather than being a
 # straight-line call, and that is deliberate. /bin/echo has to be in
 # `fs` before it can be exec'd, and it gets there at runtime (crate::main's
 # seed_bin, from `pm`) -- so a straight-line exec here would be a bet on
@@ -110,8 +127,40 @@ _start:
     mov $7, %eax        # SYS_FS_WRITE
     int $0x80
 
+    # Fork. The parent gets the child's proc_nr in rax and stays this
+    # program; the child gets 0 and goes on to become a different one.
+    mov $11, %eax       # SYS_FORK (crate::syscall::SYS_FORK)
+    int $0x80
+    test %rax, %rax
+    jz 2f               # child (rax == 0): go exec /bin/echo below
+
+    # --- parent path: record which process the child is, and stay shell ---
+    mov %rax, fork_child_nr(%rip)
+    lea fork_path(%rip), %rdi
+    mov $fork_path_len, %esi
+    mov $6, %eax        # SYS_FS_OPEN
+    int $0x80
+    mov %rax, %r8
+
+    mov %r8, %rdi
+    lea fork_child_nr(%rip), %rsi
+    mov $8, %edx
+    mov $7, %eax        # SYS_FS_WRITE
+    int $0x80
+
+    lea still_shell(%rip), %rdi
+    mov $still_shell_len, %esi
+    mov $2, %eax        # SYS_WRITE_LINE
+    int $0x80
+
+    mov $3, %eax        # SYS_BLOCK_FOREVER
+    int $0x80
+    # unreachable: the parent waits here forever, still running this
+    # image -- which is exactly what exec_verify checks it is.
+2:
+    # --- child path: replace this inherited image with /bin/echo ---
     mov $ATTEMPTS, %r12d
-1:
+3:
     # SYS_EXEC (rdi=path ptr, rsi=path len). On success this never
     # returns *here*: the same iretq that would have resumed the next
     # instruction below instead lands at the new image's own entry point,
@@ -129,7 +178,7 @@ _start:
     mov $5, %eax        # SYS_WAIT_ALARM (crate::syscall::SYS_WAIT_ALARM)
     int $0x80
     dec %r12
-    jnz 1b
+    jnz 3b
 
     lea gave_up(%rip), %rdi
     mov $gave_up_len, %esi
@@ -157,11 +206,20 @@ err_path:
     .ascii "/exec_error.bin"
 err_path_len = . - err_path
 before:
-    .ascii "shell: about to replace myself with /bin/echo via a real exec()"
+    .ascii "shell: about to fork, and have the child become /bin/echo via a real exec()"
 before_len = . - before
+still_shell:
+    .ascii "shell: forked -- my child is becoming /bin/echo, and I am still shell"
+still_shell_len = . - still_shell
 gave_up:
     .ascii "shell: /bin/echo never showed up in fs -- giving up on exec()"
 gave_up_len = . - gave_up
+fork_path:
+    .ascii "/shell_fork.bin"
+fork_path_len = . - fork_path
+    .align 8
+fork_child_nr:
+    .quad 0
 prog:
     .ascii "/bin/echo"
 prog_len = . - prog

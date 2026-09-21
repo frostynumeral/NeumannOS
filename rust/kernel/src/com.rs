@@ -56,22 +56,54 @@ pub const CONSOLE_PROC_NR: i32 = 9;
 /// `FLAKY_PROC_NR`/`CONSOLE_PROC_NR`: there's no free-list/dynamic
 /// process-number allocator in this port yet.
 pub const APP1_PROC_NR: i32 = 10;
-/// Reserved slot for `crate::syscall`'s `SYS_FORK`: the one outstanding
-/// forked child this port supports at a time, same reasoning as
-/// `APP1_PROC_NR` -- no dynamic process-number allocator yet, and no
-/// per-process memory-map bookkeeping to decide *which* pages a generic
-/// caller's fork should copy, so this is fixed to `tty`'s one demo fork
-/// rather than a real, any-process `fork()`.
-pub const FORK_CHILD_PROC_NR: i32 = 11;
 /// The `exec()` demo (`crate::calls::sys_exec`): a ring-3 task that
-/// starts life running `crate::elf::SHELL_ELF` and, a moment later, is
-/// running `/bin/echo` instead -- same process number, same slot, a
-/// different program. One process number covers both because that's the
-/// whole point of `exec`: unlike `FORK_CHILD_PROC_NR`, no second process
-/// is created.
-pub const SHELL_PROC_NR: i32 = 12;
+/// forks and whose *child*, a moment later, is running `/bin/echo`
+/// instead of the image it inherited -- the fork/exec pair a real shell
+/// is built out of (`user/shell.s`). The child's own process number
+/// isn't here, because it isn't reserved at compile time any more: see
+/// `FIRST_DYNAMIC_PROC_NR`.
+pub const SHELL_PROC_NR: i32 = 11;
 
-pub const NR_BOOT_PROCS: usize = NR_TASKS + SHELL_PROC_NR as usize + 1;
+/// The first process number handed out at *runtime* rather than nailed
+/// down here (`crate::proc::alloc_proc_nr`), and how many of them there
+/// are. Every number above is a fixed member of the system image, the
+/// same way `kernel/table.c`'s `image[]` fixes MINIX's own; these are
+/// the slots left over for processes that only exist because something
+/// asked for one while the system was running -- which, in this port,
+/// means a `fork()` (`crate::syscall`'s `SYS_FORK`).
+///
+/// Two reserved slots used to stand in for this: `FORK_CHILD_PROC_NR`,
+/// "the one outstanding forked child this port supports at a time", and
+/// before it the same trick for every other runtime-created process. A
+/// fixed number per *caller* is what made `SYS_FORK` refuse anyone but
+/// one known task; a small pool plus `alloc_proc_nr` is what makes it a
+/// real call any process can make, as many times as there are slots.
+pub const FIRST_DYNAMIC_PROC_NR: i32 = SHELL_PROC_NR + 1;
+pub const NR_DYNAMIC_PROCS: usize = 4;
+
+/// A name for each dynamically allocated slot. `crate::proc::Proc::name`
+/// is a `&'static str` -- fine for a fixed system image, where every
+/// name is a literal, but a process created at runtime has no literal of
+/// its own -- so the names are pre-written here rather than composed
+/// when the process appears. Real MINIX has the same problem and solves
+/// it the same way in reverse: `p_name` is a fixed-size char array
+/// copied into, not a pointer.
+pub const fn dynamic_proc_name(proc_nr: i32) -> &'static str {
+    match proc_nr - FIRST_DYNAMIC_PROC_NR {
+        0 => "forked child 1",
+        1 => "forked child 2",
+        2 => "forked child 3",
+        3 => "forked child 4",
+        _ => "forked child",
+    }
+}
+
+/// How many process-table slots there are in total: every fixed process
+/// number above, plus the dynamic range. Not "boot processes" -- several
+/// of the fixed numbers (`FLAKY_PROC_NR`, `APP1_PROC_NR`) belong to
+/// processes started well after boot, and the dynamic range belongs to
+/// ones that have no number until they exist.
+pub const NR_PROC_SLOTS: usize = NR_TASKS + FIRST_DYNAMIC_PROC_NR as usize + NR_DYNAMIC_PROCS;
 
 /// Map a process number to a dense array index, for the process table
 /// (`crate::proc`) and the IPC mailboxes it used to have on its own

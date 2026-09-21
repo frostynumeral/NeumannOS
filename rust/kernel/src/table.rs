@@ -14,7 +14,12 @@ pub struct BootImageEntry {
     pub name: &'static str,
 }
 
-pub static BOOT_IMAGE: [BootImageEntry; NR_BOOT_PROCS] = [
+/// One entry per *fixed* process number (`crate::com`), which is what
+/// `image[]` is in the C kernel too -- not one per process-table slot
+/// (`NR_PROC_SLOTS`), since the dynamic range above
+/// `FIRST_DYNAMIC_PROC_NR` has no names or numbers until something
+/// forks into it.
+pub static BOOT_IMAGE: [BootImageEntry; NR_TASKS + FIRST_DYNAMIC_PROC_NR as usize] = [
     BootImageEntry { proc_nr: IDLE, name: "IDLE" },
     BootImageEntry { proc_nr: CLOCK, name: "CLOCK" },
     BootImageEntry { proc_nr: SYSTEM, name: "SYSTEM" },
@@ -30,6 +35,5 @@ pub static BOOT_IMAGE: [BootImageEntry; NR_BOOT_PROCS] = [
     BootImageEntry { proc_nr: FLAKY_PROC_NR, name: "flaky" },
     BootImageEntry { proc_nr: CONSOLE_PROC_NR, name: "console" },
     BootImageEntry { proc_nr: APP1_PROC_NR, name: "hello (app slot, not started at boot)" },
-    BootImageEntry { proc_nr: FORK_CHILD_PROC_NR, name: "fork_child (slot, not started at boot)" },
-    BootImageEntry { proc_nr: SHELL_PROC_NR, name: "shell (exec demo)" },
+    BootImageEntry { proc_nr: SHELL_PROC_NR, name: "shell (fork/exec demo)" },
 ];

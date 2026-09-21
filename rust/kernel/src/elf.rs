@@ -15,7 +15,7 @@
 //! `p_memsz` (real BSS semantics) rather than assuming the file image and
 //! the mapped size are the same thing.
 
-use crate::memory::{self, GlobalFrameAllocator};
+use crate::memory::{self, GlobalFrameAllocator, MemMap};
 use crate::{com, fs, proc, serial_println};
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -57,10 +57,11 @@ const PAGE_SIZE: u64 = 4096;
 /// build command). Exposed so a kernel task can `sys_vircopy` it back out
 /// after the demo ends and confirm the loaded program's own code
 /// genuinely executed and wrote to its mapped `.data` segment -- not just
-/// that it trapped into the kernel the expected number of times. Also the
-/// page `crate::syscall`'s `SYS_FORK` handler lists as one of `tty`'s
-/// private pages: it holds every other symbol below too (`vircopy_buf`,
-/// `err_result`, ...), all in the same 4 KiB page.
+/// that it trapped into the kernel the expected number of times. Also
+/// the page that holds every other symbol below (`vircopy_buf`,
+/// `err_result`, ...), all in the same 4 KiB page -- which is why
+/// `tty`'s `SYS_FORK` copying it is what makes the forked child's own
+/// canary write observable.
 pub const COUNTER_ADDR: u64 = 0x_5555_5556_0000;
 
 /// Where `user/hello.s`'s `vircopy_buf` lives -- the destination `tty`'s
@@ -85,15 +86,19 @@ pub const ERR_RESULT_ADDR: u64 = 0x_5555_5556_00fe;
 
 /// Where `user/shell.s`'s `pre_exec_marker` lives (the first thing in its
 /// `.data`, matching its `--section-start` build command). `crate::main`'s
-/// `exec_verify` requires reading this address out of the exec'd process
-/// to *fail*: it belongs to the image exec threw away, and nothing maps it
-/// in the address space that replaced it.
+/// `exec_verify` reads this address out of *both* processes involved in
+/// the fork/exec pair and requires opposite answers: still
+/// `0xfeedface` in `shell` itself, which never stopped running its own
+/// image, and a failed read in the child, which inherited a copy of that
+/// image and then had `exec` throw it away.
 pub const SHELL_MARKER_ADDR: u64 = 0x_5555_5558_0000;
 
 /// Where `user/echo.s`'s `counter` lives (the first thing in *its*
 /// `.data`). `crate::main`'s `exec_verify` reads this back out of the
-/// exec'd process and checks it's `1` -- the new image's own instructions
-/// having run, inside the caller's original process slot.
+/// process that exec'd and checks it's `1` -- the new image's own
+/// instructions having run, inside the caller's original process slot --
+/// and out of that process's *parent*, where it must not be mapped at
+/// all.
 pub const ECHO_COUNTER_ADDR: u64 = 0x_6666_6667_0000;
 
 /// One past the last canonical lower-half address. A segment above this
@@ -169,8 +174,8 @@ struct Elf64ProgramHeader {
 /// more than one ELF-loaded task -- the boot-time demo *and* whatever
 /// `spawn_from_fs` launches later -- able to coexist, each looking up its
 /// own entry by `proc::current_proc_nr()` once its trampoline runs.
-static ELF_TASK_PARAMS: Mutex<[(u64, u64); com::NR_BOOT_PROCS]> =
-    Mutex::new([(0, 0); com::NR_BOOT_PROCS]);
+static ELF_TASK_PARAMS: Mutex<[(u64, u64); com::NR_PROC_SLOTS]> =
+    Mutex::new([(0, 0); com::NR_PROC_SLOTS]);
 
 /// Everything a successfully loaded image consists of. `load` records
 /// the last two fields in `ELF_TASK_PARAMS` for a task that hasn't
@@ -181,7 +186,23 @@ pub struct LoadedImage {
     pub pml4: PhysFrame,
     pub entry: u64,
     pub stack_top: u64,
+    /// Which pages this image's segments and stack occupy, for the
+    /// process table to carry (`crate::proc::AddressSpace`) so that a
+    /// later `fork` of whoever runs it knows what to copy. Built here
+    /// because this is where it's known: the program headers have just
+    /// been walked, and nothing downstream can recover the layout from a
+    /// bare PML4 without re-walking the page tables.
+    pub map: MemMap,
 }
+
+/// A map has to be able to hold every `PT_LOAD` segment `validate` will
+/// accept, plus the stack segment `load_image` adds on top -- otherwise
+/// an image could load successfully with a segment missing from its map,
+/// and a later `fork` would hand the child a page still shared with its
+/// parent. Checked here, at compile time, rather than as a runtime
+/// error `load_image` would have to report and a self-test would have to
+/// cover.
+const _: () = assert!(MAX_LOAD_SEGMENTS + 1 <= memory::MAX_SEGMENTS);
 
 /// Why an image was rejected. Every variant is a check `load` used to
 /// make with `assert!` (or not at all): fine when the only images in the
@@ -404,12 +425,26 @@ pub fn load_image(base_pml4: PhysFrame, image: &[u8]) -> Result<LoadedImage, Elf
             .ok_or(ElfError::MappingFailed)?;
     let mut frame_allocator = GlobalFrameAllocator;
 
+    let mut map = MemMap::EMPTY;
     for i in 0..header.e_phnum as usize {
         let ph = program_header(image, &header, i)?;
         if ph.p_type != PT_LOAD || ph.p_memsz == 0 {
             continue;
         }
         load_segment(&mut mapper, &mut frame_allocator, image, &ph, physical_memory_offset)?;
+        // Page-granular, matching what `load_segment` actually mapped
+        // (and what `validate` counted): a segment's first and last
+        // pages usually extend past its own byte range.
+        let first_page = ph.p_vaddr / PAGE_SIZE;
+        let last_page = (ph.p_vaddr + ph.p_memsz - 1) / PAGE_SIZE;
+        let pages = (last_page - first_page + 1) as usize;
+        if !map.push(VirtAddr::new(first_page * PAGE_SIZE), pages) {
+            // Unreachable given the compile-time assertion above, since
+            // `validate` has already bounded the segment count -- an
+            // error rather than a panic for the same reason
+            // `MappingFailed` is one (the caller may be ring 3).
+            return Err(ElfError::TooManySegments);
+        }
     }
 
     let stack_flags = PageTableFlags::PRESENT
@@ -425,18 +460,23 @@ pub fn load_image(base_pml4: PhysFrame, image: &[u8]) -> Result<LoadedImage, Elf
             .ignore();
     }
 
+    if !map.push(VirtAddr::new(STACK_ADDR), 1) {
+        return Err(ElfError::TooManySegments);
+    }
+
     Ok(LoadedImage {
         pml4: pml4_frame,
         entry: header.e_entry,
         stack_top: STACK_ADDR + PAGE_SIZE,
+        map,
     })
 }
 
 /// `load_image` for a task that hasn't been spawned yet: records
 /// `proc_nr`'s entry point/stack top in `ELF_TASK_PARAMS` for
 /// `task_entry` to find once it's spawned under that same `proc_nr`, and
-/// returns the new address space's top-level page table frame, for
-/// `crate::proc::spawn` to record as that task's `CR3` -- same shape as
+/// returns the new address space (page table plus memory map) for
+/// `crate::proc::spawn` to record -- same shape as
 /// `usermode::create_address_space`.
 ///
 /// Both callers run in the kernel's own address space (`kernel_main`,
@@ -446,11 +486,11 @@ pub fn load_image(base_pml4: PhysFrame, image: &[u8]) -> Result<LoadedImage, Elf
 /// it means. The images loaded this way are the ones built into the
 /// kernel binary, so a malformed one really is a build bug and panicking
 /// is the right answer -- unlike `sys_exec`'s, which come from `fs`.
-pub fn load(image: &[u8], proc_nr: i32) -> PhysFrame {
+pub fn load(image: &[u8], proc_nr: i32) -> proc::AddressSpace {
     let (active_pml4, _) = Cr3::read();
     let loaded = load_image(active_pml4, image).expect("failed to load a built-in ELF image");
     record_params(proc_nr, &loaded);
-    loaded.pml4
+    proc::AddressSpace { pml4: loaded.pml4, map: loaded.map }
 }
 
 /// Remember where `task_entry` should start `proc_nr` once it's spawned.
@@ -712,7 +752,8 @@ pub fn spawn_from_fs(
     // than bringing the kernel down over it.
     let loaded = load_image(proc::kernel_cr3(), &image).map_err(|_| ENOEXEC)?;
     record_params(proc_nr, &loaded);
-    proc::spawn(proc_nr, name, task_entry, priority, quantum, true, Some(loaded.pml4));
+    let space = proc::AddressSpace { pml4: loaded.pml4, map: loaded.map };
+    proc::spawn(proc_nr, name, task_entry, priority, quantum, true, Some(space));
     Ok(())
 }
 

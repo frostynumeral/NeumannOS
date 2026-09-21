@@ -46,7 +46,6 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use bootloader::{entry_point, BootInfo};
 use core::panic::PanicInfo;
-use x86_64::structures::paging::PhysFrame;
 use x86_64::VirtAddr;
 
 entry_point!(kernel_main);
@@ -233,9 +232,9 @@ fn frame_reclaim_self_test() {
 /// entries (`IDL_F`/`TSK_F`/`SRV_F` flags) where a real counterpart
 /// exists.
 fn spawn_tasks(
-    ring3_address_space: PhysFrame,
-    elf_address_space: PhysFrame,
-    shell_address_space: PhysFrame,
+    ring3_address_space: proc::AddressSpace,
+    elf_address_space: proc::AddressSpace,
+    shell_address_space: proc::AddressSpace,
 ) {
     proc::spawn(com::IDLE, "IDLE", idle_task, proc::IDLE_Q, 8, true, None);
     proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false, None);
@@ -269,12 +268,13 @@ fn spawn_tasks(
         true,
         Some(elf_address_space),
     );
-    // The exec() demo, at the same priority as the other ring-3 tasks:
-    // it starts out running `elf::SHELL_ELF` and ends up running
-    // /bin/echo, without ever ceasing to be this process.
+    // The fork/exec demo, at the same priority as the other ring-3
+    // tasks: it starts out running `elf::SHELL_ELF`, forks, and its
+    // child ends up running /bin/echo -- the pair a real shell is built
+    // out of, rather than a process replacing itself in place.
     proc::spawn(
         com::SHELL_PROC_NR,
-        "shell (exec demo)",
+        "shell (fork/exec demo)",
         elf::task_entry,
         6,
         16,
@@ -311,6 +311,7 @@ fn idle_task() -> ! {
     vircopy_error_from_ring3_verify();
     fork_child_verify();
     exec_verify();
+    proc_slot_pool_check();
     runtime_reclaim_check();
     serial_println!("[idle] no other task is ready, halting (uptime: {} ticks)", proc::uptime_ticks());
     halt_loop()
@@ -406,8 +407,8 @@ fn vircopy_error_from_ring3_verify() {
 /// things a shared-page aliasing bug couldn't fake. First, the forked
 /// child's own `vircopy_buf` reads back the canary (`0xcafebabe`) the
 /// child's ring-3 code wrote into *its own* copy right after forking --
-/// read via a kernel-side `sys_vircopy` targeting
-/// `com::FORK_CHILD_PROC_NR` specifically, not `tty`. Second, `tty`'s own
+/// read via a kernel-side `sys_vircopy` targeting the child's own
+/// process number specifically, not `tty`. Second, `tty`'s own
 /// `vircopy_buf` (already checked by `vircopy_from_ring3_verify` above)
 /// still holds `driver`'s code bytes, not the child's canary -- if
 /// `memory::fork_address_space` had left the data page merely aliased
@@ -418,9 +419,17 @@ fn vircopy_error_from_ring3_verify() {
 /// the child's own, separately-scheduled ring-3 execution) the same way
 /// `fs_from_ring3_verify` does for `tty`'s own file.
 fn fork_child_verify() {
+    // The child's process number isn't reserved for it in `crate::com`
+    // any more (`proc::alloc_proc_nr` hands one out at the moment of the
+    // fork), so it's found the way a real system would find it: by
+    // asking the process table who `tty`'s child is.
+    let child = proc::child_of(com::TTY_PROC_NR)
+        .expect("tty's ring-3 SYS_FORK didn't leave a child in the process table");
+    serial_println!("[idle] tty's forked child is proc_nr {}", child);
+
     let mut canary_buf = [0u8; 4];
     calls::sys_vircopy(
-        com::FORK_CHILD_PROC_NR,
+        child,
         x86_64::VirtAddr::new(elf::VIRCOPY_BUF_ADDR),
         com::IDLE,
         x86_64::VirtAddr::new(canary_buf.as_mut_ptr() as u64),
@@ -450,11 +459,13 @@ fn fork_child_verify() {
     assert_eq!(&buf[..n as usize], expected, "fs content doesn't match what the forked child wrote");
 }
 
-/// Proves `shell`'s ring-3 `SYS_EXEC` call (`user/shell.s`, via
-/// `crate::syscall`) genuinely *replaced* that process's program rather
-/// than starting a second one alongside it. Five independent checks, in
-/// the order they run, each ruling out a different way a fake (or
-/// half-done) exec could still look real:
+/// Proves the fork/exec pair `user/shell.s` performs -- a ring-3
+/// `SYS_FORK` whose *child* then `SYS_EXEC`s `/bin/echo` -- did what a
+/// real shell's does: one process became two, and exactly one of them
+/// (the child) stopped being `shell` and became a different program
+/// entirely, at its own process number, without disturbing the parent.
+/// Eight independent checks, in the order they run, each ruling out a
+/// different way a fake (or half-done) fork/exec could still look real:
 ///
 /// 1. `/from_exec.txt` holds what `user/echo.s` writes -- read back
 ///    through `fs`'s ordinary kernel-side path, so the exec'd image
@@ -480,18 +491,32 @@ fn fork_child_verify() {
 ///    `elf::validator_self_test` covers the same ground kernel-side;
 ///    this is the one that proves the path is shut to an actual
 ///    unprivileged process.
-/// 4. `user/echo.s`'s own `.data` counter (`elf::ECHO_COUNTER_ADDR`)
-///    reads `1` *in `com::SHELL_PROC_NR`'s address space* -- the new
-///    program's instructions ran inside the original process's slot, not
-///    somewhere else. (A `spawn`-in-disguise would have put it in a
-///    different process.)
-/// 5. `user/shell.s`'s `pre_exec_marker` (`elf::SHELL_MARKER_ADDR`), a
-///    page that demonstrably *was* mapped in this process a moment ago
-///    (`shell` wrote to it before calling exec, and a write to an
-///    unmapped page would have faulted), is now unmapped: reading it
-///    back has to fail with `CopyError::SrcNotMapped`. (An exec that
-///    merely added the new image's mappings to the old address space --
-///    the easy way to get checks 1 and 4 to pass -- would fail here.)
+/// 4. The process table records a child of `com::SHELL_PROC_NR`
+///    (`proc::child_of`, from `Proc::parent`) -- the fork produced a
+///    second, real process, not just a syscall return value.
+/// 5. `/shell_fork.bin` holds that same process number, written by
+///    `shell` itself from whatever `SYS_FORK` returned in its `rax`.
+///    Ring 3's view of who its child is and the kernel's have to agree;
+///    a plausible-looking number that belonged to nothing would pass
+///    every other check here.
+/// 6. `user/echo.s`'s own `.data` counter (`elf::ECHO_COUNTER_ADDR`)
+///    reads `1` *in the child's address space* -- the new program's
+///    instructions ran, in the process that called exec. It is also
+///    *unmapped* in `shell` itself, which is what distinguishes "the
+///    child replaced its own image" from "the exec'd image got loaded
+///    into whoever asked".
+/// 7. `user/shell.s`'s `pre_exec_marker` (`elf::SHELL_MARKER_ADDR`) still
+///    reads `0xfeedface` in `com::SHELL_PROC_NR`: the parent kept the
+///    image it was running. An `exec` that reached the wrong process
+///    table slot -- the caller's parent rather than the caller -- would
+///    fail here, and nothing else in this port would notice.
+/// 8. That same marker page is *unmapped in the child*: reading it back
+///    has to fail with `CopyError::SrcNotMapped`. The child demonstrably
+///    had it a moment ago (it inherited a copy from the fork, and
+///    `shell` had already written to it), so this is what proves exec
+///    genuinely threw the old image away rather than merely adding the
+///    new one's mappings alongside it -- the easy way to get checks 1
+///    and 6 to pass.
 ///
 /// Runs from `idle_task` for the same reason every other check there
 /// does; see its doc comment. Check 1 additionally waits rather than
@@ -540,39 +565,140 @@ fn exec_verify() {
         "a ring-3 process was able to exec an image targeting the kernel's own address range"
     );
 
+    let child = proc::child_of(com::SHELL_PROC_NR)
+        .expect("shell's ring-3 SYS_FORK didn't leave a child in the process table");
+    serial_println!("[idle] shell's forked child -- the process that exec'd -- is proc_nr {}", child);
+
+    let mut fork_buf = [0u8; 8];
+    let fork_n = read_when_available("/shell_fork.bin", &mut fork_buf);
+    assert_eq!(fork_n, 8, "wrong length read back from /shell_fork.bin");
+    let observed = u64::from_le_bytes(fork_buf);
+    serial_println!(
+        "[idle] read back {} from /shell_fork.bin -- the proc_nr SYS_FORK returned to shell in ring 3 (process table says {})",
+        observed,
+        child
+    );
+    assert_eq!(
+        observed, child as u64,
+        "the proc_nr ring 3 got back from SYS_FORK isn't the child the kernel actually created"
+    );
+
     let mut counter_buf = [0u8; 4];
     calls::sys_vircopy(
-        com::SHELL_PROC_NR,
+        child,
         x86_64::VirtAddr::new(elf::ECHO_COUNTER_ADDR),
         com::IDLE,
         x86_64::VirtAddr::new(counter_buf.as_mut_ptr() as u64),
         counter_buf.len(),
     )
-    .expect("sys_vircopy failed reading the exec'd image's counter out of shell's address space");
+    .expect("sys_vircopy failed reading the exec'd image's counter out of the child's address space");
     let counter = i32::from_le_bytes(counter_buf);
     serial_println!(
-        "[idle] read back {} from /bin/echo's own .data counter, in shell's process (expected 1)",
+        "[idle] read back {} from /bin/echo's own .data counter, in the child's process (expected 1)",
         counter
     );
     assert_eq!(counter, 1, "the exec'd image's own code should have incremented its counter once");
 
+    let mut in_parent = [0u8; 4];
+    let leaked = calls::sys_vircopy(
+        com::SHELL_PROC_NR,
+        x86_64::VirtAddr::new(elf::ECHO_COUNTER_ADDR),
+        com::IDLE,
+        x86_64::VirtAddr::new(in_parent.as_mut_ptr() as u64),
+        in_parent.len(),
+    );
+    serial_println!(
+        "[idle] reading /bin/echo's counter page at {:#x} out of *shell* instead: {:?} (expected SrcNotMapped -- only the child exec'd)",
+        elf::ECHO_COUNTER_ADDR,
+        leaked
+    );
+    assert!(
+        matches!(leaked, Err(memory::CopyError::SrcNotMapped)),
+        "the exec'd image is mapped in the parent too -- exec reached the wrong address space"
+    );
+
     let mut marker_buf = [0u8; 4];
-    let stale = calls::sys_vircopy(
+    calls::sys_vircopy(
         com::SHELL_PROC_NR,
         x86_64::VirtAddr::new(elf::SHELL_MARKER_ADDR),
         com::IDLE,
         x86_64::VirtAddr::new(marker_buf.as_mut_ptr() as u64),
         marker_buf.len(),
+    )
+    .expect("sys_vircopy failed reading shell's own marker page -- the parent lost its image");
+    let marker = u32::from_le_bytes(marker_buf);
+    serial_println!(
+        "[idle] read back {:#x} from shell's own pre-fork marker at {:#x} (expected 0xfeedface -- the parent still is shell)",
+        marker,
+        elf::SHELL_MARKER_ADDR
+    );
+    assert_eq!(
+        marker, 0xfeedface,
+        "shell's own .data marker is gone -- its child's exec reached the parent's address space"
+    );
+
+    let mut stale_buf = [0u8; 4];
+    let stale = calls::sys_vircopy(
+        child,
+        x86_64::VirtAddr::new(elf::SHELL_MARKER_ADDR),
+        com::IDLE,
+        x86_64::VirtAddr::new(stale_buf.as_mut_ptr() as u64),
+        stale_buf.len(),
     );
     serial_println!(
-        "[idle] reading shell's pre-exec marker page at {:#x} back: {:?} (expected SrcNotMapped -- the old image is gone)",
+        "[idle] reading shell's marker page at {:#x} out of the *child* instead: {:?} (expected SrcNotMapped -- the inherited image is gone)",
         elf::SHELL_MARKER_ADDR,
         stale
     );
     assert!(
         matches!(stale, Err(memory::CopyError::SrcNotMapped)),
-        "shell's pre-exec .data page is still mapped after exec -- the old image wasn't replaced, only added to"
+        "the image the child inherited from shell is still mapped after exec -- the old image wasn't replaced, only added to"
     );
+}
+
+/// Exercises the two ends of the dynamic process-number pool
+/// (`proc::alloc_proc_nr`/`release_proc_nr`) that a working boot doesn't
+/// reach: what happens when it runs out, and whether a number handed
+/// back is really available again.
+///
+/// Neither is reachable from anything this port does on its own. Every
+/// fork here succeeds, because `com::NR_DYNAMIC_PROCS` is larger than
+/// the number of processes that fork (two at boot, a third if a service
+/// is launched from the console), so `crate::syscall`'s
+/// `ERR_NO_FREE_PROC` and the `release_proc_nr` call on the
+/// address-space-build failure path are both dead code in practice --
+/// exactly the sort of path that is wrong the first time it is ever
+/// needed. So: claim every remaining number until the pool says no,
+/// check it said no only once there was nothing left, give them all
+/// back, and check the pool is willing to hand out the same count again.
+///
+/// Runs after `fork_child_verify`/`exec_verify`, which need the real
+/// forked children's slots intact, and leaves the pool exactly as it
+/// found it so a console-launched service can still fork afterwards.
+fn proc_slot_pool_check() {
+    let mut claimed = [0i32; com::NR_DYNAMIC_PROCS];
+    let mut n = 0;
+    while let Some(proc_nr) = proc::alloc_proc_nr() {
+        assert!(n < com::NR_DYNAMIC_PROCS, "the pool handed out more numbers than it has");
+        claimed[n] = proc_nr;
+        n += 1;
+    }
+    serial_println!(
+        "[idle] process-number pool: claimed the {} remaining dynamic slot(s) ({:?}), then it correctly refused",
+        n,
+        &claimed[..n]
+    );
+    for &proc_nr in claimed[..n].iter() {
+        proc::release_proc_nr(proc_nr);
+    }
+    let again = proc::alloc_proc_nr();
+    assert_eq!(
+        again, claimed[..n].first().copied(),
+        "a released process number wasn't the next one handed out again"
+    );
+    if let Some(proc_nr) = again {
+        proc::release_proc_nr(proc_nr);
+    }
 }
 
 /// The boot-time `frame_reclaim_self_test` runs in an empty system;
@@ -937,27 +1063,39 @@ fn fs_directory_demo() {
 }
 
 /// Proves `sys_fork` (`crate::calls`) gives the child a genuinely
-/// independent *copy* of the forked page, not just another alias of the
-/// same physical memory: forks the ring-3 demo task's code page into a
-/// new child (`init`), overwrites the *child's* copy with a canary value,
-/// then reads back both copies. If fork only cloned the top-level page
-/// table (`memory::new_address_space` alone) rather than deep-copying the
-/// page (`memory::fork_address_space`), the original task's page would
-/// show the canary too, since both sides would still be the same
-/// physical frame.
+/// independent *copy* of the pages it inherits, not just another alias of
+/// the same physical memory: forks the ring-3 demo task's whole address
+/// space into a new child (`init`), overwrites the *child's* copy of its
+/// code page with a canary value, then reads back both copies. If fork
+/// only cloned the top-level page table
+/// (`memory::new_address_space` alone) rather than deep-copying each page
+/// in the parent's memory map (`memory::fork_address_space`), the
+/// original task's page would show the canary too, since both sides would
+/// still be the same physical frame.
+///
+/// Which pages get copied is no longer stated here: it comes from
+/// `driver`'s own memory map (`proc::mem_map_of`, recorded when
+/// `usermode::build_ring3_address_space` mapped them), so this demo
+/// exercises the same discovery path a ring-3 `SYS_FORK` does rather than
+/// naming the one page it intends to check.
 fn fork_demo() {
     let code_addr = x86_64::VirtAddr::new(usermode::USER_CODE_ADDR);
 
-    serial_println!("[pm] forking the ring-3 task's address space into a new child (init)");
-    calls::sys_fork(
-        com::DRVR_PROC_NR,
-        &[code_addr],
-        com::INIT_PROC_NR,
-        "init (forked child)",
-        forked_child_task,
-        5,
-        24,
-        true,
+    serial_println!(
+        "[pm] forking the ring-3 task's address space ({} pages, from its own memory map) into a new child (init)",
+        proc::mem_map_of(com::DRVR_PROC_NR).total_pages()
+    );
+    assert!(
+        calls::sys_fork(
+            com::DRVR_PROC_NR,
+            com::INIT_PROC_NR,
+            "init (forked child)",
+            forked_child_task,
+            5,
+            24,
+            true,
+        ),
+        "sys_fork failed to build the child's address space"
     );
 
     let canary: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
