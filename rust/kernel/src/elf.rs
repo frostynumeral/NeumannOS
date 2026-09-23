@@ -38,12 +38,31 @@ pub static SHELL_ELF: &[u8] = include_bytes!("../user/shell.elf");
 /// `SHELL_ELF`'s process is running by the time anything looks at it.
 /// Unlike the other two, this one is never loaded from a static byte
 /// slice at boot -- `crate::main`'s `seed_bin` writes it into `fs` at
-/// `/bin/echo`, and `sys_exec` reads it back out of the filesystem by
+/// `/bin/exectest`, and `sys_exec` reads it back out of the filesystem by
 /// path, the way a real `exec` finds a program. It's `include_bytes!`d
 /// here only to have something to install; nothing loads it directly.
 pub static ECHO_ELF: &[u8] = include_bytes!("../user/echo.elf");
 
-/// Fixed virtual address for this demo's one stack page, chosen clear of
+/// The ring-3 programs written in Rust (`rust/user/`, built and copied
+/// here by its `install.sh`), and where `crate::main`'s `seed_bin`
+/// installs each one in `fs`. Unlike the assembly programs above, these
+/// are meant to be *used*: `sh` runs the others by path, out of `/bin`.
+pub static RUST_PROGRAMS: [(&str, &[u8]); 4] = [
+    ("/bin/sh", include_bytes!("../user/bin/sh")),
+    ("/bin/echo", include_bytes!("../user/bin/echo")),
+    ("/bin/cat", include_bytes!("../user/bin/cat")),
+    ("/bin/ptrtest", include_bytes!("../user/bin/ptrtest")),
+];
+
+/// `sh` itself, which also starts at boot (`com::SH_PROC_NR`), the way
+/// `init` starts a login shell -- loaded from the kernel binary like the
+/// other boot-time programs, since `fs` is still empty when the address
+/// space is built.
+pub fn sh_elf() -> &'static [u8] {
+    RUST_PROGRAMS[0].1
+}
+
+/// Fixed virtual address of the *bottom* of every image's stack, chosen clear of
 /// `crate::usermode`'s own demo addresses (a different address space
 /// entirely, so no real collision risk -- just kept distinct for
 /// clarity) and of `HELLO_ELF`'s own linked addresses (see `user/hello.s`).
@@ -51,6 +70,20 @@ pub static ECHO_ELF: &[u8] = include_bytes!("../user/echo.elf");
 /// image's stack (`crate::main`'s `argv_verify`, `elf::validator_self_test`).
 pub const STACK_ADDR: u64 = 0x_7777_7777_0000;
 const PAGE_SIZE: u64 = 4096;
+
+/// How many pages of stack every image gets, from `STACK_ADDR` up. Was
+/// one, which the hand-written assembly programs never came near; code
+/// compiled from Rust (`rust/user/`) wants far more -- a `core::fmt`
+/// call alone can use a kilobyte -- and there is no stack growth to fall
+/// back on (a program that runs off the bottom takes a page fault and is
+/// killed). 32 KiB is what an x86 Linux thread would call small.
+pub const STACK_PAGES: u64 = 8;
+
+/// Bytes of stack every image gets (`STACK_PAGES` pages).
+pub const STACK_SIZE: u64 = STACK_PAGES * PAGE_SIZE;
+
+/// The stack's top page, where `write_initial_stack` puts `argv`/`envp`.
+const STACK_TOP_PAGE: u64 = STACK_ADDR + STACK_SIZE - PAGE_SIZE;
 
 /// Where `user/hello.s`'s `counter` lives (matches its `--section-start`
 /// build command). Exposed so a kernel task can `sys_vircopy` it back out
@@ -259,7 +292,7 @@ pub enum ElfError {
     /// `SegmentOutsideUserSpace` does not, because this port's kernel
     /// mappings are in the lower half too.
     SegmentInSharedSlot,
-    /// A segment overlaps the fixed stack page this loader maps
+    /// A segment overlaps the fixed stack pages this loader maps
     /// (`STACK_ADDR`), which would leave the image's own contents and its
     /// stack fighting over the same frame.
     SegmentOverlapsStack,
@@ -328,10 +361,11 @@ impl StartArgs<'_> {
     }
 }
 
-/// Most of the one stack page (`STACK_ADDR`) the start-up block may
-/// take. Half: whatever the arguments don't use is all the stack the
-/// program has, and a program handed a page of arguments and no stack
-/// would fault on its first `call`. Real systems call this `ARG_MAX`
+/// Most of the stack's top page (`STACK_TOP_PAGE`) the start-up block may
+/// take. Half: the block has to fit in that one page (it's all
+/// `write_initial_stack` writes into), and the rest of the page is the
+/// first stretch of stack the program itself uses before growing down
+/// into the pages below. Real systems call this `ARG_MAX`
 /// (MINIX 3.1's is `ARG_MAX` in `include/limits.h`, 16 KiB, bounded the
 /// same way by `servers/pm/exec.c`'s fixed-size `mbuf`).
 pub const MAX_START_ARGS_BYTES: usize = (PAGE_SIZE as usize) / 2;
@@ -352,7 +386,7 @@ pub const MAX_START_ARGS_BYTES: usize = (PAGE_SIZE as usize) / 2;
 ///   argv strings, envp strings, each NUL-terminated
 /// ```
 ///
-/// Every pointer is a *user* address (inside the page at `STACK_ADDR`),
+/// Every pointer is a *user* address (inside the page at `STACK_TOP_PAGE`),
 /// computed rather than copied, because the page is being written
 /// through a kernel mapping that the program will never see.
 /// `rsp % 16 == 0`, the ABI's requirement at `_start`.
@@ -361,7 +395,7 @@ pub const MAX_START_ARGS_BYTES: usize = (PAGE_SIZE as usize) / 2;
 /// `MAX_START_ARGS_BYTES`, so everything here fits.
 fn write_initial_stack(page: *mut u8, args: &StartArgs) -> u64 {
     // Offsets from the page's start; the user address of offset `o` is
-    // `STACK_ADDR + o`. The strings occupy the top of the page in the
+    // `STACK_TOP_PAGE + o`. The strings occupy the top of the page in the
     // order they're listed (argv, then envp), so the start of each one is
     // known from the lengths of those before it, and the vectors can be
     // filled in the same pass that copies the strings -- no scratch
@@ -386,7 +420,7 @@ fn write_initial_stack(page: *mut u8, args: &StartArgs) -> u64 {
             *page.add(at + s.len()) = 0;
         }
         next_string += s.len() + 1;
-        STACK_ADDR + at as u64
+        STACK_TOP_PAGE + at as u64
     };
 
     let mut i = 0;
@@ -407,7 +441,7 @@ fn write_initial_stack(page: *mut u8, args: &StartArgs) -> u64 {
     put_word(i, 0); // auxv: AT_NULL ...
     put_word(i + 1, 0); // ... and its (unused) value
 
-    STACK_ADDR + rsp_offset as u64
+    STACK_TOP_PAGE + rsp_offset as u64
 }
 
 /// Read the fixed-size ELF header out of `image`.
@@ -472,19 +506,20 @@ fn validate(image: &[u8], header: &Elf64Header, base_pml4: PhysFrame) -> Result<
     }
 
     // Page ranges claimed so far, as inclusive `(first, last)` page
-    // numbers, starting with the stack page this loader always maps --
+    // numbers, starting with the stack pages this loader always maps --
     // so a segment colliding with the stack and a segment colliding with
     // another segment are the same check, made once.
-    let stack_page = STACK_ADDR / PAGE_SIZE;
+    let stack_first = STACK_ADDR / PAGE_SIZE;
+    let stack_last = stack_first + STACK_PAGES - 1;
     let mut claimed: [(u64, u64); MAX_LOAD_SEGMENTS + 1] = [(0, 0); MAX_LOAD_SEGMENTS + 1];
-    claimed[0] = (stack_page, stack_page);
+    claimed[0] = (stack_first, stack_last);
     let mut claimed_len = 1;
-    let mut total_pages: u64 = 1; // the stack page
+    let mut total_pages: u64 = STACK_PAGES;
 
     if !memory::pml4_slots_unused(
         base_pml4,
         VirtAddr::new(STACK_ADDR),
-        VirtAddr::new(STACK_ADDR + PAGE_SIZE - 1),
+        VirtAddr::new(STACK_ADDR + STACK_SIZE - 1),
     ) {
         return Err(ElfError::SegmentInSharedSlot);
     }
@@ -536,7 +571,7 @@ fn validate(image: &[u8], header: &Elf64Header, base_pml4: PhysFrame) -> Result<
         // twice, which is exactly what `load_segment` cannot do.
         for &(other_first, other_last) in claimed[..claimed_len].iter() {
             if first_page <= other_last && last_page >= other_first {
-                return Err(if other_first == stack_page && other_last == stack_page {
+                return Err(if other_first == stack_first && other_last == stack_last {
                     ElfError::SegmentOverlapsStack
                 } else {
                     ElfError::SegmentsOverlap
@@ -555,7 +590,7 @@ fn validate(image: &[u8], header: &Elf64Header, base_pml4: PhysFrame) -> Result<
 
 /// Parse `image` and map each `PT_LOAD` segment into a brand-new address
 /// space derived from `base_pml4` (`memory::new_address_space_from`),
-/// plus one stack page, and return where to start it.
+/// plus `STACK_PAGES` of stack, and return where to start it.
 ///
 /// `base_pml4` is explicit rather than "whatever is in `CR3`" because
 /// `sys_exec` runs inside a ring-3 caller's own trap, where the active
@@ -615,19 +650,24 @@ pub fn load_image_with_args(
         | PageTableFlags::WRITABLE
         | PageTableFlags::USER_ACCESSIBLE
         | PageTableFlags::NO_EXECUTE;
-    let stack_page = Page::containing_address(VirtAddr::new(STACK_ADDR));
-    let stack_frame = frame_allocator.allocate_frame().ok_or(ElfError::MappingFailed)?;
-    unsafe {
-        mapper
-            .map_to(stack_page, stack_frame, stack_flags, &mut frame_allocator)
-            .map_err(|_| ElfError::MappingFailed)?
-            .ignore();
+    let mut top_frame = None;
+    for i in 0..STACK_PAGES {
+        let stack_page = Page::containing_address(VirtAddr::new(STACK_ADDR + i * PAGE_SIZE));
+        let stack_frame = frame_allocator.allocate_frame().ok_or(ElfError::MappingFailed)?;
+        unsafe {
+            mapper
+                .map_to(stack_page, stack_frame, stack_flags, &mut frame_allocator)
+                .map_err(|_| ElfError::MappingFailed)?
+                .ignore();
+        }
+        top_frame = Some(stack_frame);
     }
+    let top_frame = top_frame.ok_or(ElfError::MappingFailed)?;
     let stack_page_ptr: *mut u8 =
-        (physical_memory_offset + stack_frame.start_address().as_u64()).as_mut_ptr();
+        (physical_memory_offset + top_frame.start_address().as_u64()).as_mut_ptr();
     let stack_pointer = write_initial_stack(stack_page_ptr, args);
 
-    if !map.push(VirtAddr::new(STACK_ADDR), 1) {
+    if !map.push(VirtAddr::new(STACK_ADDR), STACK_PAGES as usize) {
         return Err(ElfError::TooManySegments);
     }
 
@@ -654,8 +694,15 @@ pub fn load_image_with_args(
 /// kernel binary, so a malformed one really is a build bug and panicking
 /// is the right answer -- unlike `sys_exec`'s, which come from `fs`.
 pub fn load(image: &[u8], proc_nr: i32) -> proc::AddressSpace {
+    load_with_args(image, proc_nr, &StartArgs::EMPTY)
+}
+
+/// `load`, starting the program with `args` rather than an empty
+/// `argv`/`envp`.
+pub fn load_with_args(image: &[u8], proc_nr: i32, args: &StartArgs) -> proc::AddressSpace {
     let (active_pml4, _) = Cr3::read();
-    let loaded = load_image(active_pml4, image).expect("failed to load a built-in ELF image");
+    let loaded =
+        load_image_with_args(active_pml4, image, args).expect("failed to load a built-in ELF image");
     record_params(proc_nr, &loaded);
     proc::AddressSpace { pml4: loaded.pml4, map: loaded.map }
 }

@@ -1,0 +1,11 @@
+[build]
+target = "x86_64-unknown-none"
+# Non-PIE, linked at a fixed address by link.ld: the kernel's ELF loader
+# maps PT_LOAD segments where they ask to go and does no relocation.
+# Large code model: the default ("small") assumes every symbol sits in
+# the low 2 GiB, which here is all PML4 slot 0 -- the kernel's.
+rustflags = ["-C", "relocation-model=static", "-C", "code-model=large", "-C", "link-arg=-Tlink.ld"]
+
+[unstable]
+build-std = ["core", "compiler_builtins"]
+build-std-features = ["compiler-builtins-mem"]

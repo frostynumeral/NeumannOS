@@ -112,6 +112,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // runs (crate::calls::sys_exec). Loaded here exactly like any other
     // ELF task -- exec is what makes it interesting, not how it starts.
     let shell_address_space = elf::load(elf::SHELL_ELF, com::SHELL_PROC_NR);
+    // And the interactive shell, with the argv/envp a login shell gets.
+    let sh_address_space = elf::load_with_args(
+        elf::sh_elf(),
+        com::SH_PROC_NR,
+        &elf::StartArgs { argv: &[b"sh"], envp: &[b"PATH=/bin", b"HOME=/"] },
+    );
     // Self-test: the loader's *rejections*, which are the only part of
     // its validation that a working boot can't demonstrate. See
     // `elf::validator_self_test` for why this is here and not assumed.
@@ -148,7 +154,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // programmed, and its handler calls `reschedule()` unconditionally
     // (see `proc.rs`'s module doc comment) -- with no task enqueued yet,
     // there would be nothing for it to pick.
-    spawn_tasks(ring3_address_space, elf_address_space, shell_address_space);
+    spawn_tasks(ring3_address_space, elf_address_space, shell_address_space, sh_address_space);
     serial_println!("tasks spawned");
 
     pic::init();
@@ -343,6 +349,33 @@ fn cow_self_test() {
         p_data.start_address().as_u64()
     );
 
+    // 3b. The same reclaim, but in a *child* -- whose page tables fork
+    // built, not the loader. Fork again, let the parent copy first, and
+    // have the child (now the page's only owner) write it: a real ring-0
+    // fault that must come back `Reclaimed` and then let the store
+    // through. This is the case that killed the interactive shell's
+    // fifth command before `share_pages_into` spelled out its table
+    // flags; a leaf made writable under a read-only table faults again,
+    // with nothing COW about it, and the store never completes.
+    let child2 = memory::fork_address_space(parent.pml4, kernel_pml4, &parent.map)
+        .expect("second fork failed in the self-test");
+    write_u32(parent.pml4, data, 0x4444_4444); // parent copies away
+    let (shared, _) = memory::translate_page(child2, data).unwrap();
+    assert_eq!(memory::extra_sharers(shared), 0, "the parent's copy didn't leave the child sole owner");
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let (saved, flags) = Cr3::read();
+        Cr3::write(child2, flags);
+        core::ptr::write_volatile(data.as_mut_ptr::<u32>(), 0x5555_5555);
+        Cr3::write(saved, flags);
+    });
+    let (reclaimed, reclaimed_flags) = memory::translate_page(child2, data).unwrap();
+    assert_eq!(reclaimed, shared, "a sole-owner COW page in a child was copied instead of reclaimed");
+    assert!(reclaimed_flags.contains(PageTableFlags::WRITABLE));
+    assert_eq!(read_u32(child2, data), 0x5555_5555);
+    assert_eq!(read_u32(parent.pml4, data), 0x4444_4444);
+    unsafe { memory::free_address_space(child2, kernel_pml4) };
+    serial_println!("[cow] a forked child that became a page's only owner reclaimed it in place and wrote through");
+
     // 4. Teardown respects the sharing.
     let text_word = read_u32(parent.pml4, text);
     unsafe { memory::free_address_space(child, kernel_pml4) };
@@ -379,6 +412,7 @@ fn spawn_tasks(
     ring3_address_space: proc::AddressSpace,
     elf_address_space: proc::AddressSpace,
     shell_address_space: proc::AddressSpace,
+    sh_address_space: proc::AddressSpace,
 ) {
     proc::spawn(com::IDLE, "IDLE", idle_task, proc::IDLE_Q, 8, true, None);
     proc::spawn(com::CLOCK, "CLOCK", clock_task, proc::TASK_Q, 64, false, None);
@@ -414,7 +448,7 @@ fn spawn_tasks(
     );
     // The fork/exec demo, at the same priority as the other ring-3
     // tasks: it starts out running `elf::SHELL_ELF`, forks, and its
-    // child ends up running /bin/echo -- the pair a real shell is built
+    // child ends up running /bin/exectest -- the pair a real shell is built
     // out of, rather than a process replacing itself in place.
     proc::spawn(
         com::SHELL_PROC_NR,
@@ -425,6 +459,9 @@ fn spawn_tasks(
         true,
         Some(shell_address_space),
     );
+    // The interactive shell: reads commands from the keyboard, runs
+    // them out of /bin (fork, exec, wait), and never exits on its own.
+    proc::spawn(com::SH_PROC_NR, "sh", elf::task_entry, 6, 16, true, Some(sh_address_space));
     rs::spawn_flaky();
     proc::spawn(com::CONSOLE_PROC_NR, "console", keyboard::console_task, 5, 16, true, None);
 }
@@ -455,6 +492,7 @@ fn idle_task() -> ! {
     vircopy_error_from_ring3_verify();
     fork_child_verify();
     exec_verify();
+    ptr_safety_check();
     proc_slot_pool_check();
     wait_without_children_check();
     runtime_reclaim_check();
@@ -605,7 +643,7 @@ fn fork_child_verify() {
 }
 
 /// Proves the fork/exec pair `user/shell.s` performs -- a ring-3
-/// `SYS_FORK` whose *child* then `SYS_EXEC`s `/bin/echo` -- did what a
+/// `SYS_FORK` whose *child* then `SYS_EXEC`s `/bin/exectest` -- did what a
 /// real shell's does: one process became two, and exactly one of them
 /// (the child) stopped being `shell` and became a different program
 /// entirely, at its own process number, without disturbing the parent.
@@ -676,7 +714,7 @@ fn fork_child_verify() {
 ///
 /// Runs from `idle_task` for the same reason every other check there
 /// does; see its doc comment. Check 1 additionally waits rather than
-/// assuming: `shell` sleeps between exec attempts if `/bin/echo` hasn't
+/// assuming: `shell` sleeps between exec attempts if `/bin/exectest` hasn't
 /// been installed yet (`user/shell.s`), and `IDLE` becoming runnable
 /// during one of those naps is exactly the sort of interleaving this
 /// port has already been bitten by once.
@@ -750,7 +788,7 @@ fn exec_verify() {
     .expect("sys_vircopy failed reading the exec'd image's counter out of the child's address space");
     let counter = i32::from_le_bytes(counter_buf);
     serial_println!(
-        "[idle] read back {} from /bin/echo's own .data counter, in the child's process (expected 1)",
+        "[idle] read back {} from /bin/exectest's own .data counter, in the child's process (expected 1)",
         counter
     );
     assert_eq!(counter, 1, "the exec'd image's own code should have incremented its counter once");
@@ -764,7 +802,7 @@ fn exec_verify() {
         in_parent.len(),
     );
     serial_println!(
-        "[idle] reading /bin/echo's counter page at {:#x} out of *shell* instead: {:?} (expected SrcNotMapped -- only the child exec'd)",
+        "[idle] reading /bin/exectest's counter page at {:#x} out of *shell* instead: {:?} (expected SrcNotMapped -- only the child exec'd)",
         elf::ECHO_COUNTER_ADDR,
         leaked
     );
@@ -883,8 +921,8 @@ fn read_wait_result(path: &str) -> (i32, i32) {
     (child, status)
 }
 
-/// `exec_verify`'s argument-passing half: `shell` exec'd `/bin/echo`
-/// with `argv = {"/bin/echo", "hello", "from", "argv"}` and
+/// `exec_verify`'s argument-passing half: `shell` exec'd `/bin/exectest`
+/// with `argv = {"/bin/exectest", "hello", "from", "argv"}` and
 /// `envp = {"GREETING=neumann"}` (`user/shell.s`), and this checks the
 /// new image received exactly that, from three independent angles:
 ///
@@ -907,19 +945,19 @@ fn argv_verify(child: i32) {
     let n = read_when_available("/echo_output.txt", &mut out);
     let output = &out[..n.max(0) as usize];
     serial_println!(
-        "[idle] read back {:?} from /echo_output.txt (/bin/echo's own rendering of its argv)",
+        "[idle] read back {:?} from /echo_output.txt (/bin/exectest's own rendering of its argv)",
         core::str::from_utf8(output).unwrap_or("<invalid utf8>")
     );
-    assert_eq!(output, b"hello from argv", "/bin/echo didn't echo the argv shell exec'd it with");
+    assert_eq!(output, b"hello from argv", "/bin/exectest didn't echo the argv shell exec'd it with");
 
     let mut env = [0u8; 64];
     let n = read_when_available("/echo_env.txt", &mut env);
     let env = &env[..n.max(0) as usize];
     serial_println!(
-        "[idle] read back {:?} from /echo_env.txt (/bin/echo's envp[0])",
+        "[idle] read back {:?} from /echo_env.txt (/bin/exectest's envp[0])",
         core::str::from_utf8(env).unwrap_or("<invalid utf8>")
     );
-    assert_eq!(env, b"GREETING=neumann", "/bin/echo didn't receive the envp shell exec'd it with");
+    assert_eq!(env, b"GREETING=neumann", "/bin/exectest didn't receive the envp shell exec'd it with");
 
     let read_u64 = |addr: u64| -> u64 {
         let mut buf = [0u8; 8];
@@ -930,7 +968,7 @@ fn argv_verify(child: i32) {
             x86_64::VirtAddr::new(buf.as_mut_ptr() as u64),
             8,
         )
-        .expect("sys_vircopy failed reading /bin/echo's start-up block");
+        .expect("sys_vircopy failed reading /bin/exectest's start-up block");
         u64::from_le_bytes(buf)
     };
     let read_str = |addr: u64, buf: &mut [u8]| -> usize {
@@ -948,19 +986,19 @@ fn argv_verify(child: i32) {
     let rsp = read_u64(elf::ECHO_ENTRY_RSP_ADDR);
     let argc_seen = read_u64(elf::ECHO_ARGC_ADDR);
     serial_println!(
-        "[idle] /bin/echo started with rsp {:#x} and read argc {} there (expected 4)",
+        "[idle] /bin/exectest started with rsp {:#x} and read argc {} there (expected 4)",
         rsp,
         argc_seen
     );
     assert_eq!(rsp % 16, 0, "exec'd image's initial rsp isn't 16-byte aligned");
     assert!(
-        (elf::STACK_ADDR..elf::STACK_ADDR + 4096).contains(&rsp),
-        "exec'd image's initial rsp isn't in its stack page"
+        (elf::STACK_ADDR..elf::STACK_ADDR + elf::STACK_SIZE).contains(&rsp),
+        "exec'd image's initial rsp isn't in its stack"
     );
-    assert_eq!(argc_seen, 4, "/bin/echo read the wrong argc off its stack");
+    assert_eq!(argc_seen, 4, "/bin/exectest read the wrong argc off its stack");
     assert_eq!(read_u64(rsp), 4, "argc on the child's stack is wrong");
 
-    let expected_argv: [&[u8]; 4] = [b"/bin/echo", b"hello", b"from", b"argv"];
+    let expected_argv: [&[u8]; 4] = [b"/bin/exectest", b"hello", b"from", b"argv"];
     for (i, want) in expected_argv.iter().enumerate() {
         let ptr = read_u64(rsp + 8 + 8 * i as u64);
         // Exact length plus its NUL: long enough to catch a missing
@@ -976,7 +1014,7 @@ fn argv_verify(child: i32) {
     assert_eq!(&buf[..len], b"GREETING=neumann", "envp[0] on the child's stack is wrong");
     assert_eq!(read_u64(envp + 8), 0, "envp isn't NULL-terminated on the child's stack");
     assert_eq!(read_u64(envp + 16), 0, "the auxiliary vector doesn't start with AT_NULL");
-    serial_println!("[idle] /bin/echo's stack holds argc, argv[4] + NULL, envp[1] + NULL, AT_NULL -- the System V start-up layout");
+    serial_println!("[idle] /bin/exectest's stack holds argc, argv[4] + NULL, envp[1] + NULL, AT_NULL -- the System V start-up layout");
 
     let mut errs = [0u8; 32];
     let n = read_when_available("/argv_errors.bin", &mut errs);
@@ -992,6 +1030,33 @@ fn argv_verify(child: i32) {
         serial_println!("[idle] ring-3 exec with {}: {:#x} (expected {:#x})", what, got, want);
         assert_eq!(got, *want, "ring-3 exec with {} wasn't refused correctly", what);
     }
+}
+
+/// Runs `/bin/ptrtest` (`rust/user/src/bin/ptrtest.rs`) and requires its
+/// verdict to be `ok`: seventeen system calls given deliberately bad
+/// pointers -- the kernel heap (mapped in every address space), unmapped
+/// memory, the program's own read-only text as a write target -- each of
+/// which must come back as an error code. Before `crate::syscall` copied
+/// user memory through the caller's page tables, most of them halted the
+/// machine with a ring-0 page fault, so reaching this check at all is
+/// half the result; the verdict file is the other half, since a call
+/// that *succeeded* against the kernel heap wouldn't have faulted either.
+///
+/// Started straight out of `fs` into a free dynamic slot, with no parent
+/// (so nothing waits for it and its slot is released as soon as it
+/// exits) -- before `proc_slot_pool_check`, so the slot it borrowed is
+/// back in the pool by the time that one counts.
+fn ptr_safety_check() {
+    let proc_nr = proc::alloc_proc_nr().expect("no free process slot for ptrtest");
+    elf::spawn_from_fs("/bin/ptrtest", proc_nr, "ptrtest", 6, 16).expect("couldn't start /bin/ptrtest");
+    let mut buf = [0u8; 8];
+    let n = read_when_available("/ptrtest.out", &mut buf);
+    let verdict = &buf[..n.max(0) as usize];
+    serial_println!(
+        "[idle] /bin/ptrtest verdict: {:?} (17 syscalls handed bad pointers or process numbers, each must be refused)",
+        core::str::from_utf8(verdict).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(verdict, b"ok", "a system call accepted a bad pointer -- see ptrtest's FAIL lines above");
 }
 
 /// Exercises the two ends of the dynamic process-number pool
@@ -1266,13 +1331,13 @@ fn demo_pm_task() -> ! {
 /// otherwise have done. `fs` is in-memory and starts empty every boot, so
 /// nothing can be loaded *by path* until a task has put it there:
 /// `/bin/hello` is what `crate::rs`'s `SERVICES` table launches on
-/// demand (`elf::spawn_from_fs`), and `/bin/echo` is what `shell` execs
+/// demand (`elf::spawn_from_fs`), and `/bin/exectest` is what `shell` execs
 /// itself into (`crate::calls::sys_exec`, via `user/shell.s`). Must run
 /// from a task, not `kernel_main` directly: `fs::open`/`fs::write` block
 /// on a real IPC round trip, which needs a task context to block in.
 ///
 /// Runs as early in `pm`'s demo as it can rather than at the end, since
-/// `shell` is waiting on `/bin/echo` to appear before it can get on with
+/// `shell` is waiting on `/bin/exectest` to appear before it can get on with
 /// its own job. "As early as it can" is immediately after the
 /// `pm`/`fs` ping-pong: `fs` only becomes a real file server once those
 /// three messages are done with (`demo_fs_task`), and a `mkdir` sent
@@ -1284,7 +1349,8 @@ fn demo_pm_task() -> ! {
 fn seed_bin() {
     let rc = fs::mkdir("/bin");
     assert_eq!(rc, 0, "fs::mkdir(\"/bin\") failed: {}", rc);
-    for (path, image) in [("/bin/hello", elf::HELLO_ELF), ("/bin/echo", elf::ECHO_ELF)] {
+    let asm_programs = [("/bin/hello", elf::HELLO_ELF), ("/bin/exectest", elf::ECHO_ELF)];
+    for &(path, image) in asm_programs.iter().chain(elf::RUST_PROGRAMS.iter()) {
         let fd = fs::open(path);
         assert!(fd >= 0, "fs::open({:?}) failed: {}", path, fd);
         let n = fs::write(fd, image);

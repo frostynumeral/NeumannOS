@@ -53,7 +53,7 @@
 #          ERR_ARGS_TOO_BIG.
 #        - 30 arguments of 100 bytes each, past
 #          crate::elf::MAX_START_ARGS_BYTES: ERR_ARGS_TOO_BIG.
-#      Each of these targets /bin/echo -- this very program -- so an exec
+#      Each of these targets /bin/exectest -- this very program -- so an exec
 #      that wrongly succeeded would visibly start over rather than
 #      quietly doing nothing.
 #   7. SYS_BLOCK_FOREVER, which never returns.
@@ -204,7 +204,7 @@ _start:
 4:
 
     # --- hostile argv/envp execs (see the header comment), all of
-    # /bin/echo, all of which must fail ---
+    # /bin/exectest, all of which must fail ---
     mov $0x444444440000, %rdx   # argv itself on the kernel heap
     xor %ecx, %ecx
     call exec_self
@@ -260,7 +260,7 @@ copy_str:
     jmp 0b
 1:  ret
 
-# SYS_EXEC /bin/echo with the argv/envp already in rdx/rcx; returns the
+# SYS_EXEC /bin/exectest with the argv/envp already in rdx/rcx; returns the
 # (expected: error) result in rax.
 exec_self:
     lea self_path(%rip), %rdi
@@ -281,7 +281,7 @@ entry_rsp:              # +8: rsp on entry, i.e. the address of argc
 argc_seen:              # +16: argc as read from the stack
     .quad 0
 message:
-    .ascii "hello from /bin/echo -- a different program, running in the same process after exec()!"
+    .ascii "hello from /bin/exectest -- a different program, running in the same process after exec()!"
 message_len = . - message
 path:
     .ascii "/from_exec.txt"
@@ -340,7 +340,7 @@ argv_err_path:
     .ascii "/argv_errors.bin"
 argv_err_path_len = . - argv_err_path
 self_path:
-    .ascii "/bin/echo"
+    .ascii "/bin/exectest"
 self_path_len = . - self_path
 x_arg:
     .asciz "x"

@@ -133,8 +133,10 @@ extern "x86-interrupt" fn general_protection_fault_handler(
 /// program at all: it's `fork` having deferred a copy until now. Those
 /// are resolved (`memory::resolve_cow_fault`) and the faulting
 /// instruction simply runs again, whether it was ring-3 code writing its
-/// own `.data` or the kernel writing through a user pointer (`CR0.WP`
-/// makes the latter fault too; see `memory::init`). Everything else takes
+/// own `.data` or a kernel write into a user page (`CR0.WP` makes that
+/// fault too; see `memory::init` -- though the syscall layer's own
+/// copies break COW before writing, so this is a backstop there).
+/// Everything else takes
 /// the usual kill-or-halt path.
 extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,

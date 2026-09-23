@@ -17,19 +17,13 @@
 # ERR_VIRCOPY_FAILED/ERR_UNKNOWN_CALL) rather than just a single
 # undifferentiated failure sentinel -- the returned code is stashed in
 # err_result for a kernel task to read back and check afterward, the same
-# way vircopy_buf's real copy is. Finally, SYS_READ_LINE:
-# this blocks for real, for as long as it takes a human (or a QMP
-# send-key script) to actually type a line and press Enter, then writes
-# whatever line arrives to a second file via SYS_FS_OPEN/SYS_FS_WRITE,
-# before SYS_BLOCK_FOREVER, which never returns. No libc, no
-# _start-time setup: the kernel's elf.rs loader jumps straight to
-# _start with nothing but a stack.
+# way vircopy_buf's real copy is. Finally SYS_BLOCK_FOREVER, which never
+# returns. No libc, no _start-time setup: the kernel's elf.rs loader
+# jumps straight to _start with nothing but a stack.
 #
-# Note this means a plain, non-interactive boot will show this task
-# blocked at SYS_READ_LINE indefinitely (nothing else in this port types
-# anything on its own) -- exactly like a real shell waiting at a prompt,
-# not a bug. See rust/README.md's "Running" section for how to actually
-# supply a line over QEMU's QMP interface.
+# It used to block in SYS_READ_LINE for one typed line first; the shell
+# (sh, rust/user/src/bin/sh.rs) is the keyboard's reader now -- see the
+# note where that code was.
 #
 # Right after the counter loop, it also calls SYS_FORK -- creating a
 # genuine child process (crate::syscall::SYS_FORK) that resumes at this
@@ -144,26 +138,14 @@ _start:
     int $0x80
     mov %rax, err_result(%rip)
 
-    # Block for a real line of console input (rdi=buf ptr, rsi=max len).
-    # Returns however many bytes were actually typed.
-    lea line_buf(%rip), %rdi
-    mov $line_buf_cap, %esi
-    mov $9, %eax        # SYS_READ_LINE (crate::syscall::SYS_READ_LINE)
-    int $0x80
-    mov %rax, %r9       # stash the length read
-
-    # Open a second file and write the received line to it.
-    lea path2(%rip), %rdi
-    mov $path2_len, %esi
-    mov $6, %eax        # SYS_FS_OPEN
-    int $0x80
-    mov %rax, %r8       # fd
-
-    mov %r8, %rdi
-    lea line_buf(%rip), %rsi
-    mov %r9, %rdx
-    mov $7, %eax        # SYS_FS_WRITE
-    int $0x80
+    # (This is where this program used to block in SYS_READ_LINE for one
+    # line of keyboard input and write it to /from_console.txt. The
+    # interactive shell, sh, now does that job for real -- and with
+    # console_task handing lines to waiting readers first-come
+    # first-served, a second reader parked here for good would have eaten
+    # every other command typed at the shell. line_buf and path2 are left
+    # in .data so nothing after them moves: crate::elf's VIRCOPY_BUF_ADDR
+    # and ERR_RESULT_ADDR are those symbols' fixed addresses.)
 
     mov $3, %eax        # SYS_BLOCK_FOREVER (crate::syscall::SYS_BLOCK_FOREVER)
     int $0x80

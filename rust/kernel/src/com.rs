@@ -57,12 +57,16 @@ pub const CONSOLE_PROC_NR: i32 = 9;
 /// process-number allocator in this port yet.
 pub const APP1_PROC_NR: i32 = 10;
 /// The `exec()` demo (`crate::calls::sys_exec`): a ring-3 task that
-/// forks and whose *child*, a moment later, is running `/bin/echo`
+/// forks and whose *child*, a moment later, is running `/bin/exectest`
 /// instead of the image it inherited -- the fork/exec pair a real shell
 /// is built out of (`user/shell.s`). The child's own process number
 /// isn't here, because it isn't reserved at compile time any more: see
 /// `FIRST_DYNAMIC_PROC_NR`.
 pub const SHELL_PROC_NR: i32 = 11;
+/// `sh`, the interactive shell (`rust/user/src/bin/sh.rs`): the first
+/// ring-3 program written in Rust rather than assembly, started at boot
+/// and waiting for commands typed at the keyboard.
+pub const SH_PROC_NR: i32 = 12;
 
 /// The first process number handed out at *runtime* rather than nailed
 /// down here (`crate::proc::alloc_proc_nr`), and how many of them there
@@ -78,7 +82,7 @@ pub const SHELL_PROC_NR: i32 = 11;
 /// fixed number per *caller* is what made `SYS_FORK` refuse anyone but
 /// one known task; a small pool plus `alloc_proc_nr` is what makes it a
 /// real call any process can make, as many times as there are slots.
-pub const FIRST_DYNAMIC_PROC_NR: i32 = SHELL_PROC_NR + 1;
+pub const FIRST_DYNAMIC_PROC_NR: i32 = SH_PROC_NR + 1;
 /// Six is headroom rather than a measurement: `user/shell.s` has at
 /// most two children alive at once, `tty` one, and a console-launched
 /// service one, so four would do -- but two of `shell`'s children exit

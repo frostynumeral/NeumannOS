@@ -26,19 +26,19 @@
 //! everything else unchanged, and `iretq`s -- so a caller sees only its
 //! requested register (`rax`) change, exactly like a real syscall.
 //!
-//! Notably *not* implemented here: any cross-address-space copy for
-//! pointer arguments (`SYS_WRITE_LINE`'s `arg1`). That's safe to skip
-//! because of a property already established for every ring-3 task with
-//! its own address space (`crate::usermode`, `crate::elf`): entering this
-//! handler via `int 0x80` does *not* switch `CR3` (only entering an
-//! interrupt/trap gate itself is a hardware CR3-preserving operation,
-//! unlike a `crate::proc::switch_to` task switch, which explicitly
-//! reloads it) -- so `dispatch` runs with the *caller's own* address
-//! space still active, and a pointer the caller passed is already
-//! directly dereferenceable, the same way it would be for the caller
-//! itself. A real `sys_vircopy`-style copy is only needed to reach a
-//! *different* process's memory (see `crate::calls`/`crate::memory`),
-//! not the currently-running one's own.
+//! Pointer arguments are never dereferenced directly, even though
+//! `dispatch` runs with the caller's own address space in `CR3` (entering
+//! a trap gate doesn't switch it) and could. Everything a caller points
+//! at is copied through its page tables instead -- `copy_from_caller` in,
+//! `copy_to_caller` out -- which confine it to PML4 slots the kernel's
+//! own address space leaves empty (the kernel heap is mapped in every
+//! address space, so "mapped" alone would let ring 3 read or write it),
+//! report an unmapped or read-only page as `ERR_BAD_ARG_PTR` instead of
+//! taking a page fault in ring 0 (which halts the machine), and give the
+//! caller a private copy of any page it still shares after a `fork`
+//! before writing it. The first version of this module did dereference
+//! directly, which let any ring-3 program halt the kernel with one bad
+//! pointer.
 //!
 //! `SYS_SET_ALARM`/`SYS_WAIT_ALARM` are the first of `crate::calls`' own
 //! kernel calls reachable from ring 3 through this ABI: `SYS_SET_ALARM`
@@ -112,6 +112,17 @@ pub const SYS_FORK: u64 = 11;
 pub const SYS_EXEC: u64 = 12;
 pub const SYS_EXIT: u64 = 13;
 pub const SYS_WAIT: u64 = 14;
+/// `SYS_FS_OPEN` without the create-if-missing half: `ENOENT` for a path
+/// that isn't there, like POSIX `open` without `O_CREAT`. A separate
+/// call number rather than a flag on `SYS_FS_OPEN`, because every
+/// existing caller of that one leaves `rdx` holding whatever it held, so
+/// no value there can safely mean anything.
+pub const SYS_FS_OPEN_EXISTING: u64 = 15;
+/// Write raw bytes to the console -- a program's standard output, as
+/// opposed to `SYS_WRITE_LINE`, which is a *log* line the kernel prefixes
+/// with the caller's process number. What a shell and the programs it
+/// runs print through.
+pub const SYS_CONSOLE_WRITE: u64 = 16;
 
 /// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
 /// a sanity bound on an untrusted `len` from ring 3 -- matches the size
@@ -122,10 +133,9 @@ const MAX_VIRCOPY_LEN: usize = 256;
 /// copy through a local kernel-stack buffer in either direction.
 const MAX_FS_BUF: usize = 256;
 
-/// Longest string `SYS_WRITE_LINE` will read, purely as a sanity bound on
-/// `arg2` (an untrusted length from ring 3) -- not a real buffer, since
-/// the caller's bytes are read directly out of its own, still-active
-/// address space (see the module doc comment).
+/// Longest string `SYS_WRITE_LINE`/`SYS_CONSOLE_WRITE` will copy out of
+/// the caller (through a kernel-stack buffer of this size), bounding
+/// `arg2`, an untrusted length from ring 3.
 const MAX_LINE_LEN: u64 = 256;
 
 /// Syscall-level failure codes: small negative `i64` values reinterpreted
@@ -208,12 +218,12 @@ const MAX_EXEC_VECTOR: usize = 64;
 /// Copy `buf.len()` bytes out of `caller`'s memory at `addr`, refusing
 /// anything that isn't memory the caller privately owns.
 ///
-/// Deliberately *not* a direct dereference, unlike the other pointer
-/// arguments in this file: those are bounded, single-range reads a
-/// malformed pointer at worst faults on, but `SYS_EXEC` follows a chain
-/// of pointers the caller controls (the vector, then each string), and
-/// the bytes it gathers are handed straight back to ring 3 on the new
-/// stack. So it walks the caller's page tables instead
+/// Every pointer argument in this file is read this way (and written
+/// with `copy_to_caller`), never dereferenced: a bad pointer has to come
+/// back to the caller as an error, not fault in ring 0 -- and `SYS_EXEC`
+/// in particular follows a chain of pointers the caller controls and
+/// hands what it gathers straight back to ring 3 on the new stack. So it
+/// walks the caller's page tables instead
 /// (`memory::copy_between_address_spaces`, which reports an unmapped page
 /// rather than faulting on it), and first requires the whole range to
 /// sit in PML4 slots the kernel's own address space leaves empty -- the
@@ -245,6 +255,61 @@ fn copy_from_caller(caller: i32, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
     .map_err(|_| ERR_BAD_ARG_PTR)
 }
 
+/// Check that `caller` may have `len` bytes at `addr` written on its
+/// behalf: every page mapped, user-accessible, and writable -- or
+/// copy-on-write, which is writable as far as the process is concerned.
+/// A pointer at the caller's own read-only text is refused here rather
+/// than reaching the write: with `CR0.WP` on (`memory::init`) that write
+/// would fault in ring 0, which halts the machine.
+fn check_writable(caller: i32, addr: u64, len: usize) -> Result<(), u64> {
+    use x86_64::structures::paging::PageTableFlags as F;
+    if len == 0 {
+        return Ok(());
+    }
+    let end = addr.checked_add(len as u64 - 1).ok_or(ERR_BAD_ARG_PTR)?;
+    let (Ok(start_va), Ok(end_va)) = (VirtAddr::try_new(addr), VirtAddr::try_new(end)) else {
+        return Err(ERR_BAD_ARG_PTR);
+    };
+    if !memory::pml4_slots_unused(proc::kernel_cr3(), start_va, end_va) {
+        return Err(ERR_BAD_ARG_PTR);
+    }
+    let (caller_cr3, _) = proc::cr3_of(caller);
+    let mut page = addr & !0xfff;
+    while page <= end {
+        let (_, flags) =
+            memory::translate_page(caller_cr3, VirtAddr::new(page)).ok_or(ERR_BAD_ARG_PTR)?;
+        if !flags.contains(F::USER_ACCESSIBLE)
+            || !(flags.contains(F::WRITABLE) || flags.contains(memory::COW))
+        {
+            return Err(ERR_BAD_ARG_PTR);
+        }
+        page += 4096;
+    }
+    Ok(())
+}
+
+/// `copy_from_caller`'s other direction: write `bytes` into `caller`'s
+/// memory at `addr`, after `check_writable`. The copy itself goes through
+/// the page tables (`memory::copy_between_address_spaces`), which also
+/// gives the caller a private copy of any page it still shares after a
+/// `fork` -- nothing written on one process's behalf may land in
+/// another's.
+fn copy_to_caller(caller: i32, addr: u64, bytes: &[u8]) -> Result<(), u64> {
+    check_writable(caller, addr, bytes.len())?;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let (caller_cr3, _) = proc::cr3_of(caller);
+    memory::copy_between_address_spaces(
+        proc::kernel_cr3(),
+        VirtAddr::new(bytes.as_ptr() as u64),
+        caller_cr3,
+        VirtAddr::new(addr),
+        bytes.len(),
+    )
+    .map_err(|_| ERR_BAD_ARG_PTR)
+}
+
 /// Read one NULL-terminated vector of NUL-terminated strings (`argv` or
 /// `envp`, C's `char *const []`) out of `caller`'s memory at `vec`, into
 /// kernel-owned buffers. `vec == 0` is an empty vector, which is what
@@ -261,15 +326,18 @@ fn copy_in_vector(caller: i32, vec: u64, budget: &mut usize) -> Result<Vec<Vec<u
         return Ok(out);
     }
     loop {
-        if out.len() == MAX_EXEC_VECTOR {
-            return Err(ERR_ARGS_TOO_BIG);
-        }
         let slot = vec.checked_add(out.len() as u64 * 8).ok_or(ERR_BAD_ARG_PTR)?;
         let mut word = [0u8; 8];
         copy_from_caller(caller, slot, &mut word)?;
         let mut ptr = u64::from_le_bytes(word);
         if ptr == 0 {
             return Ok(out);
+        }
+        // Checked after the terminator, so a vector of exactly
+        // `MAX_EXEC_VECTOR` entries is accepted and only a longer one is
+        // refused.
+        if out.len() == MAX_EXEC_VECTOR {
+            return Err(ERR_ARGS_TOO_BIG);
         }
 
         let mut s = Vec::new();
@@ -321,12 +389,14 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             if arg2 > MAX_LINE_LEN {
                 return ERR_BAD_LENGTH;
             }
-            // Safety: see the module doc comment -- `dispatch` runs with
-            // the caller's own address space still active (entering this
-            // trap gate never switched `CR3`), so a pointer the caller
-            // just gave us in its own `rdi` is valid to dereference
-            // directly, the same as it would be for the caller itself.
-            let bytes = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
+            // Copied through the caller's page tables rather than
+            // dereferenced: a bad pointer is the caller's error to get
+            // back, not a kernel-mode page fault (see `copy_from_caller`).
+            let mut buf = [0u8; MAX_LINE_LEN as usize];
+            let bytes = &mut buf[..arg2 as usize];
+            if let Err(err) = copy_from_caller(caller, arg1, bytes) {
+                return err;
+            }
             match core::str::from_utf8(bytes) {
                 Ok(s) => {
                     serial_println!("[syscall] proc {}: SYS_WRITE_LINE: {:?}", caller, s);
@@ -385,12 +455,12 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             if arg2 as usize > MAX_FS_BUF {
                 return ERR_BAD_LENGTH;
             }
-            // Safety: same reasoning as SYS_WRITE_LINE -- CR3 is still
-            // the caller's own here.
-            let src = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
             let mut path_buf = [0u8; MAX_FS_BUF];
-            path_buf[..src.len()].copy_from_slice(src);
-            match core::str::from_utf8(&path_buf[..src.len()]) {
+            let len = arg2 as usize;
+            if let Err(err) = copy_from_caller(caller, arg1, &mut path_buf[..len]) {
+                return err;
+            }
+            match core::str::from_utf8(&path_buf[..len]) {
                 Ok(path) => {
                     let result = fs::open(path);
                     serial_println!("[syscall] proc {}: SYS_FS_OPEN({:?}) -> {}", caller, path, result);
@@ -398,6 +468,37 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                 }
                 Err(_) => ERR_BAD_UTF8,
             }
+        }
+        SYS_FS_OPEN_EXISTING => {
+            if arg2 as usize > MAX_FS_BUF {
+                return ERR_BAD_LENGTH;
+            }
+            // Same copy-then-call shape as SYS_FS_OPEN.
+            let mut path_buf = [0u8; MAX_FS_BUF];
+            let len = arg2 as usize;
+            if let Err(err) = copy_from_caller(caller, arg1, &mut path_buf[..len]) {
+                return err;
+            }
+            match core::str::from_utf8(&path_buf[..len]) {
+                Ok(path) => fs::open_existing(path) as u64,
+                Err(_) => ERR_BAD_UTF8,
+            }
+        }
+        SYS_CONSOLE_WRITE => {
+            if arg2 > MAX_LINE_LEN {
+                return ERR_BAD_LENGTH;
+            }
+            // Copied out *before* the serial lock is taken: reading the
+            // caller's memory under that lock, with interrupts off, meant
+            // a bad pointer faulted in ring 0 with the lock held -- and
+            // the fault handler's own report then spun on it forever.
+            let mut buf = [0u8; MAX_LINE_LEN as usize];
+            let bytes = &mut buf[..arg2 as usize];
+            if let Err(err) = copy_from_caller(caller, arg1, bytes) {
+                return err;
+            }
+            crate::serial::write_bytes(bytes);
+            arg2
         }
         SYS_FS_WRITE => {
             let fd = arg1 as i64;
@@ -409,9 +510,10 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             // everywhere buffer *before* calling into crate::fs -- see
             // the module doc comment for why this copy (unlike
             // SYS_WRITE_LINE's lack of one) is load-bearing here.
-            let src = unsafe { core::slice::from_raw_parts(arg2 as *const u8, len) };
             let mut buf = [0u8; MAX_FS_BUF];
-            buf[..len].copy_from_slice(src);
+            if let Err(err) = copy_from_caller(caller, arg2, &mut buf[..len]) {
+                return err;
+            }
             let result = fs::write(fd, &buf[..len]);
             serial_println!("[syscall] proc {}: SYS_FS_WRITE(fd {}, {} bytes) -> {}", caller, fd, len, result);
             result as u64
@@ -419,21 +521,28 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
         SYS_FS_READ => {
             let fd = arg1 as i64;
             let len = core::cmp::min(arg3 as usize, MAX_FS_BUF);
+            // Checked before reading, so a bad buffer doesn't consume
+            // bytes from the file that then have nowhere to go.
+            if let Err(err) = check_writable(caller, arg2, len) {
+                return err;
+            }
             let mut buf = [0u8; MAX_FS_BUF];
             let result = fs::read(fd, &mut buf[..len]);
-            // By the time fs::read returns, this task has been resumed
-            // (its own CR3 is active again -- see the module doc
-            // comment), so writing straight to the caller's own pointer
-            // here is safe again, the same as SYS_WRITE_LINE's read was.
+            // Through the caller's page tables, like every other pointer
+            // here (see the module doc comment).
             if result > 0 {
-                let dst = unsafe { core::slice::from_raw_parts_mut(arg2 as *mut u8, result as usize) };
-                dst.copy_from_slice(&buf[..result as usize]);
+                if let Err(err) = copy_to_caller(caller, arg2, &buf[..result as usize]) {
+                    return err;
+                }
             }
             serial_println!("[syscall] proc {}: SYS_FS_READ(fd {}) -> {}", caller, fd, result);
             result as u64
         }
         SYS_READ_LINE => {
             let max_len = core::cmp::min(arg2 as usize, MAX_FS_BUF);
+            if let Err(err) = check_writable(caller, arg1, max_len) {
+                return err;
+            }
             let mut buf = [0u8; MAX_FS_BUF];
             serial_println!("[syscall] proc {}: SYS_READ_LINE, blocking for a real keypress", caller);
             // Genuinely blocks -- possibly for a long time, however long
@@ -445,8 +554,9 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             // which CR3 is active) for as long as this call is blocked.
             let n = keyboard::read_line(buf.as_mut_ptr() as u64, max_len);
             if n > 0 {
-                let dst = unsafe { core::slice::from_raw_parts_mut(arg1 as *mut u8, n as usize) };
-                dst.copy_from_slice(&buf[..n as usize]);
+                if let Err(err) = copy_to_caller(caller, arg1, &buf[..n as usize]) {
+                    return err;
+                }
             }
             serial_println!("[syscall] proc {}: SYS_READ_LINE -> {} bytes", caller, n);
             n as u64
@@ -456,6 +566,37 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             let len = arg4 as usize;
             if len > MAX_VIRCOPY_LEN {
                 return ERR_BAD_LENGTH;
+            }
+            // A process number that names no slot would index the
+            // process table out of bounds (a kernel panic); one that
+            // names a free slot has no address space worth reading.
+            if !proc::is_valid_proc_nr(src_proc) {
+                return ERR_VIRCOPY_FAILED;
+            }
+            // Nothing to copy -- and nothing below may be handed an
+            // address that was never checked: with `len == 0` the checks
+            // pass vacuously, and a non-canonical `arg2`/`arg3` would
+            // then panic in `VirtAddr::new`.
+            if len == 0 {
+                return 0;
+            }
+            // Both ends have to be ring-3 memory: the source in a PML4
+            // slot the kernel leaves empty (without that, any process
+            // could name a kernel task -- whose address space *is* the
+            // kernel's -- and read kernel memory out), and the
+            // destination writable by the caller itself (without that,
+            // it could name the kernel heap, which every address space
+            // maps, and write into it).
+            let src_end = arg2.checked_add(len.max(1) as u64 - 1);
+            let src_ok = match src_end.map(|end| (VirtAddr::try_new(arg2), VirtAddr::try_new(end))) {
+                Some((Ok(start), Ok(end))) => memory::pml4_slots_unused(proc::kernel_cr3(), start, end),
+                _ => false,
+            };
+            if !src_ok {
+                return ERR_VIRCOPY_FAILED;
+            }
+            if check_writable(caller, arg3, len).is_err() {
+                return ERR_VIRCOPY_FAILED;
             }
             // Safety: `local_ptr` (arg3) is never dereferenced here --
             // it's only handed to `calls::sys_vircopy`, which reaches it
@@ -554,6 +695,14 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                 serial_println!("[syscall] proc {}: SYS_WAIT from ring {}, refusing", caller, caller_cs & 3);
                 return ERR_NOT_RING3;
             }
+            // A bad status pointer is refused before blocking, not after:
+            // afterwards the child has been reaped and its status would
+            // have nowhere to go.
+            if arg1 != 0 {
+                if let Err(err) = check_writable(caller, arg1, 4) {
+                    return err;
+                }
+            }
             // Blocks for as long as it takes a child to terminate, which
             // is unbounded -- the same "block inside the trap and resume
             // in ring 3 afterwards" shape `SYS_WAIT_ALARM` and
@@ -569,15 +718,11 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                 status
             );
             // `arg1` is where the caller wants the status written, or 0
-            // for "don't bother" (POSIX lets `wait(NULL)` do that).
-            // Safety: the caller's own address space is active again by
-            // now -- this task is running, so `CR3` is its own -- so this
-            // is the same direct write `SYS_WRITE_LINE`'s read relies on.
-            // Unlike `SYS_READ_LINE`, no other task ever touches this
-            // pointer: `wait_for_child` returns the status through the
-            // process table, not through a buffer.
+            // for "don't bother" (POSIX lets `wait(NULL)` do that). Checked
+            // above; the only way this can still fail is the process
+            // having unmapped the page meanwhile, which nothing here can.
             if arg1 != 0 {
-                unsafe { (arg1 as *mut i32).write_unaligned(status) };
+                let _ = copy_to_caller(caller, arg1, &status.to_le_bytes());
             }
             child as u64
         }
@@ -620,10 +765,12 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             // caller's pointer refers to nothing at all; copying into a
             // kernel-stack buffer (mapped identically in every address
             // space) is what makes the path outlive its own image.
-            let src = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2 as usize) };
             let mut path_buf = [0u8; MAX_FS_BUF];
-            path_buf[..src.len()].copy_from_slice(src);
-            let path = match core::str::from_utf8(&path_buf[..src.len()]) {
+            let path_len = arg2 as usize;
+            if let Err(err) = copy_from_caller(caller, arg1, &mut path_buf[..path_len]) {
+                return err;
+            }
+            let path = match core::str::from_utf8(&path_buf[..path_len]) {
                 Ok(path) => path,
                 Err(_) => return ERR_BAD_UTF8,
             };

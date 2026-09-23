@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
 members = ["kernel"]
+# Ring-3 programs: a separate build for a separate target configuration
+# (their own link address and linker script), see user/README.md.
+exclude = ["user"]

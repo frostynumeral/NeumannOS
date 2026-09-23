@@ -7,7 +7,7 @@
 # a program is the two of them composed, and that composition is what
 # this file is for.
 #
-# It didn't used to fork: this program used to exec /bin/echo over
+# It didn't used to fork: this program used to exec /bin/exectest over
 # itself, which proved exec but meant the process that asked for a
 # program was also the one that stopped existing -- no shell can work
 # that way, since it would have nothing left to return to a prompt.
@@ -78,18 +78,18 @@
 #
 # The child's exec passes a real argument and environment vector, the
 # way a shell turns a typed command line into one: argv is
-# {"/bin/echo", "hello", "from", "argv"} and envp is {"GREETING=neumann"},
+# {"/bin/exectest", "hello", "from", "argv"} and envp is {"GREETING=neumann"},
 # both C-style NULL-terminated arrays of NUL-terminated strings, in rdx
 # and rcx (crate::syscall's SYS_EXEC copies them out of this image before
 # discarding it, and crate::elf lays them out on the new image's stack).
-# /bin/echo prints its arguments back and writes them, and its first
+# /bin/exectest prints its arguments back and writes them, and its first
 # environment string, to files crate::main's exec_verify checks. The
 # failed exec of /not_a_program passes rdx = rcx = 0 -- no vectors -- and
 # has to say so explicitly: whatever those registers held from the
 # previous syscall would otherwise be read as a pointer.
 #
 # The child's exec call sits in a bounded retry loop rather than being a
-# straight-line call, and that is deliberate. /bin/echo has to be in
+# straight-line call, and that is deliberate. /bin/exectest has to be in
 # `fs` before it can be exec'd, and it gets there at runtime (crate::main's
 # seed_bin, from `pm`) -- so a straight-line exec here would be a bet on
 # `pm` reaching that point before this task is first scheduled. That bet
@@ -174,7 +174,7 @@ _start:
     mov $11, %eax       # SYS_FORK (crate::syscall::SYS_FORK)
     int $0x80
     test %rax, %rax
-    jz 2f               # child (rax == 0): go exec /bin/echo below
+    jz 2f               # child (rax == 0): go exec /bin/exectest below
 
     # --- parent path: record which process the child is, and stay shell ---
     mov %rax, fork_child_nr(%rip)
@@ -277,7 +277,7 @@ write_pair:
     int $0x80
     ret
 2:
-    # --- child path: replace this inherited image with /bin/echo ---
+    # --- child path: replace this inherited image with /bin/exectest ---
     mov $ATTEMPTS, %r12d
 3:
     # SYS_EXEC (rdi=path ptr, rsi=path len, rdx=argv, rcx=envp). On
@@ -293,7 +293,7 @@ write_pair:
     mov $12, %eax       # SYS_EXEC (crate::syscall::SYS_EXEC)
     int $0x80
 
-    # Failed (almost certainly ENOENT -- /bin/echo not installed yet).
+    # Failed (almost certainly ENOENT -- /bin/exectest not installed yet).
     # Sleep one real tick and try again, up to ATTEMPTS times.
     mov $1, %edi        # delay_ticks = 1
     mov $4, %eax        # SYS_SET_ALARM (crate::syscall::SYS_SET_ALARM)
@@ -329,13 +329,13 @@ err_path:
     .ascii "/exec_error.bin"
 err_path_len = . - err_path
 before:
-    .ascii "shell: about to fork, and have the child become /bin/echo via a real exec()"
+    .ascii "shell: about to fork, and have the child become /bin/exectest via a real exec()"
 before_len = . - before
 still_shell:
-    .ascii "shell: forked -- my child is becoming /bin/echo, and I am still shell"
+    .ascii "shell: forked -- my child is becoming /bin/exectest, and I am still shell"
 still_shell_len = . - still_shell
 gave_up:
-    .ascii "shell: /bin/echo never showed up in fs -- giving up on exec()"
+    .ascii "shell: /bin/exectest never showed up in fs -- giving up on exec()"
 gave_up_len = . - gave_up
 fork_path:
     .ascii "/shell_fork.bin"
@@ -361,9 +361,9 @@ wait_child:
 wait_status:
     .quad 0
 prog:
-    .ascii "/bin/echo"
+    .ascii "/bin/exectest"
 prog_len = . - prog
-# The vectors /bin/echo is exec'd with. Absolute addresses (.quad) are
+# The vectors /bin/exectest is exec'd with. Absolute addresses (.quad) are
 # fine: this is a static, non-PIE link, and they're only ever read
 # through the kernel's copy-in, which takes user addresses.
     .align 8
@@ -372,7 +372,7 @@ echo_argv:
 echo_envp:
     .quad echo_env0, 0
 echo_arg0:
-    .asciz "/bin/echo"
+    .asciz "/bin/exectest"
 echo_arg1:
     .asciz "hello"
 echo_arg2:

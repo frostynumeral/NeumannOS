@@ -1180,6 +1180,19 @@ fn reclaim(
 
 /// The `(PhysFrame, Cr3Flags)` `proc_nr`'s address space is rooted at --
 /// its own (`Proc::cr3`), or the kernel's default if it doesn't have one.
+/// Whether `proc_nr` names a process-table slot that is in use -- the
+/// check anything taking a process number from ring 3 must make first,
+/// since `com::slot` of an arbitrary number indexes the table out of
+/// bounds.
+pub fn is_valid_proc_nr(proc_nr: i32) -> bool {
+    if proc_nr < -(com::NR_TASKS as i32) {
+        return false;
+    }
+    let idx = com::slot(proc_nr);
+    idx < com::NR_PROC_SLOTS
+        && with_scheduler(|sched| sched.procs[idx].rts_flags & rts::SLOT_FREE == 0)
+}
+
 /// For `crate::calls::sys_vircopy` to translate a virtual address in some
 /// *other* process's address space via `crate::memory::page_table_for`.
 pub fn cr3_of(proc_nr: i32) -> (PhysFrame, Cr3Flags) {

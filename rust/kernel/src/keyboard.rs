@@ -19,6 +19,8 @@
 //! a timer tick.
 
 use crate::{com, fs, ipc, serial_println};
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 /// Standard IBM PC/AT "scancode set 1" (what real hardware -- and QEMU's
 /// PS/2 emulation -- both still send by default), unshifted-key mapping
@@ -111,48 +113,76 @@ pub fn translate(scancode: u8) -> Option<u8> {
     }
 }
 
-/// Longest line `on_char`/`console_task` will buffer. A character typed
-/// past this is silently dropped -- a real line discipline would likely
-/// bell or refuse further input instead; this port doesn't have a way to
-/// signal that back to the (nonexistent) terminal yet.
-const LINE_CAPACITY: usize = 64;
+/// Longest line `on_char`/`console_task` will buffer -- matched to the
+/// syscall layer's own buffer (`crate::syscall`'s `MAX_FS_BUF`) and to
+/// what `sh` reads, so a line isn't cut short anywhere along the way. A
+/// character typed past this is silently dropped -- a real line
+/// discipline would likely bell or refuse further input instead; this
+/// port doesn't have a way to signal that back to the terminal yet.
+const LINE_CAPACITY: usize = 256;
+
+/// How many completed lines `on_char` holds for `console_task` before it
+/// starts dropping them. `console_task` drains them on every
+/// `LINE_READY`, so this only fills if it falls badly behind.
+const COMPLETED_LINES: usize = 8;
 
 struct LineBuffer {
-    buf: [u8; LINE_CAPACITY],
+    /// The line being typed.
+    cur: [u8; LINE_CAPACITY],
     len: usize,
-    /// Set by `on_char` on a newline, cleared by `take_line` once
-    /// `console_task` has consumed it. `on_char` keeps accumulating into
-    /// `buf`/`len` for the *next* line even before this one's been taken
-    /// (mirroring a real line discipline's typeahead), rather than
-    /// blocking further input until `console_task` catches up.
-    ready: bool,
+    /// Lines finished (Enter pressed) but not yet taken by
+    /// `console_task`, oldest at `head`. Kept apart from `cur` so typing
+    /// ahead starts a fresh line: the first version appended new
+    /// keystrokes to a completed line that hadn't been taken yet, so two
+    /// lines typed quickly enough arrived as one.
+    done: [[u8; LINE_CAPACITY]; COMPLETED_LINES],
+    done_len: [usize; COMPLETED_LINES],
+    head: usize,
+    count: usize,
 }
 
-/// The one pending (or just-completed) line, shared between the keyboard
-/// IRQ handler (producer) and `console_task` (consumer). A `spin::Mutex`
-/// rather than anything fancier: the producer only ever holds it for a
-/// few array writes, never across a block/switch, so there's no
-/// deadlock risk against `console_task` (which never holds it across a
-/// blocking call either).
-static LINE: spin::Mutex<LineBuffer> =
-    spin::Mutex::new(LineBuffer { buf: [0; LINE_CAPACITY], len: 0, ready: false });
+/// Shared between the keyboard IRQ handler (producer) and `console_task`
+/// (consumer). A spin lock, so the consumer takes it only with interrupts
+/// off (`take_line`): the producer is an interrupt handler, and a
+/// keypress arriving while `console_task` held the lock would otherwise
+/// spin forever inside the IRQ.
+static LINE: spin::Mutex<LineBuffer> = spin::Mutex::new(LineBuffer {
+    cur: [0; LINE_CAPACITY],
+    len: 0,
+    done: [[0; LINE_CAPACITY]; COMPLETED_LINES],
+    done_len: [0; COMPLETED_LINES],
+    head: 0,
+    count: 0,
+});
 
 /// Called from `crate::interrupts::keyboard_interrupt_handler` for every
-/// translated character. A newline marks the buffered line ready and
-/// wakes `console_task` (`crate::ipc::notify`, which -- like
-/// `crate::proc::clock_tick`'s own `SYN_ALARM` delivery -- reschedules
-/// immediately if that just woke a higher-priority task); anything else
-/// is appended to the line in progress.
+/// translated character (so with interrupts already off). A newline
+/// finishes the line in progress, queues it, and wakes `console_task`
+/// (`crate::ipc::notify`, which -- like `crate::proc::clock_tick`'s own
+/// `SYN_ALARM` delivery -- reschedules immediately if that just woke a
+/// higher-priority task); anything else is appended to the line in
+/// progress.
 pub fn on_char(ascii: u8) {
     if ascii == b'\n' {
-        LINE.lock().ready = true;
+        {
+            let mut line = LINE.lock();
+            if line.count < COMPLETED_LINES {
+                let slot = (line.head + line.count) % COMPLETED_LINES;
+                let len = line.len;
+                let cur = line.cur;
+                line.done[slot] = cur;
+                line.done_len[slot] = len;
+                line.count += 1;
+            }
+            line.len = 0;
+        }
         crate::ipc::notify(crate::com::CONSOLE_PROC_NR, LINE_READY);
         return;
     }
     let mut line = LINE.lock();
     if line.len < LINE_CAPACITY {
         let len = line.len;
-        line.buf[len] = ascii;
+        line.cur[len] = ascii;
         line.len += 1;
     }
 }
@@ -163,19 +193,19 @@ pub fn on_char(ascii: u8) {
 /// task, so this is a stylistic distinction more than a load-bearing one.
 const LINE_READY: i32 = crate::com::NOTIFY_MESSAGE | 0x0100;
 
-/// Take the completed line out of `LINE` (if one is ready) and reset it
-/// for the next one. Returns the line's bytes and length -- a fixed-size
-/// array rather than a slice, so `console_task` can hold it across the
-/// `LINE` lock being released.
-fn take_line() -> Option<([u8; LINE_CAPACITY], usize)> {
-    let mut line = LINE.lock();
-    if !line.ready {
-        return None;
-    }
-    let result = (line.buf, line.len);
-    line.len = 0;
-    line.ready = false;
-    Some(result)
+/// Take the oldest completed line, if there is one.
+fn take_line() -> Option<Vec<u8>> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut line = LINE.lock();
+        if line.count == 0 {
+            return None;
+        }
+        let head = line.head;
+        let taken = Vec::from(&line.done[head][..line.done_len[head]]);
+        line.head = (head + 1) % COMPLETED_LINES;
+        line.count -= 1;
+        Some(taken)
+    })
 }
 
 /// Real message type (not a fire-and-forget notification like
@@ -264,9 +294,9 @@ fn dispatch_run(name: &str) {
 /// from `crate::syscall`'s `SYS_READ_LINE`), that same line is delivered
 /// to them too, directly into the buffer their request pointed at
 /// (`deliver_line`). A `CONSOLE_READ_LINE` request that arrives with no
-/// line buffered yet is remembered (`pending_reader`) rather than
-/// replied to immediately, and satisfied whenever the next line
-/// completes -- proof a ring-3 task can genuinely block waiting for
+/// line buffered yet is queued (`pending_readers`, oldest first) rather
+/// than replied to immediately, and satisfied when a line completes and
+/// every earlier reader has had one -- proof a ring-3 task can genuinely block waiting for
 /// keyboard input and resume once a human (or, in QEMU, a QMP
 /// `send-key` sequence) actually types something.
 ///
@@ -281,34 +311,57 @@ pub fn console_task() -> ! {
     if fd < 0 {
         serial_println!("[console] fs::open(\"/console.log\") failed: {}", fd);
     }
-    let mut pending_reader: Option<PendingReader> = None;
+    // Every caller blocked in `SYS_READ_LINE`, oldest first. A queue
+    // rather than one slot: a single slot meant whichever of two readers
+    // asked second silently replaced -- and so permanently starved -- the
+    // other.
+    let mut pending_readers: VecDeque<PendingReader> = VecDeque::new();
+    // And the other side: lines typed while nobody was reading (a command
+    // typed while the shell is still waiting for the last one to finish).
+    // Kept rather than dropped, up to a point -- a real tty's input queue
+    // is finite too.
+    let mut unread: VecDeque<Vec<u8>> = VecDeque::new();
+    const MAX_UNREAD: usize = 16;
 
     loop {
         let msg = ipc::receive(com::ANY);
 
         if msg.m_type == CONSOLE_READ_LINE {
-            // Simplification: only one pending reader is tracked at a
-            // time -- a second SYS_READ_LINE arriving before the first
-            // is satisfied would overwrite (and so silently starve) it.
-            // Fine for this port's one demo caller.
-            pending_reader =
-                Some(PendingReader { proc_nr: msg.source, ptr: msg.args[0] as u64, max_len: msg.args[1] as usize });
-            continue;
+            pending_readers.push_back(PendingReader {
+                proc_nr: msg.source,
+                ptr: msg.args[0] as u64,
+                max_len: msg.args[1] as usize,
+            });
+        } else {
+            while let Some(line) = take_line() {
+                let text = core::str::from_utf8(&line).unwrap_or("<invalid utf8>");
+                serial_println!("[console] received line: {:?}", text);
+                if fd >= 0 {
+                    fs::write(fd, &line);
+                    fs::write(fd, b"\n");
+                }
+                // A `run` command is the console's own, handled here and
+                // consumed: handing it to a reader as well had the shell
+                // try to run a program called `run`.
+                if let Some(name) = text.strip_prefix("run ") {
+                    dispatch_run(name);
+                    continue;
+                }
+                if unread.len() == MAX_UNREAD {
+                    serial_println!("[console] input queue full, dropping {:?}", text);
+                    continue;
+                }
+                unread.push_back(line);
+            }
         }
 
-        let Some((buf, len)) = take_line() else { continue };
-        let line = &buf[..len];
-        let text = core::str::from_utf8(line).unwrap_or("<invalid utf8>");
-        serial_println!("[console] received line: {:?}", text);
-        if fd >= 0 {
-            fs::write(fd, line);
-            fs::write(fd, b"\n");
-        }
-        if let Some(name) = text.strip_prefix("run ") {
-            dispatch_run(name);
-        }
-        if let Some(reader) = pending_reader.take() {
-            deliver_line(&reader, line);
+        // Each line goes to exactly one reader, and both queues are
+        // served oldest first -- the same order a real tty gives two
+        // processes reading one terminal.
+        while !pending_readers.is_empty() && !unread.is_empty() {
+            let reader = pending_readers.pop_front().unwrap();
+            let line = unread.pop_front().unwrap();
+            deliver_line(&reader, &line);
         }
     }
 }

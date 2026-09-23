@@ -36,4 +36,5 @@ pub static BOOT_IMAGE: [BootImageEntry; NR_TASKS + FIRST_DYNAMIC_PROC_NR as usiz
     BootImageEntry { proc_nr: CONSOLE_PROC_NR, name: "console" },
     BootImageEntry { proc_nr: APP1_PROC_NR, name: "hello (app slot, not started at boot)" },
     BootImageEntry { proc_nr: SHELL_PROC_NR, name: "shell (fork/exec demo)" },
+    BootImageEntry { proc_nr: SH_PROC_NR, name: "sh" },
 ];

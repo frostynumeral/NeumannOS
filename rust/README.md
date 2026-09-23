@@ -356,7 +356,7 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   CPU didn't already save, calls `dispatch` with the caller's original
   `rax`/`rdi`/`rsi`/`rdx`/`rcx`, writes the `u64` result back into the
   saved `rax` slot, restores everything else unchanged, and `iretq`s.
-  `dispatch` implements fourteen calls: `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  `dispatch` implements sixteen calls (the two newest, `SYS_FS_OPEN_EXISTING` and `SYS_CONSOLE_WRITE`, are described under "Ring-3 programs in Rust" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
@@ -828,16 +828,14 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   a real `SYS_VIRCOPY` reading a range of `driver`'s own private memory
   straight from ring 3 (see `src/syscall.rs` below), a second,
   deliberately-invalid `SYS_VIRCOPY` exercising the ABI's distinct error
-  codes, then a real `SYS_READ_LINE` -- blocking for however long it
-  takes a human to actually type a line -- followed by a second
-  `SYS_FS_OPEN`/`SYS_FS_WRITE` writing whatever line arrived to
-  `/from_console.txt`, and finally `SYS_BLOCK_FOREVER` -- see
-  `src/syscall.rs` below for what each of those actually does. `IDLE`
-  (below) reads `/from_ring3.txt` and `/from_fork_child.txt` back
-  afterward to confirm the content genuinely landed in `fs`;
-  `/from_console.txt` needs a human (or a QMP `send-key` script) to
-  actually type something first, so nothing reads it back automatically --
-  see the "Running" section. `CLOCK` now genuinely
+  codes, and finally `SYS_BLOCK_FOREVER` -- see `src/syscall.rs` below
+  for what each of those actually does. `IDLE` (below) reads
+  `/from_ring3.txt` and `/from_fork_child.txt` back afterward to confirm
+  the content genuinely landed in `fs`. (`tty` also used to block in
+  `SYS_READ_LINE` for one typed line and write it to
+  `/from_console.txt`; the shell, `sh`, is the keyboard's reader now, and
+  with lines handed to readers first-come first-served a second reader
+  parked for good would have taken every other command typed at it.) `CLOCK` now genuinely
   calls `sys_setalarm` and blocks in `receive` -- exactly real MINIX's
   `while (TRUE) receive(HARDWARE, &m)` -- instead of polling
   `uptime_ticks()`, and also exercises `sys_vircopy`: reading the ring-3
@@ -864,6 +862,78 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   address space: translating the ring-3 code page's address through the
   *kernel's own* page table returns `None`, proving the mapping really is
   private and not merely inaccessible-by-privilege-level.
+
+### Ring-3 programs in Rust: `rust/user/` and the shell
+
+`rust/user/` is a separate crate (excluded from the kernel's workspace,
+with its own `.cargo/config.toml` and linker script -- see its
+`README.md`) holding the first ring-3 programs written in Rust rather
+than hand-assembled, and `neumann_rt`, the runtime they're written on:
+this port's first real step on roadmap item 12, the libc-equivalent.
+
+- `neumann_rt` (`src/lib.rs`, `src/sys.rs`): a naked `_start` that hands
+  `main` the `argc`/`argv`/`envp` block `exec` built on the stack
+  (`Args`, with `env()`/`var()`), turns `main`'s return value into
+  `SYS_EXIT`, `print!`/`println!` through `SYS_CONSOLE_WRITE`, a panic
+  handler exiting with 101, and one wrapper per system call (`sys`).
+  No heap: nothing backs one yet.
+- `sh` (`src/bin/sh.rs`, `com::SH_PROC_NR`, started at boot with
+  `argv = {"sh"}` and `envp = {"PATH=/bin", "HOME=/"}`): the interactive
+  shell. It reads a line (`SYS_READ_LINE`), echoes it (nothing else
+  does), splits it into words, and runs it the way every Unix shell
+  does -- `fork`, the child `exec`s `/bin/<word>` with the words as its
+  `argv` and the shell's own environment, the parent `wait`s and reports
+  a non-zero status (`[exit 1]`, `[exit 127]` for a missing command).
+  Built in: `exit [status]` and `help`.
+- `echo`, `cat`, `ptrtest` -- what it runs. `cat` uses the new
+  `SYS_FS_OPEN_EXISTING` (`open` without `O_CREAT`; plain `SYS_FS_OPEN`
+  creates what it opens, so `cat missing` used to leave an empty file
+  behind). `ptrtest` hands the kernel bad pointers (above).
+
+Everything a real program launch needs was already here; what this adds
+is the first thing that *uses* it interactively. `pm`'s `seed_bin`
+installs the programs at `/bin` at boot (`elf::RUST_PROGRAMS`, embedded
+from `kernel/user/bin/`, which `rust/user/install.sh` fills). The
+hand-assembled exec test that used to live at `/bin/echo` moved to
+`/bin/exectest` so the real `echo` could have the name.
+
+Kernel changes it needed: every ELF image now gets an 8-page stack
+(`elf::STACK_PAGES`; compiled Rust wanted more than the one page the
+assembly programs never came near), with `argv`/`envp` in the top page;
+`SYS_CONSOLE_WRITE` (a program's standard output, as opposed to
+`SYS_WRITE_LINE`'s prefixed log line); `SYS_FS_OPEN_EXISTING`; and
+`console_task` queueing readers and lines (see "known simplifications in
+the keyboard driver"). Verified interactively over QMP `send-key`:
+`help`, `echo`, `cat` of files that exist and don't, an unknown command,
+two commands typed back to back without waiting, `run hello` (which goes
+to `rs` and not to the shell), `ptrtest`, and `exit 3`, with no faults.
+
+Building it turned up a real copy-on-write bug that nothing before had
+exercised: a forked child that ended up *sole owner* of a copy-on-write
+page (its parent having copied first) got write permission back on the
+page-table leaf only, while the tables above it -- created by `map_to`
+with permissions derived from a read-only COW leaf -- stayed read-only,
+so the child's next write faulted again, found nothing COW about the
+page, and killed it. It was the shell's fifth command. `share_pages_into`
+now spells out permissive table flags, and `cow_self_test` has a case
+that fails without that fix. A review of copy-on-write and of
+`exec`'s `argv` found more, all fixed alongside: the frame allocator
+and heap locks are now taken only with interrupts off (the page-fault
+handler takes both, and could otherwise spin on a lock held by a
+preempted task); fork runs with interrupts off (a kernel task forking a
+*different*, runnable process could lose isolation if the source ran
+mid-fork); COW resolution translates and acts in one uninterruptible
+step; a kernel write into a page shared *without* COW (program text)
+now gets a private copy instead of rewriting every sharer's code;
+`copy_between_address_spaces` no longer panics stepping past the top of
+the lower half; and the syscall layer's pointer handling described in
+"known simplifications in the syscall ABI".
+
+Known gaps: `fs` has no `close`, so every `cat` leaks an open-file slot
+in `fs`'s table (which grows without bound); output goes to COM1 only,
+interleaved with the kernel's own log (the on-screen console is the
+next milestone); no quoting, pipes, redirection, variables, job control
+or current directory in `sh`.
 
 ### A real bug found and fixed by a multi-agent review
 
@@ -934,7 +1004,9 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Fourteen calls exist**, and all but the unrecognized-call-number
+- **Sixteen calls exist** (`SYS_FS_OPEN_EXISTING` and
+  `SYS_CONSOLE_WRITE` are the newest -- see the `rust/user/` section
+  above), and all but the unrecognized-call-number
   fallback reach real server/kernel-call logic, including `SYS_FORK`
   from any ring-3 caller now (see the `src/syscall.rs`/`src/proc.rs`
   bullets above). Real enough to
@@ -969,14 +1041,27 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   `src/main.rs`). `SYS_FS_*` separately forward `fs`'s own real error
   codes through unchanged on top of these, since those are a distinct,
   already-real-`errno`-shaped failure mode with no need for a stand-in.
-- **No validation beyond a length bound.** `SYS_WRITE_LINE`/`SYS_FS_*`
-  check a length against `MAX_LINE_LEN`/`MAX_FS_BUF` before reading, but
-  never check that a pointer actually points at memory the caller is
-  allowed to read (a real kernel validates a user pointer against the
-  process's known memory map, or handles the page fault gracefully if it
-  doesn't; a bad pointer here page-faults the kernel itself, in the
-  caller's still-active address space, which isn't handled any more
-  gracefully than any other in-kernel fault -- see `crate::interrupts`).
+- **Pointers are validated by copying, one call's worth at a time.**
+  Every pointer argument is read with `copy_from_caller` or written with
+  `copy_to_caller` (after `check_writable`), both walking the caller's
+  page tables and confined to PML4 slots the kernel leaves empty, so a
+  bad pointer comes back as `ERR_BAD_ARG_PTR` instead of a ring-0 page
+  fault. This used to be a raw dereference, and any ring-3 program could
+  halt the machine with one bad pointer, read the kernel heap through
+  `SYS_WRITE_LINE`, or write it through `SYS_FS_READ`; `SYS_VIRCOPY`
+  could name a kernel task as its source (reading kernel memory) or the
+  heap as its destination. `/bin/ptrtest` (run at boot by
+  `crate::main`'s `ptr_safety_check`) holds seventeen such calls to
+  refusing. What's still coarse: the copies go through one bounded
+  kernel-stack buffer per call (256 bytes), and a write checked before a
+  call blocks could in principle find the page gone afterwards (nothing
+  here unmaps a page from a live process, so it can't today).
+- **The error codes overlap.** `ERR_*` are numbered from -1 with no
+  regard to the POSIX-numbered `fs` codes forwarded alongside them
+  (`ERR_BAD_UTF8` and `ENOENT` are both -2, `ERR_NO_FREE_PROC` and
+  `ENOEXEC` both -8), so a code only means one thing in the context of
+  the call that returned it. `neumann_rt::sys::strerror` names the reading
+  most calls mean; renumbering the ABI would fix it properly.
 - **`entry`'s register save list is fixed and total** (all 15
   general-purpose registers, every call), rather than saving only what a
   real syscall convention requires (e.g. SysV's syscall-clobbered set) or
@@ -1126,7 +1211,7 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   it.
 - **Three images, all built out of band.** `HELLO_ELF`, `SHELL_ELF`, and
   `ECHO_ELF` are `include_bytes!`d from hand-assembled files; the last of
-  those only so `pm` has something to install at `/bin/echo`. Loading by
+  those only so `pm` has something to install at `/bin/exectest`. Loading by
   path out of `fs` is real (`read_file`), but what's *in* `fs` still
   ultimately comes from the kernel binary.
 
@@ -1135,7 +1220,7 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 - **`argv`/`envp` are real, but small.** `SYS_EXEC` copies both vectors
   out of the address space it's about to destroy and reconstructs them
   on the new image's stack, as a real `execve` does (`user/shell.s`
-  execs `/bin/echo` with four arguments and one environment string, and
+  execs `/bin/exectest` with four arguments and one environment string, and
   `user/echo.s` genuinely echoes them; `crate::main`'s `argv_verify`
   reads the start-up block back out of the child's stack and checks the
   layout word by word). What's small is the budget: everything has to
@@ -1276,19 +1361,28 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   only because `crate::fs` has no explicit "append" mode to fall back on
   (see "known simplifications in `fs`" above); re-opening on every line
   would silently overwrite from the start each time instead.
-- **Only one pending `SYS_READ_LINE` reader is tracked at a time.**
-  `console_task`'s `pending_reader` is a single `Option`, not a queue: a
-  second `CONSOLE_READ_LINE` request arriving before the first is
-  satisfied would silently overwrite (and so permanently starve) the
-  first caller. Fine for this port's one caller (`tty`); not fine for
-  more than one ring-3 task blocking on console input at once.
-- **A completed line with no pending reader is only logged, not saved
-  for a future reader.** If a line finishes before anyone calls
-  `SYS_READ_LINE` for it, `console_task` still appends it to
-  `/console.log`, but a *later* `SYS_READ_LINE` call will wait for the
-  *next* line typed, not receive the one that already happened. Fine for
-  this port's demo (`tty` calls `SYS_READ_LINE` well before any human
-  types anything), not a general "replay history" mailbox.
+- **Readers and lines are both queued, first-come first-served, and
+  bounded.** `console_task` keeps every blocked `SYS_READ_LINE` caller
+  (`pending_readers`) and every line typed while nobody was reading
+  (`unread`, at most 16), and pairs them oldest-first -- so a command
+  typed while the shell is still running the last one waits its turn
+  rather than vanishing, and two readers each get their own lines. (The
+  first version tracked one reader in a single `Option` and dropped
+  lines nobody was waiting for; before that, typing ahead appended new
+  keystrokes onto the completed line, merging two lines into one.) The
+  keyboard IRQ holds up to 8 completed lines for `console_task`
+  (`COMPLETED_LINES`); past either bound a line is dropped, with a log
+  line for the `unread` case. There's no notion of a *foreground* reader:
+  whoever asked first gets the next line.
+- **`run <name>` is the console's, not the shell's.** A line starting
+  `run ` goes to `rs` (`dispatch_run`) and is *not* handed to a reader,
+  so the shell never sees it -- the one command the console still
+  interprets itself.
+- **No echo, no editing, no Shift.** The shell prints each line back
+  after it's entered (`sh` does that itself); nothing echoes keystrokes
+  as they're typed, Backspace isn't handled, and with no modifier state
+  there are no capitals or shifted punctuation -- `_` can't be typed, so
+  neither can a path containing one.
 
 ### Known simplifications in `rs`/crash recovery
 
@@ -1450,7 +1544,7 @@ Roughly in the order the original kernel needs them:
     exactly as it was" is the guarantee most easily broken here.
     The two now compose the way a shell composes them, which is the point
     of having both: `shell` (`user/shell.s`) *forks*, and its child is
-    what execs `/bin/echo`, while the parent goes on being `shell`. That
+    what execs `/bin/exectest`, while the parent goes on being `shell`. That
     needed the last two things keeping `fork` from being a general call
     -- a per-process memory map saying which pages a fork must copy
     (`crate::memory::MemMap`, in `Proc::mem_map`), and a process number
@@ -1466,7 +1560,7 @@ Roughly in the order the original kernel needs them:
     fork/exec/exit/wait cycle a real program launch is made of, running
     in ring 3 -- and the exec carries a real `argv`/`envp` across, laid
     out on the new stack the way the System V ABI has it, which
-    `/bin/echo` then actually echoes. Still
+    `/bin/exectest` then actually echoes. Still
     missing: `fs`
     growing `readdir` and a real backing store (see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
@@ -1476,7 +1570,12 @@ Roughly in the order the original kernel needs them:
     kernel-stack buffer around the IPC call -- `fs` itself still has no
     `sys_vircopy`-style cross-address-space copy of its own for a caller
     that reaches it some other way.
-12. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`.
+12. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`
+    -- started: `rust/user/`'s `neumann_rt` (entry point and `argv`/`envp`,
+    a wrapper per system call, formatted console output, a panic
+    handler), and the first programs written on it, an interactive shell
+    among them (see "Ring-3 programs in Rust" above). Missing: a heap,
+    and everything a heap would enable.
 13. ~~**Real graphics output**~~ — started (`src/vga.rs`): VGA mode 13h
     (320x200, 256-color), a real palette (VGA DAC ports) and a real
     linear framebuffer, `fill_rect`/`fill_rounded_rect` drawing
@@ -1506,14 +1605,14 @@ Roughly in the order the original kernel needs them:
     boot, once `IDLE` had already halted. `console_task` now also answers
     real `SYS_READ_LINE` requests from ring 3 (`crate::syscall`): `tty`
     blocks for an entire line of real, human-timed keyboard input from
-    inside its own trap, then writes what it received to a second file --
-    verified end to end by typing `"neumann"` over QMP well after boot and
-    seeing it land in `/from_console.txt`, exactly as typed. `console_task`'s
+    inside its own trap -- first proven by `tty`, now what the shell
+    (`sh`, `rust/user/`) reads every command with, readers and typed-ahead
+    lines both queued first-come first-served. `console_task`'s
     line discipline can now also dispatch a `"run <name>"` command to `rs`
     (see item 11 above), not just log/echo the line. See "known
     simplifications in the keyboard driver" above for what's still missing
-    (modifier-key state, extended scancodes, echo/editing, only one
-    pending reader tracked at a time, and a real `tty` server this port's
+    (modifier-key state, extended scancodes, echo/editing, no notion of a
+    foreground reader, and a real `tty` server this port's
     `console_task` stands in for by talking to `fs` directly).
 15. ~~**A real syscall ABI**~~ — done (`src/syscall.rs`). Replaced
     `usermode`'s old fixed-action, count-and-cut-off `int 0x80` handler
@@ -1521,7 +1620,7 @@ Roughly in the order the original kernel needs them:
     gate saves every general-purpose register, reads the caller's `rax`
     (call number) and `rdi`/`rsi`/`rdx`/`rcx` (up to four arguments, since
     grown from three -- see the `src/syscall.rs` bullet above),
-    dispatches to one of fourteen calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    dispatches to one of sixteen calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
     -- a real cross-ring pointer argument, read directly since entering a
     trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
     the first of `crate::calls`' own kernel calls reachable from ring 3,
@@ -1568,7 +1667,7 @@ Roughly in the order the original kernel needs them:
     child's canary write (proving its memory is a real, independent copy)
     and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
     `IDLE`. See "known simplifications in the syscall ABI" above for what's
-    not a real syscall surface yet (fourteen calls, one code per *kind* of
+    not a real syscall surface yet (sixteen calls, one code per *kind* of
     dispatch-level mistake rather than a real per-cause `errno` set).
     `SYS_FORK` is no longer restricted to one known caller with one
     reserved child slot: the pages to copy come out of the caller's own
@@ -1580,7 +1679,7 @@ Roughly in the order the original kernel needs them:
     plumbing `SYS_FORK` introduced for the opposite purpose: rather than
     copying the caller's trap into a new process, it overwrites the
     caller's own saved registers, so the trap returns into a different
-    program entirely (`shell` becomes `/bin/echo` mid-syscall). See item
+    program entirely (`shell` becomes `/bin/exectest` mid-syscall). See item
     11 above and "known simplifications in `exec()`".
 
 ## Building
@@ -1653,18 +1752,21 @@ button matching the digit pressed (button `N` for digit `N`), and
 nowhere else. The line discipline can be exercised the same way: send a
 sequence of letter `qcode`s followed by `"ret"` (e.g. `"h"`, `"i"`,
 `"ret"`), and COM1 should print `[console] received line: "hi"` --
-this too works well after boot, once `IDLE` has already halted. `tty`'s
-`SYS_READ_LINE` call means this actually matters for a normal run, not
-just an optional extra: since nothing else in this port types anything
-on its own, `tty` will sit blocked at
-`[syscall] proc 5: SYS_READ_LINE, blocking for a real keypress`
-indefinitely in a plain, non-interactive boot -- exactly like a real
-shell waiting at a prompt, not a hang or a bug. Typing a line (e.g. `"n"`,
-`"e"`, `"u"`, `"m"`, `"a"`, `"n"`, `"n"`, `"ret"` for `"neumann"`) over
-QMP unblocks it: COM1 should show `[console] received line: "neumann"`,
-then `[syscall] proc 5: SYS_READ_LINE -> 7 bytes`, then `tty` opening
-and writing that same text to `/from_console.txt`, then finally its
-`SYS_BLOCK_FOREVER`. Typing `"run hello"` instead (`"r"`, `"u"`, `"n"`,
+this too works well after boot, once `IDLE` has already halted. That
+line goes to the shell: a plain boot ends with `sh` (`proc_nr` 12)
+printing `NeumannOS sh -- type `help` for help` and `$ `, then sitting at
+`[syscall] proc 12: SYS_READ_LINE, blocking for a real keypress`
+indefinitely -- a shell waiting at a prompt, not a hang. Type a command
+(`"e"`, `"c"`, `"h"`, `"o"`, `"spc"`, `"h"`, `"i"`, `"ret"` for
+`echo hi`) and COM1 shows the command echoed back, `sh` forking, the
+child exec'ing `/bin/echo` (`[syscall] proc 13: SYS_EXEC("/bin/echo",
+argc 2, envc 2) -> ...`), `hi`, the child's `SYS_EXIT(0)`, `sh`'s
+`SYS_WAIT` collecting it, and a fresh `$ `. `help`, `cat /console.log`,
+`cat /nope` (`cat: /nope: no such file or directory`, `[exit 1]`),
+`nosuch` (`sh: nosuch: no such file or directory`, `[exit 127]`),
+`ptrtest` and `exit 3` are all worth trying; `qmp_type.py`-style
+scripts that send one `send-key` per character with a short pause
+between commands work well. Typing `"run hello"` instead (`"r"`, `"u"`, `"n"`,
 `"spc"`, `"h"`, `"e"`, `"l"`, `"l"`, `"o"`, `"ret"`) exercises `rs`'s
 on-demand launch path: COM1 shows `[console] received line: "run hello"`,
 `[rs] launch request for "hello" -> 0`, `[console] run "hello" -> 0`,
@@ -1717,13 +1819,13 @@ and `tty` (a real ELF64 binary loaded by `crate::elf`) each making real,
 register-dispatched syscalls through `crate::syscall` --
 `[syscall] proc P: SYS_GET_UPTIME -> N` a few times each, `tty`
 additionally calling `SYS_FORK` right after its own loop
-(`[syscall] proc 5: SYS_FORK -> child proc_nr 13`) and genuinely forking
-itself: a real, separately-scheduled child (`proc_nr` 13 -- a number
+(`[syscall] proc 5: SYS_FORK -> child proc_nr 15`) and genuinely forking
+itself: a real, separately-scheduled child (`proc_nr` 15 -- a number
 allocated at the moment of the fork, not reserved for it, so it depends
 on what has forked already) resumes at that
 same point seeing `0` instead, writes a canary into its own copy of
 `vircopy_buf`, and makes its own independent `SYS_FS_OPEN`/`SYS_FS_WRITE`
-(`[syscall] proc 13: SYS_FS_OPEN("/from_fork_child.txt") -> N`) before
+(`[syscall] proc 15: SYS_FS_OPEN("/from_fork_child.txt") -> N`) before
 blocking for good -- while `tty` itself (seeing its child's nonzero
 `proc_nr`) falls straight through to `SYS_SET_ALARM`/`SYS_WAIT_ALARM`
 (`[syscall] proc 5: SYS_SET_ALARM(3 ticks)`, then, after genuinely
@@ -1778,13 +1880,13 @@ surviving its own deliberately-failed exec of a non-ELF file --
 reading `/evil_exec_error.bin` and confirming it too holds
 `ERR_BAD_ELF` -- that one written by the exec'd image after it tried,
 from ring 3, to `exec` a hand-built ELF asking to be mapped onto the
-kernel's own heap (`[syscall] proc 12: SYS_EXEC("/evil") -> bad image:
+kernel's own heap (`[syscall] proc 13: SYS_EXEC("/evil") -> bad image:
 SegmentInSharedSlot` appears earlier in the log), which the first
 version of this loader's validation accepted -- then finding `shell`'s
 forked child in the process table and cross-checking it against
 `/shell_fork.bin`, the `proc_nr` `SYS_FORK` actually handed back to
-`shell` in ring 3 (`[idle] read back 12 from /shell_fork.bin -- the
-proc_nr SYS_FORK returned to shell in ring 3 (process table says 12)`),
+`shell` in ring 3 (`[idle] read back 13 from /shell_fork.bin -- the
+proc_nr SYS_FORK returned to shell in ring 3 (process table says 13)`),
 and then four reads that together pin down *which* address space
 changed: the exec'd image's `.data` counter reads `1` in the child and
 is `Err(SrcNotMapped)` in `shell`, while `shell`'s own marker page still
@@ -1803,7 +1905,7 @@ terminated with `SYS_EXIT`) and the two `(proc_nr, status)` pairs
 the *same* process number, which is the point: collecting a status is
 what releases a slot, so the second fork gets the first child's number
 back. Watch for the two different collection paths in the log --
-`[proc] proc_nr 11 collected child proc_nr 13 (status 42) handed over
+`[proc] proc_nr 11 collected child proc_nr 14 (status 42) handed over
 directly -- it was still blocked here when the child exited` for the
 first, and `... (status 7) out of a zombie slot, which is now free
 again` for the second, which `shell` deliberately lets terminate before
@@ -1811,22 +1913,23 @@ asking for it. Before all of that, watch `shell`
 (`proc_nr` 11) announce itself, fail an exec on purpose
 (`[syscall] proc 11: SYS_EXEC("/not_a_program") -> bad image: NotElf`),
 carry on regardless, and then fork
-(`[syscall] proc 11: SYS_FORK -> child proc_nr 12`), then fork twice
+(`[syscall] proc 11: SYS_FORK -> child proc_nr 13`), then fork twice
 more and wait for each of those in turn
-(`[syscall] proc 13: SYS_EXIT(42)` from a child, then
-`[syscall] proc 11: SYS_WAIT -> child proc_nr 13 terminated with
+(`[syscall] proc 14: SYS_EXIT(42)` from a child, then
+`[syscall] proc 11: SYS_WAIT -> child proc_nr 14 terminated with
 status 42` from the parent), and finally go quiet with
-`shell: forked -- my child is becoming /bin/echo, and I am still shell`,
+`shell: forked -- my child is becoming /bin/exectest, and I am still shell`,
 while its first child stops being that program entirely
-(`[syscall] proc 12: SYS_EXEC("/bin/echo") -> replaced its own image,
-entering at 0x666666660000 on a fresh stack`), with every line after
-that from `proc 12` coming from a completely different program. If
-the child runs before `pm` has installed `/bin/echo`, you'll also see a
+(`[syscall] proc 13: SYS_EXEC("/bin/exectest", argc 4, envc 1) -> replaced
+its own image, entering at 0x666666660000 on a fresh stack`), with every
+line after that from `proc 13` coming from a completely different
+program. If
+the child runs before `pm` has installed `/bin/exectest`, you'll also see a
 few `-> fs error -2` (`ENOENT`) attempts a tick apart first: that's
 `user/shell.s`'s retry loop, not a failure. `IDLE` then exercises the
 dynamic process-number pool's own two edges, which no successful boot
 reaches on its own (`[idle] process-number pool: claimed the 4 remaining
-dynamic slot(s) ([13, 15, 16, 17]), then it correctly refused`): it
+dynamic slot(s) ([14, 16, 17, 18]), then it correctly refused`): it
 claims every number left until the pool refuses, hands them all back,
 and checks the first one comes out again. It also asks
 `proc::wait_for_child` for a child it doesn't have, which has to come

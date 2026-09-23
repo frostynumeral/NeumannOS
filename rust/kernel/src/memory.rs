@@ -86,7 +86,11 @@ fn share_frame(frame: PhysFrame) {
 /// The mapping being dropped must already be gone (or about to be, with
 /// nothing reaching it in between) -- the same contract as
 /// `deallocate_frame`, which this becomes for an unshared frame.
-unsafe fn release_frame(frame: PhysFrame) {
+///
+/// Returns whether the frame went back to the allocator -- decided under
+/// the same lock that decides it, so a caller counting frees can't be
+/// told a different story by a second, separate look.
+unsafe fn release_frame(frame: PhysFrame) -> bool {
     let last = without_interrupts(|| {
         let mut sharers = SHARERS.lock();
         let key = frame.start_address().as_u64();
@@ -105,6 +109,7 @@ unsafe fn release_frame(frame: PhysFrame) {
     if last {
         deallocate_frame(frame);
     }
+    last
 }
 
 /// Mappings of `frame` beyond one -- `0` for a frame only one address
@@ -137,12 +142,18 @@ pub unsafe fn init_frame_allocator(memory_map: &'static MemoryMap) {
 pub struct GlobalFrameAllocator;
 
 unsafe impl FrameAllocator<Size4KiB> for GlobalFrameAllocator {
+    // Interrupts off around every use of the lock, for the same reason
+    // as the kernel heap's (`crate::allocator::InterruptSafeHeap`): the
+    // page-fault handler allocates a frame for every copy-on-write copy,
+    // and would otherwise deadlock on a task preempted mid-allocation.
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        FRAME_ALLOCATOR
-            .lock()
-            .as_mut()
-            .expect("global frame allocator used before init_frame_allocator")
-            .allocate_frame()
+        without_interrupts(|| {
+            FRAME_ALLOCATOR
+                .lock()
+                .as_mut()
+                .expect("global frame allocator used before init_frame_allocator")
+                .allocate_frame()
+        })
     }
 }
 
@@ -151,11 +162,13 @@ impl FrameDeallocator<Size4KiB> for GlobalFrameAllocator {
     /// `frame` must be a frame this allocator handed out, no longer
     /// mapped in any address space and not referenced by any page table.
     unsafe fn deallocate_frame(&mut self, frame: PhysFrame) {
-        FRAME_ALLOCATOR
-            .lock()
-            .as_mut()
-            .expect("global frame allocator used before init_frame_allocator")
-            .deallocate_frame(frame)
+        without_interrupts(|| {
+            FRAME_ALLOCATOR
+                .lock()
+                .as_mut()
+                .expect("global frame allocator used before init_frame_allocator")
+                .deallocate_frame(frame)
+        })
     }
 }
 
@@ -176,9 +189,11 @@ pub unsafe fn deallocate_frame(frame: PhysFrame) {
 /// operations actually balances -- "no leak" is not observable any other
 /// way in a kernel with no process accounting.
 pub fn frame_stats() -> (usize, usize) {
-    let guard = FRAME_ALLOCATOR.lock();
-    let allocator = guard.as_ref().expect("frame allocator used before init_frame_allocator");
-    (allocator.in_use, allocator.free_count)
+    without_interrupts(|| {
+        let guard = FRAME_ALLOCATOR.lock();
+        let allocator = guard.as_ref().expect("frame allocator used before init_frame_allocator");
+        (allocator.in_use, allocator.free_count)
+    })
 }
 
 /// Build an `OffsetPageTable` over the page table the bootloader already
@@ -239,21 +254,48 @@ pub enum CowResolution {
 
 /// Make `addr`'s page writable again in the address space rooted at
 /// `pml4`, if -- and only if -- it is a copy-on-write page: the page-fault
-/// handler's answer to a write that hit one, and `copy_between_address_spaces`'
-/// before writing into one. `None` for anything else (not mapped, not
-/// COW, not in a private PML4 slot, or no frame left to copy into), which
-/// the fault handler treats as a genuine fault.
+/// handler's answer to a write that hit one. `None` for anything else
+/// (not mapped, not COW, not in a private PML4 slot, or no frame left to
+/// copy into), which the fault handler treats as a genuine fault.
 ///
 /// There is no C original: MINIX 3.1 has no paging, so no copy-on-write
 /// (its `fork` copies the parent's whole data+stack segment,
 /// `servers/pm/forkexit.c`'s `do_fork`). This is the standard design --
 /// shared frames mapped read-only, a reference count, a copy on the first
 /// write -- that makes `fork` cost page tables rather than pages.
-///
-/// Must not be called with `SHARERS` or the frame allocator's lock held;
-/// the fault handler can't be, since neither is held across anything that
-/// touches user memory.
 pub fn resolve_cow_fault(pml4: PhysFrame, addr: VirtAddr) -> Option<CowResolution> {
+    unshare(pml4, addr, false)
+}
+
+/// Give `pml4` a page at `addr` that nobody else maps, so the kernel can
+/// write it through the physical-memory window: a copy-on-write page is
+/// resolved exactly as a write fault would resolve it, and a page that
+/// is *read-only but shared* -- program text, which `fork` shares without
+/// marking it COW -- gets a private copy that keeps its read-only flags.
+/// Without the second case, `copy_between_address_spaces` into a forked
+/// child's text page would rewrite the code of its parent and every
+/// sibling at once. `Some(None)` means there was nothing to do: the page
+/// was already this address space's alone.
+pub fn unshare_for_kernel_write(pml4: PhysFrame, addr: VirtAddr) -> Option<Option<CowResolution>> {
+    // Kernel memory -- a shared PML4 slot -- is never shared by `fork`
+    // or marked COW, and may well be mapped with huge pages
+    // `translate_page` doesn't describe: nothing to do there.
+    if !pml4_slots_unused(kernel_pml4(), addr, addr) {
+        return Some(None);
+    }
+    let (frame, flags) = translate_page(pml4, addr)?;
+    if !flags.contains(COW) && extra_sharers(frame) == 0 {
+        return Some(None);
+    }
+    unshare(pml4, addr, true).map(Some)
+}
+
+/// The one implementation behind both of the above. Runs start to finish
+/// with interrupts off -- including the translation, so the frame it acts
+/// on is the frame that is mapped when it acts (a stale translation could
+/// copy old contents over a page the process had just made private, and
+/// drop a share it didn't hold).
+fn unshare(pml4: PhysFrame, addr: VirtAddr, shared_readonly_too: bool) -> Option<CowResolution> {
     let page = Page::<Size4KiB>::containing_address(addr);
     let start = page.start_address();
     // Only ever set on private pages (`share_pages_into`); checked anyway
@@ -262,25 +304,30 @@ pub fn resolve_cow_fault(pml4: PhysFrame, addr: VirtAddr) -> Option<CowResolutio
     if !pml4_slots_unused(kernel_pml4(), start, start + (PAGE_SIZE - 1)) {
         return None;
     }
-    let (frame, flags) = translate_page(pml4, start)?;
-    if !flags.contains(COW) {
-        return None;
-    }
-    let writable = (flags - COW) | PageTableFlags::WRITABLE;
-    // Safety: `pml4` is a live address space (the one that faulted, or
-    // the destination of a copy); single CPU, and nothing else edits its
-    // tables while this runs with interrupts off.
-    let mut table = unsafe { page_table_for(pml4) };
 
     let resolution = without_interrupts(|| {
+        let (frame, flags) = translate_page(pml4, start)?;
+        let is_cow = flags.contains(COW);
+        if !is_cow && !shared_readonly_too {
+            return None;
+        }
+        // A COW page comes back writable; a shared read-only one keeps
+        // exactly the permissions it had.
+        let new_flags = if is_cow { (flags - COW) | PageTableFlags::WRITABLE } else { flags };
+        // Safety: `pml4` is a live address space (the one that faulted,
+        // or the destination of a kernel copy); single CPU, and nothing
+        // else edits its tables while this runs with interrupts off.
+        let mut table = unsafe { page_table_for(pml4) };
+
         let mut sharers = SHARERS.lock();
         let key = frame.start_address().as_u64();
         match sharers.get_mut(&key) {
-            None => {
+            None if is_cow => {
                 // Safety: same page, same frame, only permissions change.
-                unsafe { table.update_flags(page, writable).ok()?.ignore() };
+                unsafe { table.update_flags(page, new_flags).ok()?.ignore() };
                 Some(CowResolution::Reclaimed)
             }
+            None => None, // not shared, not COW: nothing to do
             Some(n) => {
                 let fresh = GlobalFrameAllocator.allocate_frame()?;
                 let offset = physical_memory_offset();
@@ -300,7 +347,7 @@ pub fn resolve_cow_fault(pml4: PhysFrame, addr: VirtAddr) -> Option<CowResolutio
                 let remapped = unsafe {
                     table.unmap(page).map(|(_, f)| f.ignore()).is_ok()
                         && table
-                            .map_to(page, fresh, writable, &mut GlobalFrameAllocator)
+                            .map_to(page, fresh, new_flags, &mut GlobalFrameAllocator)
                             .map(|f| f.ignore())
                             .is_ok()
                 };
@@ -574,7 +621,17 @@ pub fn fork_address_space(
     let (child_pml4, mut child) = new_address_space_from(base_pml4, offset)?;
     let src_is_active = Cr3::read().0 == src_pml4;
 
-    match share_pages_into(&mut src, &mut child, base_pml4, map, src_is_active) {
+    // With interrupts off throughout. Forking the *caller* (every ring-3
+    // `SYS_FORK`) couldn't be interrupted in a harmful way anyway, but a
+    // kernel task forking some *other*, runnable process (`pm`'s
+    // `fork_demo`) could be preempted between marking a page COW and
+    // recording the share -- and if the source ran and wrote that page in
+    // between, it would find no sharer, reclaim the page as its own, and
+    // then share a writable frame with the child it was being forked
+    // into. Nothing here copies a page any more, so this is a short
+    // stretch: page-table frames only.
+    let shared = without_interrupts(|| share_pages_into(&mut src, &mut child, base_pml4, map, src_is_active));
+    match shared {
         Ok(()) => Some(child_pml4),
         Err(()) => {
             // Safety: built here, never loaded into `CR3`, referenced by
@@ -631,12 +688,27 @@ fn share_pages_into(
             flags
         };
 
+        // The page-table levels above the leaf get their permissions
+        // spelled out rather than derived: plain `map_to` copies them
+        // from the leaf's flags, so a table first created for a
+        // read-only (COW) page would itself be read-only -- and x86 ANDs
+        // permissions across every level. `resolve_cow_fault`'s
+        // `Reclaimed` path only makes the *leaf* writable, so a child
+        // that ended up sole owner of a page would take the same write
+        // fault again, find nothing COW about it, and be killed. That is
+        // exactly what the interactive shell's fifth command did before
+        // this was fixed. Here the leaf alone decides.
+        let table_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE;
         // Safety: `page` is unmapped in `child` (a fresh address space
         // whose only non-empty PML4 slots are `base_pml4`'s, which the
         // check above excluded); `frame` is deliberately mapped twice
         // now, which `share_frame` records. `.ignore()`: `child` isn't in
         // `CR3`, so nothing is cached to invalidate.
-        match unsafe { child.map_to(page, frame, shared_flags, &mut allocator) } {
+        match unsafe {
+            child.map_to_with_table_flags(page, frame, shared_flags, table_flags, &mut allocator)
+        } {
             Ok(flush) => flush.ignore(),
             Err(_) => return Err(()),
         }
@@ -721,9 +793,7 @@ unsafe fn free_table(table_frame: PhysFrame, level: u8) -> usize {
             // A leaf: one of the process's own pages -- or one it shares
             // since a fork, in which case this only drops a reference and
             // the frame stays with whoever else maps it.
-            let shared = extra_sharers(frame) > 0;
-            release_frame(frame);
-            if !shared {
+            if release_frame(frame) {
                 freed += 1;
             }
         }
@@ -774,35 +844,45 @@ pub fn copy_between_address_spaces(
     let offset = physical_memory_offset();
 
     let mut remaining = len;
-    let mut src = src_addr;
-    let mut dst = dst_addr;
+    let mut src = src_addr.as_u64();
+    let mut dst = dst_addr.as_u64();
     while remaining > 0 {
-        let src_phys = src_table.translate_addr(src).ok_or(CopyError::SrcNotMapped)?;
-        // This copy writes through the physical-memory window, not
-        // through `dst`'s own mapping, so a read-only copy-on-write page
-        // wouldn't stop it: it would write straight into a frame another
-        // process still shares. Break the sharing first, exactly as a
-        // write fault would have.
-        if let Some((_, flags)) = translate_page(dst_pml4, dst) {
-            if flags.contains(COW) {
-                resolve_cow_fault(dst_pml4, dst).ok_or(CopyError::DstNotMapped)?;
+        let chunk = remaining
+            .min(4096 - (src as usize % 4096))
+            .min(4096 - (dst as usize % 4096));
+        // Addresses are kept as plain integers between chunks and only
+        // turned into `VirtAddr`s here: the end of a copy that finishes
+        // exactly at the top of the lower half is one past it, which is
+        // non-canonical, and `VirtAddr` arithmetic panics on that --
+        // reachable from ring 3 through `SYS_EXEC`'s argument copy-in.
+        let src_va = VirtAddr::try_new(src).map_err(|_| CopyError::SrcNotMapped)?;
+        let dst_va = VirtAddr::try_new(dst).map_err(|_| CopyError::DstNotMapped)?;
+
+        // One chunk at a time with interrupts off: the destination must
+        // still be this address space's own page when the bytes land. The
+        // write goes through the physical-memory window, which no
+        // read-only mapping stops, so a page some other address space
+        // still shares -- copy-on-write, or read-only text `fork` shared
+        // outright -- has to be made private first, and nothing may
+        // re-share it (a `fork` of the destination) before the write.
+        without_interrupts(|| {
+            let src_phys = src_table.translate_addr(src_va).ok_or(CopyError::SrcNotMapped)?;
+            unshare_for_kernel_write(dst_pml4, dst_va).ok_or(CopyError::DstNotMapped)?;
+            let dst_phys = dst_table.translate_addr(dst_va).ok_or(CopyError::DstNotMapped)?;
+            // Safety: both translations are live mappings, reached
+            // through the physical-memory window; `chunk` stays inside
+            // one page on both sides.
+            unsafe {
+                let src_ptr: *const u8 = (offset + src_phys.as_u64()).as_ptr();
+                let dst_ptr: *mut u8 = (offset + dst_phys.as_u64()).as_mut_ptr();
+                core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, chunk);
             }
-        }
-        let dst_phys = dst_table.translate_addr(dst).ok_or(CopyError::DstNotMapped)?;
-
-        let src_room = 4096 - (src.as_u64() as usize % 4096);
-        let dst_room = 4096 - (dst.as_u64() as usize % 4096);
-        let chunk = remaining.min(src_room).min(dst_room);
-
-        unsafe {
-            let src_ptr: *const u8 = (offset + src_phys.as_u64()).as_ptr();
-            let dst_ptr: *mut u8 = (offset + dst_phys.as_u64()).as_mut_ptr();
-            core::ptr::copy_nonoverlapping(src_ptr, dst_ptr, chunk);
-        }
+            Ok(())
+        })?;
 
         remaining -= chunk;
-        src += chunk as u64;
-        dst += chunk as u64;
+        src = src.wrapping_add(chunk as u64);
+        dst = dst.wrapping_add(chunk as u64);
     }
     Ok(())
 }

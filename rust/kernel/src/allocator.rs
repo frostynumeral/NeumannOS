@@ -9,7 +9,9 @@
 //! natural to write against a heap than against more fixed-size static
 //! arrays.
 
+use core::alloc::GlobalAlloc;
 use linked_list_allocator::LockedHeap;
+use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::structures::paging::{
     mapper::MapToError, FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB,
 };
@@ -24,8 +26,28 @@ use crate::memory::GlobalFrameAllocator;
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 pub const HEAP_SIZE: usize = 1024 * 1024; // 1 MiB
 
+/// The heap's lock is a spin lock, and code that runs with interrupts
+/// already off -- the page-fault handler, and `crate::memory`'s
+/// copy-on-write bookkeeping, both of which allocate or free through a
+/// `BTreeMap` -- takes it too. If a task holding it with interrupts on
+/// were preempted, or a page fault arrived mid-allocation, that code
+/// would spin forever on a lock only the parked task can release. So
+/// every allocation happens with interrupts off, and nothing can hold
+/// the lock across a switch.
+struct InterruptSafeHeap(LockedHeap);
+
+unsafe impl core::alloc::GlobalAlloc for InterruptSafeHeap {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        without_interrupts(|| self.0.alloc(layout))
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        without_interrupts(|| self.0.dealloc(ptr, layout))
+    }
+}
+
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: InterruptSafeHeap = InterruptSafeHeap(LockedHeap::empty());
 
 /// Map `HEAP_SIZE` bytes at `HEAP_START` and hand that range to the global
 /// allocator. Must run once, after `crate::memory::init` and
@@ -50,7 +72,7 @@ pub fn init_heap(mapper: &mut impl Mapper<Size4KiB>) -> Result<(), MapToError<Si
     }
 
     unsafe {
-        ALLOCATOR.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
+        ALLOCATOR.0.lock().init(HEAP_START as *mut u8, HEAP_SIZE);
     }
     Ok(())
 }

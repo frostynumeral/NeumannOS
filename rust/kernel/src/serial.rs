@@ -23,10 +23,28 @@ pub fn init() {
     lazy_static::initialize(&SERIAL1);
 }
 
+/// Interrupts are off while the port's lock is held: it's a spin lock
+/// on one CPU, and both the keyboard IRQ handler and the page-fault
+/// handler print. Either one arriving while an interrupted task held the
+/// lock -- or a timer tick switching to another task that prints --
+/// would otherwise spin forever on a lock nothing can release.
 #[doc(hidden)]
 pub fn _print(args: core::fmt::Arguments) {
     use core::fmt::Write;
-    SERIAL1.lock().write_fmt(args).expect("serial write failed");
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        SERIAL1.lock().write_fmt(args).expect("serial write failed");
+    });
+}
+
+/// Raw bytes to COM1, no formatting and no line prefix: a ring-3
+/// program's standard output (`crate::syscall`'s `SYS_CONSOLE_WRITE`).
+pub fn write_bytes(bytes: &[u8]) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut port = SERIAL1.lock();
+        for &b in bytes {
+            port.send(b);
+        }
+    });
 }
 
 #[macro_export]
