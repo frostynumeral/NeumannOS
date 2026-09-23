@@ -94,10 +94,8 @@ fn main(_args: Args) -> i32 {
     }
     let verdict: &[u8] = if failed == 0 { b"ok" } else { b"FAIL" };
     if failed == 0 {
-        println!(
-            "ptrtest: all {} bad-pointer calls refused with the right error, and no other process's descriptor is usable",
-            cases.len()
-        );
+        // Short: it lands on the 24-column on-screen console too.
+        println!("ptrtest: ok ({} calls)", cases.len());
     }
     if let Ok(out) = sys::open(b"/ptrtest.out") {
         let _ = sys::write(out, verdict);

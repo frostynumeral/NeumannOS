@@ -30,8 +30,9 @@ real kernel call (`SYS_SET_ALARM`/`SYS_WAIT_ALARM`, wrapping the same
 where it left off in ring 3 once the alarm actually fires, not just
 one-shot calls that always return immediately — and, the first step
 toward the BeOS/Haiku-flavored desktop-OS direction noted below, real
-VGA graphics (a static, LCARS-style panel of flat-colored rounded-rectangle
-bars and buttons, no text, painted into a real linear framebuffer) and a
+VGA graphics (an LCARS-style panel of flat-colored rounded-rectangle
+bars and buttons painted into a real linear framebuffer, with a text
+console in its open area that the shell and its programs print to) and a
 real PS/2 keyboard driver (hardware IRQ1, scancodes read and translated to
 ASCII, asynchronously -- even waking the CPU from `IDLE`'s `hlt`), now
 connected to the panel: pressing a digit key highlights the matching
@@ -934,10 +935,10 @@ the lower half; and the syscall layer's pointer handling described in
 "known simplifications in the syscall ABI".
 
 Known gaps: file descriptors are owned by process number in one global
-table (see "known simplifications in `fs`"); output goes to COM1 only,
-interleaved with the kernel's own log (the on-screen console is the
-next milestone); no quoting, pipes, redirection, variables, job control
-or current directory in `sh`.
+table (see "known simplifications in `fs`"); on COM1, program output is
+interleaved with the kernel's own log (the on-screen console, below,
+shows only program output and what's typed); no quoting, pipes,
+redirection, variables, job control or current directory in `sh`.
 
 ### A real bug found and fixed by a multi-agent review
 
@@ -1322,6 +1323,33 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   is the reverse -- so "exec reached the right process" is checked, not
   assumed.
 
+### The on-screen text console
+
+`src/console.rs` and `src/font.rs`: a 24x18 grid of 8x8 character cells
+drawn in the panel's open area (right of the purple descender, below the
+orange sweep, left of the buttons), tan on black. `SYS_CONSOLE_WRITE`
+writes there as well as to COM1, and the keyboard echoes there, so the
+shell is usable by someone looking at the screen rather than the serial
+log. The usual terminal behaviors -- printable characters advance and
+wrap at the right edge, `\n` starts a line, backspace steps back and
+erases, running off the bottom scrolls -- redrawing only the cells a
+write changes, and the whole grid on a scroll or a panel repaint
+(`vga::draw_demo_panel` calls `console::redraw`). The font is
+`font8x8_basic` (Daniel Hepper, from Marcel Sondaar's and IBM's VGA
+fonts), public domain, converted to a Rust table covering printable
+ASCII; anything else draws as `?`. `console::self_test` checks
+backspace, wrapping and scrolling against the character grid at boot.
+Verified by QMP `screendump` after typing commands at the shell: the
+banner, `help`, an `ls` listing and each command as typed (a backspace
+correction included) all appear on screen. The shell's own messages and
+`help` text are written to fit the 24 columns; anything longer wraps.
+
+Known gaps: the console is small (mode 13h's 320x200 leaves room for 24
+columns once the panel has its share), has no cursor, no colors beyond
+one, no scrollback, and redraws with the CPU straight into the live
+framebuffer. The kernel's own log still goes to COM1 only, which is the
+point: the screen shows what programs print and what's typed.
+
 ### Known simplifications in the VGA graphics
 
 - **One fixed 256-color mode (320x200), not VBE/a linear high-resolution
@@ -1333,7 +1361,8 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   VBE/framebuffer feature of its own to build on for that -- see the
   long-term direction note above).
 - **A single, fixed, hardcoded layout.** `draw_demo_panel` always draws
-  the same bars/buttons at the same coordinates; there's no generic
+  the same bars/buttons at the same coordinates (and the console in the
+  same box -- see "The on-screen text console" above); there's no generic
   "layout a panel of N elements" API or windowing yet -- this is a
   static image with one piece of live state (`select_button`'s highlight),
   not a UI. Selection is keyboard-driven only (digit keys `1`-`4`, see
@@ -1407,11 +1436,16 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   `run ` goes to `rs` (`dispatch_run`) and is *not* handed to a reader,
   so the shell never sees it -- the one command the console still
   interprets itself.
-- **No echo, no editing, no Shift.** The shell prints each line back
-  after it's entered (`sh` does that itself); nothing echoes keystrokes
-  as they're typed, Backspace isn't handled, and with no modifier state
-  there are no capitals or shifted punctuation -- `_` can't be typed, so
-  neither can a path containing one.
+- **Echo and Backspace, and nothing more.** `on_char` echoes each key as
+  it's typed, to the screen (`crate::console`) and COM1, the way a
+  terminal's line discipline does (the per-key `[kbd] key: ...` log line
+  it replaced would have interleaved with the echo); Backspace (scancode
+  `0x0E`) deletes the last character of the line in progress and erases
+  it on both. No cursor movement within a line, no history, no Ctrl
+  keys, and with no modifier state no capitals or shifted punctuation --
+  `_` can't be typed, so neither can a path containing one. Digit keys
+  still also select a panel button (see `crate::vga`), which repaints
+  the whole panel, console included, on every digit typed.
 
 ### Known simplifications in `rs`/crash recovery
 
@@ -1641,7 +1675,7 @@ Roughly in the order the original kernel needs them:
     line discipline can now also dispatch a `"run <name>"` command to `rs`
     (see item 11 above), not just log/echo the line. See "known
     simplifications in the keyboard driver" above for what's still missing
-    (modifier-key state, extended scancodes, echo/editing, no notion of a
+    (modifier-key state, extended scancodes, line editing beyond Backspace, no notion of a
     foreground reader, and a real `tty` server this port's
     `console_task` stands in for by talking to `fs` directly).
 15. ~~**A real syscall ABI**~~ — done (`src/syscall.rs`). Replaced
@@ -1767,8 +1801,8 @@ so multiply logical panel coordinates by 2 before sampling a pixel from
 the dump. The keyboard driver can be exercised the same headless way:
 with the same `-qmp` socket from above, send
 `{"execute": "send-key", "arguments": {"keys": [{"type": "qcode", "data": "a"}]}}`
-after the capabilities handshake, and COM1 should print
-`[kbd] key: 'a' (scancode 0x1e)` -- this works even after `IDLE` has
+after the capabilities handshake, and the key is echoed -- an `a` on
+COM1 and in the on-screen console -- which works even after `IDLE` has
 logged that it's halting, since the keyboard IRQ wakes the CPU straight
 out of `hlt`. To see a digit key's effect on the panel, send a `qcode`
 of `"1"`-`"4"` instead and take a `screendump` afterward -- **wait a beat

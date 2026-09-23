@@ -195,13 +195,10 @@ extern "x86-interrupt" fn timer_interrupt_handler(_frame: InterruptStackFrame) {
     crate::proc::reschedule();
 }
 
-/// IRQ1 (keyboard): read the scancode the controller just latched, print
-/// its ASCII translation (if `crate::keyboard`'s table has one), and
-/// acknowledge. No task is woken here yet -- there's no real `tty`/line-
-/// discipline layer to hand this to (see `rust/README.md`'s roadmap) --
-/// so this is currently just proof the IRQ genuinely fires per keypress,
-/// asynchronously, the same way `timer_interrupt_handler` proves IRQ0
-/// does.
+/// IRQ1 (keyboard): read the scancode the controller just latched,
+/// acknowledge, and hand its ASCII translation (if `crate::keyboard`'s
+/// table has one) to the line discipline (`keyboard::on_char`), which
+/// echoes it and, on Enter, wakes `console_task`.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame) {
     let scancode = crate::keyboard::read_scancode();
     // Send EOI before `keyboard::on_char` (which can notify -- and so
@@ -212,7 +209,10 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_frame: InterruptStackFrame
     // ones in the meantime.
     pic::end_of_interrupt(1);
     if let Some(ascii) = crate::keyboard::translate(scancode) {
-        crate::serial_println!("[kbd] key: {:?} (scancode {:#04x})", ascii as char, scancode);
+        // No per-key log line any more: `keyboard::on_char` echoes the
+        // key itself (to the screen and COM1), and a log line per key
+        // would interleave with that echo.
+        let _ = scancode;
         // Digits '1'-'4' pick one of the VGA demo panel's buttons and
         // redraw it highlighted -- a direct function call, not a real
         // input event delivered to a process.

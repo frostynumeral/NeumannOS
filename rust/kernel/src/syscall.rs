@@ -542,6 +542,9 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                 return err;
             }
             crate::serial::write_bytes(bytes);
+            // And on screen: standard output is what a person at the
+            // machine reads, not just the serial log.
+            crate::console::write(bytes);
             arg2
         }
         SYS_FS_WRITE => {

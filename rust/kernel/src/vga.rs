@@ -1,7 +1,8 @@
 //! VGA mode 13h (320x200, 256-color) graphics: palette programming and a
 //! handful of flat-shaded drawing primitives, enough to paint a static,
-//! LCARS-flavored panel -- rectangular color blocks with rounded corners,
-//! no text/font rendering.
+//! LCARS-flavored panel -- rectangular color blocks with rounded corners
+//! -- with a text console (`crate::console`, `crate::font`) drawn in its
+//! open area.
 //!
 //! No MINIX C equivalent (2005-era MINIX has no graphics stack at all --
 //! see `rust/README.md`'s long-term-direction note on the BeOS/Haiku-
@@ -94,7 +95,7 @@ pub fn init_palette() {
     }
 }
 
-fn put_pixel(fb: *mut u8, x: usize, y: usize, color: u8) {
+pub fn put_pixel(fb: *mut u8, x: usize, y: usize, color: u8) {
     if x < WIDTH && y < HEIGHT {
         unsafe { fb.add(y * WIDTH + x).write_volatile(color) };
     }
@@ -178,8 +179,9 @@ pub fn fill_rounded_rect(
     }
 }
 
-/// Paint the demo panel this port's milestone calls for: flat-colored
-/// rectangular blocks with rounded-corner elements, no text. A stand-in
+/// Paint the demo panel: flat-colored rectangular blocks with
+/// rounded-corner elements, and the text console (`crate::console`) in
+/// the open area. A stand-in
 /// "LCARS" layout -- an orange sweep bar with a rounded left end, a
 /// purple descender bar below it with a rounded bottom end (together
 /// forming an L, the classic LCARS silhouette), and a column of smaller,
@@ -240,6 +242,10 @@ pub fn draw_demo_panel(fb: *mut u8) {
         }
         fill_rounded_rect(fb, BUTTON_X, y, BUTTON_W, BUTTON_H, BUTTON_RADIUS, Corners::ALL, color);
     }
+
+    // The text console lives in the open area; repainting the panel
+    // above cleared it, so put it back.
+    crate::console::redraw(fb);
 }
 
 pub const BUTTON_COUNT: usize = 4;

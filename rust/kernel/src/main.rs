@@ -25,7 +25,9 @@ extern crate alloc;
 mod allocator;
 mod calls;
 mod com;
+mod console;
 mod elf;
+mod font;
 mod fs;
 mod gdt;
 mod interrupts;
@@ -99,6 +101,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     );
     drop(boxed);
     drop(vec);
+    // The on-screen console needs `memory::init`'s physical-memory
+    // offset to reach the framebuffer, so its check runs here, not next
+    // to the panel painting above.
+    console::self_test();
 
     // Build the ring-3 demo task's own address space and map its
     // code/stack pages into it now; the task itself (spawned below) does

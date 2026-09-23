@@ -57,6 +57,7 @@ const SCANCODE_TO_ASCII: [u8; 0x3A] = {
     table[0x1A] = b'[';
     table[0x1B] = b']';
     table[0x1C] = b'\n';
+    table[0x0E] = 0x08; // Backspace
     table[0x1E] = b'a';
     table[0x1F] = b's';
     table[0x20] = b'd';
@@ -163,28 +164,65 @@ static LINE: spin::Mutex<LineBuffer> = spin::Mutex::new(LineBuffer {
 /// higher-priority task); anything else is appended to the line in
 /// progress.
 pub fn on_char(ascii: u8) {
-    if ascii == b'\n' {
-        {
+    // Echo, the way a terminal's line discipline does: what's typed
+    // appears as it's typed, on the screen (`crate::console`) and on COM1,
+    // rather than only once a program prints the finished line back.
+    if ascii == 0x08 {
+        let erased = {
             let mut line = LINE.lock();
-            if line.count < COMPLETED_LINES {
+            let had = line.len > 0;
+            line.len = line.len.saturating_sub(1);
+            had
+        };
+        if erased {
+            crate::console::write(&[0x08]);
+            crate::serial::write_bytes(b"\x08 \x08");
+        }
+        return;
+    }
+    // Echoed only once accepted: echoing a character past
+    // `LINE_CAPACITY` (or a line with nowhere to go) would show the user
+    // something the reader will never get, and a later Backspace would
+    // then erase the wrong thing.
+    if ascii == b'\n' {
+        let queued = {
+            let mut line = LINE.lock();
+            let queued = line.count < COMPLETED_LINES;
+            if queued {
                 let slot = (line.head + line.count) % COMPLETED_LINES;
                 let len = line.len;
                 let cur = line.cur;
                 line.done[slot] = cur;
                 line.done_len[slot] = len;
                 line.count += 1;
+                line.len = 0;
             }
-            line.len = 0;
+            queued
+        };
+        if queued {
+            echo(b'\n');
+            crate::ipc::notify(crate::com::CONSOLE_PROC_NR, LINE_READY);
         }
-        crate::ipc::notify(crate::com::CONSOLE_PROC_NR, LINE_READY);
         return;
     }
-    let mut line = LINE.lock();
-    if line.len < LINE_CAPACITY {
-        let len = line.len;
-        line.cur[len] = ascii;
-        line.len += 1;
+    let stored = {
+        let mut line = LINE.lock();
+        let stored = line.len < LINE_CAPACITY;
+        if stored {
+            let len = line.len;
+            line.cur[len] = ascii;
+            line.len += 1;
+        }
+        stored
+    };
+    if stored {
+        echo(ascii);
     }
+}
+
+fn echo(byte: u8) {
+    crate::console::write(&[byte]);
+    crate::serial::write_bytes(&[byte]);
 }
 
 /// Notification type `on_char` sends `console_task`. Distinct from the

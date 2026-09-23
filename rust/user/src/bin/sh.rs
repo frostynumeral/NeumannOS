@@ -33,16 +33,15 @@ fn main(args: Args) -> i32 {
         *slot = var.as_ptr();
     }
 
-    println!("NeumannOS sh -- type `help` for help");
+    // Two short lines: the on-screen console is 24 columns wide.
+    println!("NeumannOS sh");
+    println!("type `help` for help");
     let mut line = [0u8; sys::MAX_IO];
     loop {
         print!("$ ");
+        // No echo here: the kernel's line discipline echoes each key as
+        // it's typed (`crate::keyboard::on_char`), Enter included.
         let n = sys::read_line(&mut line);
-        // Echo what was typed: the keyboard driver has no echo of its own
-        // (the console only sees the finished line), so without this a
-        // transcript would show prompts and output with the commands
-        // themselves missing.
-        println!("{}", Bytes(&line[..n]));
         if let Some(status) = run_line(&line[..n], &envp) {
             return status;
         }
@@ -86,12 +85,14 @@ fn run_line(line: &[u8], envp: &[*const u8]) -> Option<i32> {
             return Some(status);
         }
         b"help" => {
-            println!("Commands are programs in /bin, run with the words that follow as their arguments:");
-            println!("  echo WORDS...   print the words");
-            println!("  cat FILE...     print files");
-            println!("  ls [DIR...]     list directories (default /)");
-            println!("  mkdir DIR...    create directories");
-            println!("Built in: exit [STATUS], help. Try: ls /bin, cat /console.log");
+            // Kept to the on-screen console's 24 columns.
+            println!("programs in /bin:");
+            println!(" echo WORDS...");
+            println!(" cat FILE...");
+            println!(" ls [DIR...]");
+            println!(" mkdir DIR...");
+            println!("built in: exit, help");
+            println!("try: ls /bin");
             return None;
         }
         _ => {}
