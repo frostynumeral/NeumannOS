@@ -357,7 +357,7 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   CPU didn't already save, calls `dispatch` with the caller's original
   `rax`/`rdi`/`rsi`/`rdx`/`rcx`, writes the `u64` result back into the
   saved `rax` slot, restores everything else unchanged, and `iretq`s.
-  `dispatch` implements twenty-seven calls (the newest -- `SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`, `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR`, the thread and semaphore calls 20-26, and `SYS_BRK` (27) -- are described under "Ring-3 programs in Rust" and "Threads, teams and semaphores" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  `dispatch` implements thirty-eight calls (the newest -- `SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`, `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR`, the thread and semaphore calls 20-26, `SYS_BRK` (27), and Haiku's port API (28-38) -- are described under "Ring-3 programs in Rust" and "Threads, teams and semaphores" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
@@ -1009,9 +1009,9 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Twenty-seven calls exist** (`SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`,
+- **Thirty-eight calls exist** (`SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`,
   `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR`, and the thread and
-  semaphore calls `SYS_THREAD_SPAWN`..`SYS_SEM_RELEASE` and `SYS_BRK` are the newest --
+  semaphore calls `SYS_THREAD_SPAWN`..`SYS_SEM_RELEASE`, `SYS_BRK`, and Haiku's port API `SYS_CREATE_PORT`..`SYS_SYSTEM_TIME` are the newest --
   see the `rust/user/` and threads sections above), and all but the unrecognized-call-number
   fallback reach real server/kernel-call logic, including `SYS_FORK`
   from any ring-3 caller now (see the `src/syscall.rs`/`src/proc.rs`
@@ -1057,7 +1057,7 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   `SYS_WRITE_LINE`, or write it through `SYS_FS_READ`; `SYS_VIRCOPY`
   could name a kernel task as its source (reading kernel memory) or the
   heap as its destination. `/bin/ptrtest` (run at boot by
-  `crate::main`'s `ptr_safety_check`) holds twenty-one such calls to
+  `crate::main`'s `ptr_safety_check`) holds twenty-four such calls to
   refusing. What's still coarse: the copies go through one bounded
   kernel-stack buffer per call (256 bytes), and a write checked before a
   call blocks could in principle find the page gone afterwards (nothing
@@ -1323,6 +1323,74 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   in the child and unmapped in the parent, and `shell`'s own marker page
   is the reverse -- so "exec reached the right process" is checked, not
   assumed.
+
+### Haiku's ports -- and the Haiku API as the target
+
+The direction for this port is Haiku (the open-source continuation of
+BeOS), and *API-compatible* with it: kernel-kit interfaces follow
+Haiku's `headers/os/kernel/OS.h` and `headers/os/support/Errors.h` --
+the same names, semantics and numeric values (both headers are MIT
+licensed) -- so code written against Haiku's C API maps onto them
+one-to-one. Ports are the first piece built that way.
+
+A port (`proc::port_*`, syscalls 28-38) is a named, system-wide queue
+of up to `capacity` messages, each an `int32` code plus bytes -- the
+primitive Haiku's `BMessage`/`BLooper` messaging is built on.
+`create_port`, `find_port`, `write_port[_etc]`, `read_port[_etc]`,
+`port_buffer_size[_etc]`, `port_count`, `close_port`, `delete_port`,
+`set_port_owner`, `get_port_info` and `system_time` behave as Haiku's
+do: a write blocks while the port is full and a read while it's empty,
+the `_etc` forms take `B_RELATIVE_TIMEOUT`/`B_ABSOLUTE_TIMEOUT`
+(microseconds, against `system_time`; a relative timeout of zero means
+`B_WOULD_BLOCK` instead of waiting, an expired one `B_TIMED_OUT`), a
+read copies what fits and drops the rest, `close_port` refuses writes
+but lets readers drain before `B_BAD_PORT_ID`, `delete_port` wakes every
+waiter with `B_BAD_PORT_ID`, and a team's ports are deleted when it
+dies. Status codes are Haiku's own (`proc::haiku`, `B_GENERAL_ERROR_BASE`
+= `INT_MIN`), including `B_BAD_ADDRESS` for a pointer the caller doesn't
+own; `port_info` has Haiku's layout. Blocking reuses the scheduler's own
+state (`rts::PORT_WAIT`, a deadline `clock_tick` checks), and a waiter
+decides to wait under the same lock hold that saw it had to. Port ids
+carry a per-slot generation, so a stale id can't reach a slot's next
+port. `write_port_etc`/`read_port_etc` are the first six-argument system
+calls: `flags` and `timeout` come from the caller's `r8`/`r9` in the
+saved trap frame.
+
+`neumann_rt::os` is the ring-3 side, with Haiku's types (`port_id`,
+`status_t`, `ssize_t`, `bigtime_t`, `port_info`) and constants; slices
+stand in for C's pointer-plus-length. `/bin/porttest` checks
+create/find, FIFO order, counts, sizes and info, truncating reads, both
+timeouts on a full and an empty port, a producer and consumer thread
+blocking on a two-deep port, a message from a forked process, close,
+delete waking a blocked reader, and a dead team's port being gone;
+`crate::main`'s `port_check` requires its `ok`, and `ptrtest` requires
+`B_BAD_ADDRESS` from three port calls handed bad pointers.
+
+A review of it found, and this fixes: Haiku's `B_INFINITE_TIMEOUT`
+(`i64::MAX`, the usual "wait forever" even with a timeout flag)
+overflowed the tick arithmetic and panicked the kernel -- it now means
+no deadline, and the arithmetic saturates; a writer's pending message
+lived on its kernel stack, which is never unwound if its team ends while
+it waits, so each such write leaked up to 4 KiB of the 1 MiB kernel heap
+-- it lives in the process table now (`Proc::port_pending`), freed with
+the slot; `set_port_owner` accepted a team that had already ended (whose
+ports would then never be deleted); a zero-timeout write to a closed,
+full port said `B_WOULD_BLOCK` rather than `B_BAD_PORT_ID`; and the
+global byte bound failed writes outright where Haiku's writers wait for
+room (a read now wakes every port waiter to look again). `porttest`
+checks both infinite timeouts, and two of its checks were tightened so
+they can't pass without the behavior they name.
+
+Deliberate differences from Haiku: messages are limited to 4 KiB (Haiku:
+256 KiB) and all queues together to 256 KiB (`PORT_QUEUE_BYTES`, which a
+write waits under, as for a full port), and there are 64 ports -- all
+because the kernel heap is 1 MiB. `read_port_etc` checks the whole
+buffer it's given is writable before waiting, where Haiku only touches
+as much as the message fills. `B_CAN_INTERRUPT` and the
+`_get_next_port_info`/`get_port_message_info_etc` extras aren't there
+yet. The threads and semaphores that predate this still use this port's
+own names and error codes; bringing them to `spawn_thread`/`create_sem`
+with Haiku's signatures is the obvious next step.
 
 ### The user heap: `SYS_BRK` and a global allocator
 
@@ -1813,7 +1881,7 @@ Roughly in the order the original kernel needs them:
     gate saves every general-purpose register, reads the caller's `rax`
     (call number) and `rdi`/`rsi`/`rdx`/`rcx` (up to four arguments, since
     grown from three -- see the `src/syscall.rs` bullet above),
-    dispatches to one of twenty-seven calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    dispatches to one of thirty-eight calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
     -- a real cross-ring pointer argument, read directly since entering a
     trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
     the first of `crate::calls`' own kernel calls reachable from ring 3,
@@ -1860,7 +1928,7 @@ Roughly in the order the original kernel needs them:
     child's canary write (proving its memory is a real, independent copy)
     and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
     `IDLE`. See "known simplifications in the syscall ABI" above for what's
-    not a real syscall surface yet (twenty-seven calls, one code per *kind* of
+    not a real syscall surface yet (thirty-eight calls, one code per *kind* of
     dispatch-level mistake rather than a real per-cause `errno` set).
     `SYS_FORK` is no longer restricted to one known caller with one
     reserved child slot: the pages to copy come out of the caller's own

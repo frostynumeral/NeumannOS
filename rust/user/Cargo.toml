@@ -63,3 +63,8 @@ bench = false
 name = "heaptest"
 test = false
 bench = false
+
+[[bin]]
+name = "porttest"
+test = false
+bench = false

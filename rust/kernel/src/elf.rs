@@ -47,7 +47,7 @@ pub static ECHO_ELF: &[u8] = include_bytes!("../user/echo.elf");
 /// here by its `install.sh`), and where `crate::main`'s `seed_bin`
 /// installs each one in `fs`. Unlike the assembly programs above, these
 /// are meant to be *used*: `sh` runs the others by path, out of `/bin`.
-pub static RUST_PROGRAMS: [(&str, &[u8]); 8] = [
+pub static RUST_PROGRAMS: [(&str, &[u8]); 9] = [
     ("/bin/sh", include_bytes!("../user/bin/sh")),
     ("/bin/echo", include_bytes!("../user/bin/echo")),
     ("/bin/cat", include_bytes!("../user/bin/cat")),
@@ -56,6 +56,7 @@ pub static RUST_PROGRAMS: [(&str, &[u8]); 8] = [
     ("/bin/mkdir", include_bytes!("../user/bin/mkdir")),
     ("/bin/threads", include_bytes!("../user/bin/threads")),
     ("/bin/heaptest", include_bytes!("../user/bin/heaptest")),
+    ("/bin/porttest", include_bytes!("../user/bin/porttest")),
 ];
 
 /// `sh` itself, which also starts at boot (`com::SH_PROC_NR`), the way

@@ -30,6 +30,7 @@ extern crate alloc;
 use core::fmt;
 
 pub mod heap;
+pub mod os;
 pub mod sys;
 pub mod thread;
 

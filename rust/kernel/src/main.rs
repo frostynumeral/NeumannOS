@@ -538,6 +538,7 @@ fn idle_task() -> ! {
     ptr_safety_check();
     threads_check();
     heap_check();
+    port_check();
     proc_slot_pool_check();
     wait_without_children_check();
     runtime_reclaim_check();
@@ -1133,7 +1134,7 @@ fn fs_dir_check() {
 }
 
 /// Runs `/bin/ptrtest` (`rust/user/src/bin/ptrtest.rs`) and requires its
-/// verdict to be `ok`: twenty-one system calls given deliberately bad
+/// verdict to be `ok`: twenty-four system calls given deliberately bad
 /// pointers -- the kernel heap (mapped in every address space), unmapped
 /// memory, the program's own read-only text as a write target -- each of
 /// which must come back as an error code. Before `crate::syscall` copied
@@ -1153,7 +1154,7 @@ fn ptr_safety_check() {
     let n = read_when_available("/ptrtest.out", &mut buf);
     let verdict = &buf[..n.max(0) as usize];
     serial_println!(
-        "[idle] /bin/ptrtest verdict: {:?} (21 syscalls handed bad pointers, process numbers or breaks, each must be refused)",
+        "[idle] /bin/ptrtest verdict: {:?} (24 syscalls handed bad pointers, process numbers or breaks, each must be refused)",
         core::str::from_utf8(verdict).unwrap_or("<invalid utf8>")
     );
     assert_eq!(verdict, b"ok", "a system call accepted a bad pointer -- see ptrtest's FAIL lines above");
@@ -1220,6 +1221,32 @@ fn heap_check() {
     let after = memory::frame_stats().0;
     serial_println!("[idle] heaptest's heap went back with it ({} frames in use before, {} after)", before, after);
     assert!(after <= before, "heaptest leaked {} frames", after - before);
+}
+
+/// Runs `/bin/porttest` (`rust/user/src/bin/porttest.rs`) and requires its
+/// verdict to be `ok`: Haiku's port API with Haiku's semantics and status
+/// codes -- create/find by name, FIFO order, counts, sizes and
+/// `port_info`, truncating reads, `B_WOULD_BLOCK`/`B_TIMED_OUT` on a full
+/// or empty port, a producer and consumer thread both blocking on a
+/// 2-deep port, a message from a forked process, close (drain then
+/// `B_BAD_PORT_ID`), delete waking a blocked reader, and a dead team's
+/// port deleted with it.
+fn port_check() {
+    let proc_nr = proc::alloc_proc_nr().expect("no free process slot for porttest");
+    elf::spawn_from_fs("/bin/porttest", proc_nr, "porttest", 6, 16).expect("couldn't start /bin/porttest");
+    let mut buf = [0u8; 8];
+    let n = read_when_available("/porttest.out", &mut buf);
+    let verdict = &buf[..n.max(0) as usize];
+    serial_println!(
+        "[idle] /bin/porttest verdict: {:?} (Haiku's port API: queues, timeouts, threads, processes, close/delete)",
+        core::str::from_utf8(verdict).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(verdict, b"ok", "the port test failed -- see its output above");
+    let deadline = proc::uptime_ticks() + 120;
+    while proc::is_valid_proc_nr(proc_nr) {
+        assert!(proc::uptime_ticks() < deadline, "porttest never finished exiting");
+        proc::yield_now();
+    }
 }
 
 /// Exercises the two ends of the dynamic process-number pool

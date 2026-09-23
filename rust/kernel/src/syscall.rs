@@ -152,6 +152,37 @@ pub const SYS_SEM_RELEASE: u64 = 26;
 /// Move the program break to `rdi` (`0`: just report it); returns the
 /// break afterwards. What a heap allocator grows its heap with.
 pub const SYS_BRK: u64 = 27;
+/// Haiku's port API (`OS.h`), one call each. These return Haiku status
+/// codes (`proc::haiku`), not the `ERR_*` values above; a pointer the
+/// caller doesn't own is Haiku's `B_BAD_ADDRESS`. Names are passed as
+/// pointer and length.
+///
+/// `create_port(capacity rdi, name rsi/rdx)` -> port id.
+pub const SYS_CREATE_PORT: u64 = 28;
+/// `find_port(name rdi/rsi)` -> port id or `B_NAME_NOT_FOUND`.
+pub const SYS_FIND_PORT: u64 = 29;
+/// `write_port_etc(port rdi, code rsi, buffer rdx, size rcx, flags r8,
+/// timeout r9)` -- the first call needing more than four arguments; the
+/// last two are read from the caller's saved `r8`/`r9` in the trap frame.
+pub const SYS_WRITE_PORT_ETC: u64 = 30;
+/// `read_port_etc(port rdi, code* rsi, buffer rdx, size rcx, flags r8,
+/// timeout r9)` -> bytes copied (the message is consumed either way).
+pub const SYS_READ_PORT_ETC: u64 = 31;
+/// `port_buffer_size_etc(port rdi, flags rsi, timeout rdx)`.
+pub const SYS_PORT_BUFFER_SIZE_ETC: u64 = 32;
+/// `port_count(port rdi)`.
+pub const SYS_PORT_COUNT: u64 = 33;
+/// `close_port(port rdi)`.
+pub const SYS_CLOSE_PORT: u64 = 34;
+/// `delete_port(port rdi)`.
+pub const SYS_DELETE_PORT: u64 = 35;
+/// `get_port_info(port rdi, info* rsi)`; `set_port_owner` is
+/// `SYS_SET_PORT_OWNER`.
+pub const SYS_GET_PORT_INFO: u64 = 36;
+/// `set_port_owner(port rdi, team rsi)`.
+pub const SYS_SET_PORT_OWNER: u64 = 37;
+/// `system_time()`: microseconds since boot.
+pub const SYS_SYSTEM_TIME: u64 = 38;
 
 /// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
 /// a sanity bound on an untrusted `len` from ring 3 -- matches the size
@@ -297,6 +328,12 @@ fn copy_from_caller(caller: i32, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
         buf.len(),
     )
     .map_err(|_| ERR_BAD_ARG_PTR)
+}
+
+/// A Haiku `status_t` (an `int32`) as `rax` carries it: sign-extended,
+/// so ring 3 reads the same negative value back.
+fn haiku_status(status: i32) -> u64 {
+    status as i64 as u64
 }
 
 /// Check that `caller` may have `len` bytes at `addr` written on its
@@ -584,6 +621,81 @@ fn dispatch_call(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, fram
                 Err(proc::JoinError::NotAThread) => ERR_NOT_A_THREAD,
             }
         }
+        SYS_CREATE_PORT | SYS_FIND_PORT => {
+            let (name_ptr, name_len) = if call_num == SYS_CREATE_PORT { (arg2, arg3) } else { (arg1, arg2) };
+            let mut name = [0u8; MAX_FS_BUF];
+            let len = (name_len as usize).min(MAX_FS_BUF);
+            if copy_from_caller(caller, name_ptr, &mut name[..len]).is_err() {
+                return haiku_status(proc::haiku::B_BAD_ADDRESS);
+            }
+            let id = if call_num == SYS_CREATE_PORT {
+                proc::port_create(arg1 as i32, &name[..len])
+            } else {
+                proc::port_find(&name[..len])
+            };
+            haiku_status(id)
+        }
+        SYS_WRITE_PORT_ETC => {
+            // Safety: see `SYS_FORK`'s use of `frame_ptr` below.
+            let frame = unsafe { *(frame_ptr as *const proc::TrapFrame) };
+            let size = arg4 as usize;
+            if size > proc::PORT_MAX_MESSAGE {
+                return haiku_status(proc::haiku::B_BAD_VALUE);
+            }
+            // Copied into the kernel heap before anything blocks: the
+            // message outlives this call, and the caller's memory isn't
+            // reachable from whoever reads it.
+            let mut data = alloc::vec![0u8; size];
+            if copy_from_caller(caller, arg3, &mut data).is_err() {
+                return haiku_status(proc::haiku::B_BAD_ADDRESS);
+            }
+            haiku_status(proc::port_write(arg1 as i32, arg2 as i32, data, frame.r8 as u32, frame.r9 as i64))
+        }
+        SYS_READ_PORT_ETC => {
+            // Safety: see `SYS_FORK`'s use of `frame_ptr` below.
+            let frame = unsafe { *(frame_ptr as *const proc::TrapFrame) };
+            let size = arg4 as usize;
+            // Checked before taking a message, so a bad buffer doesn't
+            // cost the port one.
+            if check_writable(caller, arg2, 4).is_err() || check_writable(caller, arg3, size).is_err() {
+                return haiku_status(proc::haiku::B_BAD_ADDRESS);
+            }
+            match proc::port_read(arg1 as i32, frame.r8 as u32, frame.r9 as i64) {
+                Ok((code, data)) => {
+                    // Haiku copies what fits and reports that much; the
+                    // rest of an oversized message is dropped.
+                    let n = data.len().min(size);
+                    let _ = copy_to_caller(caller, arg2, &code.to_le_bytes());
+                    if copy_to_caller(caller, arg3, &data[..n]).is_err() {
+                        return haiku_status(proc::haiku::B_BAD_ADDRESS);
+                    }
+                    n as u64
+                }
+                Err(status) => haiku_status(status),
+            }
+        }
+        SYS_PORT_BUFFER_SIZE_ETC => haiku_status(proc::port_buffer_size(arg1 as i32, arg2 as u32, arg3 as i64)),
+        SYS_PORT_COUNT => haiku_status(proc::port_count(arg1 as i32)),
+        SYS_CLOSE_PORT => haiku_status(proc::port_close(arg1 as i32)),
+        SYS_DELETE_PORT => haiku_status(proc::port_delete(arg1 as i32)),
+        SYS_SET_PORT_OWNER => haiku_status(proc::port_set_owner(arg1 as i32, arg2 as i32)),
+        SYS_GET_PORT_INFO => match proc::port_info(arg1 as i32) {
+            Ok(info) => {
+                // Safety: `PortInfo` is `repr(C)` plain data.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &info as *const proc::PortInfo as *const u8,
+                        core::mem::size_of::<proc::PortInfo>(),
+                    )
+                };
+                match copy_to_caller(caller, arg2, bytes) {
+                    Ok(()) => 0,
+                    Err(_) => haiku_status(proc::haiku::B_BAD_ADDRESS),
+                }
+            }
+            Err(status) => haiku_status(status),
+        },
+        SYS_SYSTEM_TIME => proc::system_time_us() as u64,
         SYS_BRK => match proc::brk(arg1) {
             Ok(end) => end,
             Err(()) => ERR_BRK_FAILED,

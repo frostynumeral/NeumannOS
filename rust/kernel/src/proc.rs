@@ -114,6 +114,10 @@ pub mod rts {
     /// identity) until the last of them is gone, when it terminates for
     /// real and its parent (and `RS`) hear about it.
     pub const DRAINING: u16 = 0x400;
+    /// Blocked in a port operation (`crate::proc::port_*`) until the port
+    /// changes -- a message arrives or leaves, or it's closed or deleted --
+    /// or `Proc::wait_deadline` passes.
+    pub const PORT_WAIT: u16 = 0x800;
 }
 
 /// Everything a process's own address space consists of: the top-level
@@ -242,6 +246,18 @@ pub struct Proc {
     /// The team's program break -- the end of its heap (`brk`). Only the
     /// leader's is meaningful; the heap is the team's.
     brk: u64,
+    /// With `rts::PORT_WAIT`: the port slot waited on.
+    port_wait: Option<usize>,
+    /// The tick at which a timed wait gives up (`clock_tick` wakes it and
+    /// sets `timed_out`).
+    wait_deadline: Option<u64>,
+    timed_out: bool,
+    /// A `write_port` message waiting for room, held here rather than on
+    /// the writer's kernel stack: if the team ends while it waits, the
+    /// slot is freed without that stack ever unwinding, and a message
+    /// left there would leak its kernel-heap buffer for good. Freeing the
+    /// slot drops this.
+    port_pending: Option<(i32, Vec<u8>)>,
 }
 
 /// Where every program's heap starts (`brk`): PML4 slot 112, clear of the
@@ -291,6 +307,10 @@ impl Proc {
             sem_wait: None,
             sem_granted: None,
             brk: HEAP_BASE,
+            port_wait: None,
+            wait_deadline: None,
+            timed_out: false,
+            port_pending: None,
         }
     }
 
@@ -351,6 +371,12 @@ struct Scheduler {
     generations: [u32; NR_PROCS],
     /// The semaphore table (`sem_create` and friends).
     sems: [Sem; NR_SEMS],
+    /// The port table (`port_create` and friends), and each slot's
+    /// generation, so a stale `port_id` can't reach a slot's next port.
+    ports: Vec<Option<Port>>,
+    port_generations: [u32; NR_PORTS],
+    /// Bytes queued in every port together (`PORT_QUEUE_BYTES` bounds it).
+    port_bytes: usize,
     /// Next `sem_wait` ticket: waiters are served in arrival order.
     sem_seq: u64,
 }
@@ -723,6 +749,12 @@ impl Scheduler {
                 self.delete_sem(id);
             }
         }
+        // Ports too, as Haiku deletes a team's ports when it dies.
+        for slot in 0..NR_PORTS {
+            if self.ports[slot].as_ref().is_some_and(|p| p.owner_team == team) {
+                self.delete_port_slot(slot);
+            }
+        }
         if self.is_member(leader, team) && self.procs[leader].doomed.is_none() {
             if self.must_linger(leader) {
                 self.procs[leader].doomed = Some((status, crashed));
@@ -731,6 +763,53 @@ impl Scheduler {
             }
         }
         freed
+    }
+
+    /// End `idx`'s port wait, making it runnable if nothing else holds it.
+    fn stop_port_wait(&mut self, idx: usize) {
+        self.procs[idx].port_wait = None;
+        self.procs[idx].wait_deadline = None;
+        self.procs[idx].rts_flags &= !rts::PORT_WAIT;
+        if self.procs[idx].rts_flags == 0 {
+            self.enqueue(idx);
+        }
+    }
+
+    /// Wake everyone waiting on port `slot` to look again: something
+    /// about it changed.
+    fn wake_port_waiters(&mut self, slot: usize) {
+        for i in 0..NR_PROCS {
+            if self.procs[i].port_wait == Some(slot) {
+                self.stop_port_wait(i);
+            }
+        }
+    }
+
+    /// The live port slot a `port_id` names, if it names one.
+    fn port_slot(&self, id: i32) -> Option<usize> {
+        if id < 0 {
+            return None;
+        }
+        let slot = (id as usize) % NR_PORTS;
+        let generation = (id as u32) / NR_PORTS as u32;
+        (self.ports[slot].is_some() && self.port_generations[slot] == generation).then_some(slot)
+    }
+
+    fn delete_port_slot(&mut self, slot: usize) {
+        if let Some(port) = self.ports[slot].take() {
+            self.port_bytes -= port.queue.iter().map(|(_, data)| data.len()).sum::<usize>();
+        }
+        // Everyone: this slot's waiters to find it gone, and writers on
+        // other ports waiting for the bytes it just released.
+        self.wake_all_port_waiters();
+    }
+
+    fn wake_all_port_waiters(&mut self) {
+        for i in 0..NR_PROCS {
+            if self.procs[i].rts_flags & rts::PORT_WAIT != 0 {
+                self.stop_port_wait(i);
+            }
+        }
     }
 
     fn delete_sem(&mut self, id: usize) {
@@ -784,6 +863,9 @@ lazy_static::lazy_static! {
         kernel_cr3: Cr3::read(),
         generations: [0; NR_PROCS],
         sems: [Sem::FREE; NR_SEMS],
+        ports: (0..NR_PORTS).map(|_| None).collect(),
+        port_generations: [0; NR_PORTS],
+        port_bytes: 0,
         sem_seq: 0,
     });
 }
@@ -876,6 +958,10 @@ pub fn spawn(
             sem_wait: None,
             sem_granted: None,
             brk,
+            port_wait: None,
+            wait_deadline: None,
+            timed_out: false,
+            port_pending: None,
         };
         sched.enqueue(idx);
     });
@@ -1155,6 +1241,10 @@ fn install_trapped(
             sem_wait: None,
             sem_granted: None,
             brk,
+            port_wait: None,
+            wait_deadline: None,
+            timed_out: false,
+            port_pending: None,
         };
         sched.enqueue(idx);
     });
@@ -1852,6 +1942,396 @@ pub fn sem_delete(id: usize) -> Result<(), BadSem> {
     })
 }
 
+// ---------------------------------------------------------------------
+// Ports: Haiku's message queues (`create_port`/`write_port`/`read_port`
+// and the rest of the kernel kit's port API, `headers/os/kernel/OS.h`),
+// with Haiku's semantics and error values. A port is a named, bounded
+// queue of `(int32 code, bytes)` messages any team can write to and
+// read from; `BMessage`/`BLooper` messaging is built on them in Haiku.
+// ---------------------------------------------------------------------
+
+/// How many ports exist system-wide (Haiku's default is 4096; the
+/// kernel heap here is 1 MiB).
+pub const NR_PORTS: usize = 64;
+/// Longest message a port takes. Haiku allows 256 KiB
+/// (`PORT_MAX_MESSAGE_SIZE`); this port's kernel heap is 1 MiB, so less.
+pub const PORT_MAX_MESSAGE: usize = 4096;
+/// Most messages one port may queue (Haiku's `PORT_MAX_QUEUE`).
+pub const PORT_MAX_CAPACITY: i32 = 4096;
+/// Bytes all ports together may hold queued, so writers can't exhaust
+/// the kernel heap: a write that would exceed it waits for room, as one
+/// on a full port does.
+pub const PORT_QUEUE_BYTES: usize = 256 * 1024;
+/// Haiku's `B_OS_NAME_LENGTH`: a port's name, NUL included.
+pub const B_OS_NAME_LENGTH: usize = 32;
+
+/// Haiku's status codes, exactly as `headers/os/support/Errors.h`
+/// defines them (`B_GENERAL_ERROR_BASE` is `INT_MIN`).
+pub mod haiku {
+    pub const B_OK: i32 = 0;
+    const GENERAL: i32 = i32::MIN;
+    const OS: i32 = GENERAL + 0x1000;
+    pub const B_NO_MEMORY: i32 = GENERAL;
+    pub const B_BAD_VALUE: i32 = GENERAL + 5;
+    pub const B_NAME_NOT_FOUND: i32 = GENERAL + 7;
+    pub const B_TIMED_OUT: i32 = GENERAL + 9;
+    pub const B_WOULD_BLOCK: i32 = GENERAL + 11;
+    pub const B_BAD_TEAM_ID: i32 = OS + 0x103;
+    pub const B_BAD_PORT_ID: i32 = OS + 0x200;
+    pub const B_NO_MORE_PORTS: i32 = OS + 0x201;
+    pub const B_BAD_ADDRESS: i32 = OS + 0x301;
+    /// `OS.h`'s timeout flags.
+    pub const B_RELATIVE_TIMEOUT: u32 = 0x8;
+    pub const B_ABSOLUTE_TIMEOUT: u32 = 0x10;
+    /// `OS.h`'s `B_INFINITE_TIMEOUT`.
+    pub const B_INFINITE_TIMEOUT: i64 = i64::MAX;
+}
+
+pub struct Port {
+    name: [u8; B_OS_NAME_LENGTH],
+    capacity: i32,
+    owner_team: i32,
+    closed: bool,
+    queue: alloc::collections::VecDeque<(i32, Vec<u8>)>,
+    total_read: i32,
+}
+
+/// `port_info` (`OS.h`), field for field.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PortInfo {
+    pub port: i32,
+    pub team: i32,
+    pub name: [u8; B_OS_NAME_LENGTH],
+    pub capacity: i32,
+    pub queue_count: i32,
+    pub total_count: i32,
+}
+
+/// A timeout as Haiku's `_etc` calls take one: `flags` (`B_RELATIVE_TIMEOUT`
+/// or `B_ABSOLUTE_TIMEOUT`, else wait forever) and microseconds. Turned
+/// into a deadline tick, or `Err(B_WOULD_BLOCK)` for a relative timeout
+/// of zero (Haiku's "don't wait at all").
+fn deadline_for(flags: u32, timeout_us: i64, now: u64) -> Result<Option<u64>, i32> {
+    // `B_INFINITE_TIMEOUT` (`i64::MAX`, Haiku's usual way to say "wait
+    // forever" even with a timeout flag set), and anything too far off to
+    // count in ticks, is no deadline at all. The arithmetic saturates: an
+    // overflow here used to panic the kernel (a debug build checks) on
+    // exactly that idiom.
+    let ticks = |us: i64| (us.max(0) as u64).checked_mul(crate::pit::HZ as u64).map(|t| t.div_ceil(1_000_000));
+    if timeout_us == haiku::B_INFINITE_TIMEOUT {
+        return Ok(None);
+    }
+    if flags & haiku::B_RELATIVE_TIMEOUT != 0 {
+        if timeout_us <= 0 {
+            return Err(haiku::B_WOULD_BLOCK);
+        }
+        Ok(ticks(timeout_us).and_then(|t| now.checked_add(t)))
+    } else if flags & haiku::B_ABSOLUTE_TIMEOUT != 0 {
+        Ok(ticks(timeout_us))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Microseconds since boot, at the timer's resolution -- Haiku's
+/// `system_time()`, the clock `B_ABSOLUTE_TIMEOUT` is measured against.
+pub fn system_time_us() -> i64 {
+    (uptime_ticks() as i64) * 1_000_000 / crate::pit::HZ as i64
+}
+
+/// `create_port`: a new port holding up to `capacity` messages, owned by
+/// the caller's team. `name` is cut to 31 bytes.
+pub fn port_create(capacity: i32, name: &[u8]) -> i32 {
+    if capacity <= 0 || capacity > PORT_MAX_CAPACITY {
+        return haiku::B_BAD_VALUE;
+    }
+    with_scheduler(|sched| {
+        let team = sched.procs[sched.current].team;
+        let Some(slot) = (0..NR_PORTS).find(|&i| sched.ports[i].is_none()) else {
+            return haiku::B_NO_MORE_PORTS;
+        };
+        let mut stored = [0u8; B_OS_NAME_LENGTH];
+        let n = name.len().min(B_OS_NAME_LENGTH - 1);
+        stored[..n].copy_from_slice(&name[..n]);
+        sched.ports[slot] = Some(Port {
+            name: stored,
+            capacity,
+            owner_team: team,
+            closed: false,
+            queue: alloc::collections::VecDeque::new(),
+            total_read: 0,
+        });
+        // Generations keep ids positive and unique per slot reuse.
+        sched.port_generations[slot] = (sched.port_generations[slot] + 1) % (i32::MAX as u32 / NR_PORTS as u32);
+        (sched.port_generations[slot] * NR_PORTS as u32 + slot as u32) as i32
+    })
+}
+
+/// `find_port`: the id of the port named `name` (compared as `create_port`
+/// stored it), or `B_NAME_NOT_FOUND`.
+pub fn port_find(name: &[u8]) -> i32 {
+    let n = name.len().min(B_OS_NAME_LENGTH - 1);
+    with_scheduler(|sched| {
+        (0..NR_PORTS)
+            .find(|&i| {
+                sched.ports[i].as_ref().is_some_and(|p| {
+                    let len = p.name.iter().position(|&b| b == 0).unwrap_or(B_OS_NAME_LENGTH);
+                    p.name[..len] == name[..n]
+                })
+            })
+            .map_or(haiku::B_NAME_NOT_FOUND, |slot| {
+                (sched.port_generations[slot] * NR_PORTS as u32 + slot as u32) as i32
+            })
+    })
+}
+
+impl Scheduler {
+    /// Mark the caller waiting on port `slot` until it changes or
+    /// `deadline` passes -- called under the same lock hold that found it
+    /// had to wait, so nothing can change the port in between and leave
+    /// it waiting for something that already happened.
+    fn begin_port_wait(&mut self, slot: usize, deadline: Option<u64>) {
+        let idx = self.current;
+        if self.procs[idx].rts_flags == 0 {
+            self.dequeue(idx);
+        }
+        self.procs[idx].rts_flags |= rts::PORT_WAIT;
+        self.procs[idx].port_wait = Some(slot);
+        self.procs[idx].wait_deadline = deadline;
+        self.procs[idx].timed_out = false;
+    }
+}
+
+/// Switch away after `begin_port_wait`; `true` if the wait timed out.
+fn finish_port_wait() -> bool {
+    reschedule();
+    with_scheduler(|sched| core::mem::take(&mut sched.procs[sched.current].timed_out))
+}
+
+/// `write_port_etc`: queue `(code, data)` on port `id`, waiting while it's
+/// full (subject to the timeout). `B_OK`, or `B_BAD_PORT_ID` (no such
+/// port, closed, or deleted while waiting), `B_BAD_VALUE` (too big),
+/// `B_WOULD_BLOCK`/`B_TIMED_OUT`, `B_NO_MEMORY` (all ports' queues full).
+pub fn port_write(id: i32, code: i32, data: Vec<u8>, flags: u32, timeout_us: i64) -> i32 {
+    if data.len() > PORT_MAX_MESSAGE {
+        return haiku::B_BAD_VALUE;
+    }
+    let deadline = deadline_for(flags, timeout_us, uptime_ticks());
+    // The message waits in the process table, not on this stack (see
+    // `Proc::port_pending`).
+    with_scheduler(|sched| {
+        let cur = sched.current;
+        sched.procs[cur].port_pending = Some((code, data));
+    });
+    loop {
+        enum Step {
+            Done(i32),
+            Wait,
+        }
+        let step = with_scheduler(|sched| {
+            let cur = sched.current;
+            let Some(slot) = sched.port_slot(id) else {
+                sched.procs[cur].port_pending = None;
+                return Step::Done(haiku::B_BAD_PORT_ID);
+            };
+            let len = sched.procs[cur].port_pending.as_ref().map_or(0, |(_, d)| d.len());
+            let bytes_ok = sched.port_bytes + len <= PORT_QUEUE_BYTES;
+            let port = sched.ports[slot].as_mut().unwrap();
+            if port.closed {
+                sched.procs[cur].port_pending = None;
+                return Step::Done(haiku::B_BAD_PORT_ID);
+            }
+            // Room in this port *and* under the global byte bound: queue
+            // it. Short of either, wait -- as Haiku's writers wait for
+            // room -- rather than fail.
+            if port.queue.len() < port.capacity as usize && bytes_ok {
+                let message = sched.procs[cur].port_pending.take().unwrap();
+                sched.ports[slot].as_mut().unwrap().queue.push_back(message);
+                sched.port_bytes += len;
+                sched.wake_port_waiters(slot);
+                return Step::Done(haiku::B_OK);
+            }
+            match deadline {
+                Err(status) => {
+                    sched.procs[cur].port_pending = None;
+                    Step::Done(status)
+                }
+                Ok(d) if d.is_some_and(|d| sched.ticks >= d) => {
+                    sched.procs[cur].port_pending = None;
+                    Step::Done(haiku::B_TIMED_OUT)
+                }
+                Ok(d) => {
+                    sched.begin_port_wait(slot, d);
+                    Step::Wait
+                }
+            }
+        });
+        match step {
+            Step::Done(status) => {
+                reschedule(); // a woken reader may outrank the caller
+                return status;
+            }
+            Step::Wait => {
+                if finish_port_wait() {
+                    with_scheduler(|sched| {
+                        let cur = sched.current;
+                        sched.procs[cur].port_pending = None;
+                    });
+                    return haiku::B_TIMED_OUT;
+                }
+            }
+        }
+    }
+}
+
+/// What a read wants from the queue's head.
+enum Take {
+    /// Remove it: `read_port`.
+    Message,
+    /// Just its size: `port_buffer_size`.
+    Size,
+}
+
+/// The common body of `read_port_etc` and `port_buffer_size_etc`: wait
+/// (subject to the timeout) for a message, then take it or report its
+/// size. `Ok((code, data))` -- `data` empty and `code` the size for
+/// `Take::Size` -- or a Haiku status.
+fn port_next(id: i32, flags: u32, timeout_us: i64, take: Take) -> Result<(i32, Vec<u8>), i32> {
+    let deadline = deadline_for(flags, timeout_us, uptime_ticks());
+    loop {
+        enum Step {
+            Got(i32, Vec<u8>),
+            Fail(i32),
+            Wait,
+        }
+        let step = with_scheduler(|sched| {
+            let Some(slot) = sched.port_slot(id) else { return Step::Fail(haiku::B_BAD_PORT_ID) };
+            let port = sched.ports[slot].as_mut().unwrap();
+            match (port.queue.is_empty(), &take) {
+                (false, Take::Size) => {
+                    let size = port.queue.front().unwrap().1.len() as i32;
+                    Step::Got(size, Vec::new())
+                }
+                (false, Take::Message) => {
+                    let (code, data) = port.queue.pop_front().unwrap();
+                    port.total_read = port.total_read.saturating_add(1);
+                    sched.port_bytes -= data.len();
+                    // Room for a writer now -- on this port, and, since the
+                    // byte bound is global, possibly on any other.
+                    sched.wake_all_port_waiters();
+                    Step::Got(code, data)
+                }
+                // A closed port reads until it's empty, then is gone.
+                (true, _) if port.closed => Step::Fail(haiku::B_BAD_PORT_ID),
+                (true, _) => match deadline {
+                    // A zero relative timeout: don't wait at all.
+                    Err(status) => Step::Fail(status),
+                    Ok(d) if d.is_some_and(|d| sched.ticks >= d) => Step::Fail(haiku::B_TIMED_OUT),
+                    Ok(d) => {
+                        sched.begin_port_wait(slot, d);
+                        Step::Wait
+                    }
+                },
+            }
+        });
+        match step {
+            Step::Got(code, data) => return Ok((code, data)),
+            Step::Fail(status) => return Err(status),
+            Step::Wait => {
+                if finish_port_wait() {
+                    return Err(haiku::B_TIMED_OUT);
+                }
+            }
+        }
+    }
+}
+
+/// `read_port_etc`: take the next message, waiting for one.
+pub fn port_read(id: i32, flags: u32, timeout_us: i64) -> Result<(i32, Vec<u8>), i32> {
+    port_next(id, flags, timeout_us, Take::Message)
+}
+
+/// `port_buffer_size_etc`: the size of the next message, waiting for one.
+pub fn port_buffer_size(id: i32, flags: u32, timeout_us: i64) -> i32 {
+    match port_next(id, flags, timeout_us, Take::Size) {
+        Ok((size, _)) => size,
+        Err(status) => status,
+    }
+}
+
+/// `port_count`: messages queued, or `B_BAD_PORT_ID`.
+pub fn port_count(id: i32) -> i32 {
+    with_scheduler(|sched| match sched.port_slot(id) {
+        Some(slot) => sched.ports[slot].as_ref().unwrap().queue.len() as i32,
+        None => haiku::B_BAD_PORT_ID,
+    })
+}
+
+/// `close_port`: no more writes; readers drain what's queued, then get
+/// `B_BAD_PORT_ID`. Writers waiting are woken to find it closed.
+pub fn port_close(id: i32) -> i32 {
+    with_scheduler(|sched| match sched.port_slot(id) {
+        Some(slot) if !sched.ports[slot].as_ref().unwrap().closed => {
+            sched.ports[slot].as_mut().unwrap().closed = true;
+            sched.wake_port_waiters(slot);
+            haiku::B_OK
+        }
+        _ => haiku::B_BAD_PORT_ID,
+    })
+}
+
+/// `delete_port`: gone, queue and all; every waiter wakes to
+/// `B_BAD_PORT_ID`.
+pub fn port_delete(id: i32) -> i32 {
+    with_scheduler(|sched| match sched.port_slot(id) {
+        Some(slot) => {
+            sched.delete_port_slot(slot);
+            haiku::B_OK
+        }
+        None => haiku::B_BAD_PORT_ID,
+    })
+}
+
+/// `set_port_owner`: hand port `id` to `team` (which must be a live team's
+/// leader), so it's deleted when *that* team dies.
+pub fn port_set_owner(id: i32, team: i32) -> i32 {
+    // A live team: its leader's slot in use and not ended (a zombie or
+    // draining leader's team has already had its ports deleted, and one
+    // handed a port now would never delete it).
+    let ended = rts::ZOMBIE | rts::DRAINING | rts::DEAD;
+    let team_ok = is_valid_proc_nr(team)
+        && team_of(team) == team
+        && with_scheduler(|sched| {
+            let f = sched.procs[com::slot(team)].rts_flags;
+            f & ended == 0 && f != rts::RESERVED
+        });
+    with_scheduler(|sched| match sched.port_slot(id) {
+        None => haiku::B_BAD_PORT_ID,
+        Some(_) if !team_ok => haiku::B_BAD_TEAM_ID,
+        Some(slot) => {
+            sched.ports[slot].as_mut().unwrap().owner_team = team;
+            haiku::B_OK
+        }
+    })
+}
+
+/// `get_port_info`.
+pub fn port_info(id: i32) -> Result<PortInfo, i32> {
+    with_scheduler(|sched| {
+        let slot = sched.port_slot(id).ok_or(haiku::B_BAD_PORT_ID)?;
+        let p = sched.ports[slot].as_ref().unwrap();
+        Ok(PortInfo {
+            port: id,
+            team: p.owner_team,
+            name: p.name,
+            capacity: p.capacity,
+            queue_count: p.queue.len() as i32,
+            total_count: p.total_read,
+        })
+    })
+}
+
 /// Whether `proc_nr` names a process-table slot that is in use -- the
 /// check anything taking a process number from ring 3 must make first,
 /// since `com::slot` of an arbitrary number indexes the table out of
@@ -2000,6 +2480,13 @@ pub fn clock_tick() {
             if sched.procs[i].alarm.is_some_and(|target| now >= target) {
                 sched.procs[i].alarm = None;
                 sched.try_deliver_notification(i, com::CLOCK, com::SYN_ALARM);
+            }
+            // A timed port wait whose deadline has passed.
+            if sched.procs[i].rts_flags & rts::PORT_WAIT != 0
+                && sched.procs[i].wait_deadline.is_some_and(|d| now >= d)
+            {
+                sched.procs[i].timed_out = true;
+                sched.stop_port_wait(i);
             }
         }
     });

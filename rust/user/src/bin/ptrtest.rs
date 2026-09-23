@@ -32,7 +32,10 @@ const SH_PROC_NR: u64 = 12;
 fn main(_args: Args) -> i32 {
     let fd = sys::open(b"/ptrtest.tmp").unwrap_or(-1);
     let mut status_word = 0i32;
-    let cases: [(&str, i64, i64); 21] = unsafe {
+    // A real port for the port cases, so they reach the pointer check
+    // rather than stopping at "no such port".
+    let port = neumann_rt::os::create_port(1, "ptrtest") as u64;
+    let cases: [(&str, i64, i64); 24] = unsafe {
         [
             ("SYS_WRITE_LINE from the kernel heap", syscall4(sys::SYS_WRITE_LINE, KERNEL_HEAP, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
             ("SYS_WRITE_LINE from unmapped memory", syscall4(sys::SYS_WRITE_LINE, UNMAPPED, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
@@ -51,6 +54,10 @@ fn main(_args: Args) -> i32 {
             // below it would unmap the program, above it past the limit.
             ("SYS_BRK below the heap", syscall4(sys::SYS_BRK, 0x3000_0000_0000, 0, 0, 0), sys::ERR_BRK_FAILED),
             ("SYS_BRK past the heap's limit", syscall4(sys::SYS_BRK, 0x3800_0000_0000 + (32 << 20), 0, 0, 0), sys::ERR_BRK_FAILED),
+            // The Haiku port calls answer in Haiku's codes: B_BAD_ADDRESS.
+            ("write_port from the kernel heap", syscall4(30, port, 0, KERNEL_HEAP, 8), neumann_rt::os::B_BAD_ADDRESS as i64),
+            ("find_port of a name on the kernel heap", syscall4(29, KERNEL_HEAP, 8, 0, 0), neumann_rt::os::B_BAD_ADDRESS as i64),
+            ("get_port_info into read-only text", syscall4(36, port, OWN_TEXT, 0, 0), neumann_rt::os::B_BAD_ADDRESS as i64),
             ("SYS_EXEC of a path on the kernel heap", syscall4(sys::SYS_EXEC, KERNEL_HEAP, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
             // src_proc -4 is IDLE, a kernel task: its address space is the kernel's.
             ("SYS_VIRCOPY out of the kernel heap", syscall4(sys::SYS_VIRCOPY, (-4i64) as u64, KERNEL_HEAP, &mut status_word as *mut i32 as u64, 4), ERR_VIRCOPY_FAILED),

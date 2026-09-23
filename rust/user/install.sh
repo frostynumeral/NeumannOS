@@ -8,7 +8,7 @@ set -e
 cd "$(dirname "$0")"
 cargo +nightly build --release
 mkdir -p ../kernel/user/bin
-for prog in sh echo cat ptrtest ls mkdir threads heaptest; do
+for prog in sh echo cat ptrtest ls mkdir threads heaptest porttest; do
     cp "target/x86_64-unknown-none/release/$prog" "../kernel/user/bin/$prog"
 done
 ls -l ../kernel/user/bin
