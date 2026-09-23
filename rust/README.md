@@ -356,7 +356,7 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   CPU didn't already save, calls `dispatch` with the caller's original
   `rax`/`rdi`/`rsi`/`rdx`/`rcx`, writes the `u64` result back into the
   saved `rax` slot, restores everything else unchanged, and `iretq`s.
-  `dispatch` implements sixteen calls (the two newest, `SYS_FS_OPEN_EXISTING` and `SYS_CONSOLE_WRITE`, are described under "Ring-3 programs in Rust" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  `dispatch` implements nineteen calls (the newest -- `SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`, `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR` -- are described under "Ring-3 programs in Rust" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
@@ -885,7 +885,11 @@ this port's first real step on roadmap item 12, the libc-equivalent.
   `argv` and the shell's own environment, the parent `wait`s and reports
   a non-zero status (`[exit 1]`, `[exit 127]` for a missing command).
   Built in: `exit [status]` and `help`.
-- `echo`, `cat`, `ptrtest` -- what it runs. `cat` uses the new
+- `echo`, `cat`, `ls`, `mkdir`, `ptrtest` -- what it runs. `ls` lists
+  directories through `SYS_FS_READDIR` (size, name, `/` on
+  subdirectories; `/` by default, since there's no current directory),
+  `mkdir` creates them through `SYS_FS_MKDIR`, and `cat` closes what it
+  opens (`SYS_FS_CLOSE`). `cat` uses the new
   `SYS_FS_OPEN_EXISTING` (`open` without `O_CREAT`; plain `SYS_FS_OPEN`
   creates what it opens, so `cat missing` used to leave an empty file
   behind). `ptrtest` hands the kernel bad pointers (above).
@@ -929,8 +933,8 @@ now gets a private copy instead of rewriting every sharer's code;
 the lower half; and the syscall layer's pointer handling described in
 "known simplifications in the syscall ABI".
 
-Known gaps: `fs` has no `close`, so every `cat` leaks an open-file slot
-in `fs`'s table (which grows without bound); output goes to COM1 only,
+Known gaps: file descriptors are owned by process number in one global
+table (see "known simplifications in `fs`"); output goes to COM1 only,
 interleaved with the kernel's own log (the on-screen console is the
 next milestone); no quoting, pipes, redirection, variables, job control
 or current directory in `sh`.
@@ -1004,9 +1008,9 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Sixteen calls exist** (`SYS_FS_OPEN_EXISTING` and
-  `SYS_CONSOLE_WRITE` are the newest -- see the `rust/user/` section
-  above), and all but the unrecognized-call-number
+- **Nineteen calls exist** (`SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`,
+  `SYS_FS_CLOSE`, `SYS_FS_READDIR` and `SYS_FS_MKDIR` are the newest --
+  see the `rust/user/` section above), and all but the unrecognized-call-number
   fallback reach real server/kernel-call logic, including `SYS_FORK`
   from any ring-3 caller now (see the `src/syscall.rs`/`src/proc.rs`
   bullets above). Real enough to
@@ -1051,7 +1055,7 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   `SYS_WRITE_LINE`, or write it through `SYS_FS_READ`; `SYS_VIRCOPY`
   could name a kernel task as its source (reading kernel memory) or the
   heap as its destination. `/bin/ptrtest` (run at boot by
-  `crate::main`'s `ptr_safety_check`) holds seventeen such calls to
+  `crate::main`'s `ptr_safety_check`) holds nineteen such calls to
   refusing. What's still coarse: the copies go through one bounded
   kernel-stack buffer per call (256 bytes), and a write checked before a
   call blocks could in principle find the page gone afterwards (nothing
@@ -1148,8 +1152,13 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 - **A real but shallow directory hierarchy.** `mkdir`/`open` check a
   path's immediate parent (`ENOENT`/`ENOTDIR`/`EISDIR`/`EEXIST`, see the
-  `src/fs.rs` bullet above), but there's still no `readdir`/listing, no
-  `unlink`/`rmdir`, no `stat`/permissions/inode-number concept, and no
+  `src/fs.rs` bullet above), and `readdir` lists a directory
+  (`FS_READDIR`: the *n*-th entry -- subdirectories first, then files,
+  each in creation order -- as a 128-byte `DirEntry` of name, kind and
+  size, `0` past the end; stateless and index-based rather than a cursor
+  on an open directory, so it costs a scan of every entry per call, and
+  a directory changing mid-listing can shift what an index means). Still
+  no `unlink`/`rmdir`, no `stat`/permissions/inode-number concept, and no
   relative paths or `.`/`..` -- every path is a full, absolute string
   compared exactly, not a real walk through directory-entry blocks the
   way `servers/fs/path.c`'s `lookup()` does.
@@ -1159,13 +1168,31 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   "known simplifications in the ring-3 task" above); a real, isolated
   `fs` server would need a `sys_vircopy`-style copy for every buffer, the
   same way `sys_vircopy` itself does for `sys_fork`'d tasks.
-- **`open` still always creates** (`open_existing` is opt-in, not the
-  default, and there is no `O_CREAT`-style flag set for a caller to
-  express anything finer), and there's no `close`: a file descriptor is
-  never freed once allocated (`InMemoryFs::open`'s slot table only ever
-  grows), and repeated opens of the same name return independent
-  descriptors with independent cursors rather than sharing or refusing
-  based on any open-file-table policy.
+- **`open` still creates by default** (`open_existing`/
+  `SYS_FS_OPEN_EXISTING` is opt-in; there is no `O_CREAT`-style flag set
+  for anything finer). `close` exists now (`FS_CLOSE`/`SYS_FS_CLOSE`),
+  and its slot is the next one `open` hands out -- before it, every open
+  cost `fs` a table entry forever, one per `cat` and one per poll of the
+  kernel's own `read_when_available`. Descriptors are one global table,
+  but each records the process that opened it (`OpenFile::owner`), and
+  reading, writing or closing someone else's is `EBADF` -- before that,
+  any process could close any other's, and slot reuse then quietly
+  redirected the first one's writes (`console_task`'s `/console.log`)
+  into a different file; `ptrtest` checks every descriptor it didn't
+  open is unusable to it. The owner is a process number *plus* that
+  slot's generation (`proc::generation_of`, bumped every time a new
+  process takes the slot): by number alone, a reaped child's still-open
+  files went to the next process handed its number -- which `ptrtest`
+  caught the first time it ran. The generation doubles as cleanup on
+  exit: a descriptor whose owner is gone counts as a free slot to
+  `open`. Consequences of owning by process: `exec` keeps its
+  descriptors (same process), as POSIX does, but a `fork`ed child can't
+  use its parent's, which POSIX would let it.
+  Paths have exactly one spelling -- absolute, no `//`, no trailing `/`
+  (`EINVAL` otherwise) -- since they're compared as whole strings: before
+  that check, `/x` and `//x` were different entries and `mkdir /bin/`
+  made a directory with an empty name. Repeated opens of the same name
+  return independent descriptors with independent cursors.
 - **In-memory only.** There's no backing device, so nothing here survives
   a reboot -- there's no block layer, block cache, or on-disk layout at
   all (`kernel/kernel.h`'s device abstractions, `servers/fs`'s
@@ -1233,7 +1260,9 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   called from `proc::set_address_space` once the new `CR3` is loaded),
   so `exec` no longer costs an address space per call. What is still
   missing is the rest of a real teardown: `fs` descriptors the old image
-  opened stay open (there is no `close`), and a partially-mapped image
+  opened stay open (they carry over to the new image, as POSIX's do; a
+  process's descriptors are reclaimed once it has exited -- see "known
+  simplifications in `fs`"), and a partially-mapped image
   rejected mid-way leaves the frames it already took behind, because
   `load_image` frees nothing on the error path -- it only avoids
   allocating in the first place, which covers every case `validate`
@@ -1562,7 +1591,8 @@ Roughly in the order the original kernel needs them:
     out on the new stack the way the System V ABI has it, which
     `/bin/exectest` then actually echoes. Still
     missing: `fs`
-    growing `readdir` and a real backing store (see "known simplifications in
+    growing a real backing store (it has `readdir` and `close` now, and
+    `ls`/`mkdir` in `/bin` on top of them -- see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
     file/directory table. Ring-3 callers can now reach `fs` for real
     (`crate::syscall`'s `SYS_FS_OPEN`/`SYS_FS_WRITE`/`SYS_FS_READ`), but
@@ -1620,7 +1650,7 @@ Roughly in the order the original kernel needs them:
     gate saves every general-purpose register, reads the caller's `rax`
     (call number) and `rdi`/`rsi`/`rdx`/`rcx` (up to four arguments, since
     grown from three -- see the `src/syscall.rs` bullet above),
-    dispatches to one of sixteen calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    dispatches to one of nineteen calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
     -- a real cross-ring pointer argument, read directly since entering a
     trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
     the first of `crate::calls`' own kernel calls reachable from ring 3,
@@ -1667,7 +1697,7 @@ Roughly in the order the original kernel needs them:
     child's canary write (proving its memory is a real, independent copy)
     and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
     `IDLE`. See "known simplifications in the syscall ABI" above for what's
-    not a real syscall surface yet (sixteen calls, one code per *kind* of
+    not a real syscall surface yet (nineteen calls, one code per *kind* of
     dispatch-level mistake rather than a real per-cause `errno` set).
     `SYS_FORK` is no longer restricted to one known caller with one
     reserved child slot: the pages to copy come out of the caller's own

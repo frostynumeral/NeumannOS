@@ -89,7 +89,9 @@ fn run_line(line: &[u8], envp: &[*const u8]) -> Option<i32> {
             println!("Commands are programs in /bin, run with the words that follow as their arguments:");
             println!("  echo WORDS...   print the words");
             println!("  cat FILE...     print files");
-            println!("Built in: exit [STATUS], help. Try: cat /console.log");
+            println!("  ls [DIR...]     list directories (default /)");
+            println!("  mkdir DIR...    create directories");
+            println!("Built in: exit [STATUS], help. Try: ls /bin, cat /console.log");
             return None;
         }
         _ => {}

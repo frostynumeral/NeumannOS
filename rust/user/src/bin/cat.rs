@@ -37,6 +37,7 @@ fn main(args: Args) -> i32 {
                 }
             }
         }
+        let _ = sys::close(fd);
     }
     status
 }

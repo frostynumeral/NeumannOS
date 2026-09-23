@@ -492,6 +492,7 @@ fn idle_task() -> ! {
     vircopy_error_from_ring3_verify();
     fork_child_verify();
     exec_verify();
+    fs_dir_check();
     ptr_safety_check();
     proc_slot_pool_check();
     wait_without_children_check();
@@ -1032,8 +1033,63 @@ fn argv_verify(child: i32) {
     }
 }
 
+/// `fs`'s directory listing and descriptor release, checked against a
+/// tree built here: `/dirtest` holding a subdirectory and two files,
+/// which `readdir` must list subdirectory first, then files in creation
+/// order, with the right kinds and sizes, and then report the end; a
+/// missing directory is `ENOENT` and a file is `ENOTDIR`. Then `close`:
+/// a closed descriptor is `EBADF` to read and to close again. And paths
+/// have one spelling: `//`, a trailing `/` and relative paths are
+/// `EINVAL` everywhere (`ls` and `mkdir` from the shell made those
+/// reachable: `mkdir /bin/` used to create a directory with an empty
+/// name).
+fn fs_dir_check() {
+    assert_eq!(fs::mkdir("/dirtest"), 0);
+    assert_eq!(fs::mkdir("/dirtest/sub"), 0);
+    for (path, body) in [("/dirtest/a.txt", &b"alpha"[..]), ("/dirtest/b.txt", &b"bravo!"[..])] {
+        let fd = fs::open(path);
+        assert!(fd >= 0);
+        assert_eq!(fs::write(fd, body), body.len() as i64);
+        assert_eq!(fs::close(fd), 0);
+    }
+    let expected: [(&[u8], i64, u64); 3] =
+        [(b"sub", fs::KIND_DIR, 0), (b"a.txt", fs::KIND_FILE, 5), (b"b.txt", fs::KIND_FILE, 6)];
+    let mut entry = fs::DirEntry::EMPTY;
+    for (i, (name, kind, size)) in expected.iter().enumerate() {
+        assert_eq!(fs::readdir("/dirtest", i, &mut entry), 1, "readdir /dirtest #{} found nothing", i);
+        assert_eq!(entry.name(), *name, "readdir /dirtest #{} has the wrong name", i);
+        assert_eq!(entry.kind as i64, *kind, "readdir /dirtest #{} has the wrong kind", i);
+        assert_eq!(entry.size, *size, "readdir /dirtest #{} has the wrong size", i);
+    }
+    assert_eq!(fs::readdir("/dirtest", 3, &mut entry), 0, "readdir /dirtest didn't end after 3 entries");
+    assert_eq!(fs::readdir("/dirtest/sub", 0, &mut entry), 0, "an empty directory listed something");
+    assert_eq!(fs::readdir("/no_such_dir", 0, &mut entry), fs::ENOENT);
+    assert_eq!(fs::readdir("/dirtest/a.txt", 0, &mut entry), fs::ENOTDIR);
+
+    let fd = fs::open_existing("/dirtest/a.txt");
+    assert!(fd >= 0);
+    assert_eq!(fs::close(fd), 0);
+    let mut buf = [0u8; 4];
+    assert_eq!(fs::read(fd, &mut buf), fs::EBADF, "a closed descriptor still reads");
+    assert_eq!(fs::close(fd), fs::EBADF, "a descriptor closed twice");
+    // (Deliberately no "the freed slot is the next one handed out"
+    // assertion: the table is shared by every process, and any of them
+    // opening a file between the `close` and the `open` would take it.)
+
+    // Paths are compared as whole strings, so only one spelling of each
+    // may get in.
+    for bad in ["//dirtest", "/dirtest/", "/dirtest//a.txt", "dirtest"] {
+        assert_eq!(fs::readdir(bad, 0, &mut entry), fs::EINVAL, "readdir accepted {:?}", bad);
+        assert_eq!(fs::mkdir(bad), fs::EINVAL, "mkdir accepted {:?}", bad);
+        assert_eq!(fs::open_existing(bad), fs::EINVAL, "open accepted {:?}", bad);
+    }
+    serial_println!(
+        "[idle] fs: readdir /dirtest -> sub/, a.txt (5), b.txt (6), end; missing -> ENOENT, file -> ENOTDIR; a closed fd is EBADF; //, trailing / and relative paths are EINVAL"
+    );
+}
+
 /// Runs `/bin/ptrtest` (`rust/user/src/bin/ptrtest.rs`) and requires its
-/// verdict to be `ok`: seventeen system calls given deliberately bad
+/// verdict to be `ok`: nineteen system calls given deliberately bad
 /// pointers -- the kernel heap (mapped in every address space), unmapped
 /// memory, the program's own read-only text as a write target -- each of
 /// which must come back as an error code. Before `crate::syscall` copied
@@ -1053,7 +1109,7 @@ fn ptr_safety_check() {
     let n = read_when_available("/ptrtest.out", &mut buf);
     let verdict = &buf[..n.max(0) as usize];
     serial_println!(
-        "[idle] /bin/ptrtest verdict: {:?} (17 syscalls handed bad pointers or process numbers, each must be refused)",
+        "[idle] /bin/ptrtest verdict: {:?} (19 syscalls handed bad pointers or process numbers, each must be refused)",
         core::str::from_utf8(verdict).unwrap_or("<invalid utf8>")
     );
     assert_eq!(verdict, b"ok", "a system call accepted a bad pointer -- see ptrtest's FAIL lines above");
@@ -1170,6 +1226,9 @@ fn read_when_available(path: &str, buf: &mut [u8]) -> i64 {
             // as far as `open` and no further -- the same race, one step
             // later.
             let n = fs::read(fd, buf);
+            // Every poll opens a fresh descriptor; close it either way,
+            // or waiting for a file costs one `fs` slot per retry.
+            fs::close(fd);
             if n != 0 {
                 return n;
             }
@@ -1354,6 +1413,7 @@ fn seed_bin() {
         let fd = fs::open(path);
         assert!(fd >= 0, "fs::open({:?}) failed: {}", path, fd);
         let n = fs::write(fd, image);
+        fs::close(fd);
         serial_println!("[pm] seeded {} with {} bytes", path, n);
         assert_eq!(n, image.len() as i64, "fs::write didn't accept the whole ELF image");
     }

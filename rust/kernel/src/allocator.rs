@@ -9,7 +9,6 @@
 //! natural to write against a heap than against more fixed-size static
 //! arrays.
 
-use core::alloc::GlobalAlloc;
 use linked_list_allocator::LockedHeap;
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::structures::paging::{

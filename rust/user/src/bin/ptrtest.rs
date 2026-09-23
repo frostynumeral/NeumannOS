@@ -25,13 +25,14 @@ const UNMAPPED: u64 = 0x3000_0080_0000;
 const OWN_TEXT: u64 = 0x3000_0000_0000;
 
 const ERR_VIRCOPY_FAILED: i64 = -3;
+const EBADF: i64 = -9;
 /// `sh`, the interactive shell (the kernel's `com::SH_PROC_NR`).
 const SH_PROC_NR: u64 = 12;
 
 fn main(_args: Args) -> i32 {
     let fd = sys::open(b"/ptrtest.tmp").unwrap_or(-1);
     let mut status_word = 0i32;
-    let cases: [(&str, i64, i64); 17] = unsafe {
+    let cases: [(&str, i64, i64); 19] = unsafe {
         [
             ("SYS_WRITE_LINE from the kernel heap", syscall4(sys::SYS_WRITE_LINE, KERNEL_HEAP, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
             ("SYS_WRITE_LINE from unmapped memory", syscall4(sys::SYS_WRITE_LINE, UNMAPPED, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
@@ -44,6 +45,8 @@ fn main(_args: Args) -> i32 {
             ("SYS_FS_READ into the kernel heap", syscall4(sys::SYS_FS_READ, fd as u64, KERNEL_HEAP, 8, 0), sys::ERR_BAD_ARG_PTR),
             ("SYS_READ_LINE into this program's read-only text", syscall4(sys::SYS_READ_LINE, OWN_TEXT, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
             ("SYS_WAIT writing its status into read-only text", syscall4(sys::SYS_WAIT, OWN_TEXT, 0, 0, 0), sys::ERR_BAD_ARG_PTR),
+            ("SYS_FS_READDIR writing its entry into read-only text", syscall4(sys::SYS_FS_READDIR, b"/".as_ptr() as u64, 1, 0, OWN_TEXT), sys::ERR_BAD_ARG_PTR),
+            ("SYS_FS_MKDIR of a path on the kernel heap", syscall4(sys::SYS_FS_MKDIR, KERNEL_HEAP, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
             ("SYS_EXEC of a path on the kernel heap", syscall4(sys::SYS_EXEC, KERNEL_HEAP, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
             // src_proc -4 is IDLE, a kernel task: its address space is the kernel's.
             ("SYS_VIRCOPY out of the kernel heap", syscall4(sys::SYS_VIRCOPY, (-4i64) as u64, KERNEL_HEAP, &mut status_word as *mut i32 as u64, 4), ERR_VIRCOPY_FAILED),
@@ -62,7 +65,27 @@ fn main(_args: Args) -> i32 {
         ]
     };
 
-    let mut failed = 0;
+    // Descriptor ownership: every descriptor number this program didn't
+    // open itself -- `console_task`'s `/console.log`, the files other
+    // processes left open -- must be `EBADF` here, to read and to close.
+    // Before `fs` recorded owners, any process could close any other's,
+    // and slot reuse then redirected its writes into a different file.
+    let mut foreign_ok = true;
+    for other in 0..64i64 {
+        if other == fd {
+            continue;
+        }
+        let mut byte = [0u8; 1];
+        let read = unsafe { syscall4(sys::SYS_FS_READ, other as u64, byte.as_mut_ptr() as u64, 1, 0) };
+        let close = unsafe { syscall4(sys::SYS_FS_CLOSE, other as u64, 0, 0, 0) };
+        if read != EBADF || close != EBADF {
+            println!("ptrtest: FAIL descriptor {} (not mine): read -> {}, close -> {}", other, read, close);
+            foreign_ok = false;
+        }
+    }
+    let _ = sys::close(fd);
+
+    let mut failed = if foreign_ok { 0 } else { 1 };
     for (what, got, want) in cases.iter() {
         if got != want {
             println!("ptrtest: FAIL {}: got {}, expected {}", what, got, want);
@@ -71,7 +94,10 @@ fn main(_args: Args) -> i32 {
     }
     let verdict: &[u8] = if failed == 0 { b"ok" } else { b"FAIL" };
     if failed == 0 {
-        println!("ptrtest: all {} bad-pointer calls refused with the right error", cases.len());
+        println!(
+            "ptrtest: all {} bad-pointer calls refused with the right error, and no other process's descriptor is usable",
+            cases.len()
+        );
     }
     if let Ok(out) = sys::open(b"/ptrtest.out") {
         let _ = sys::write(out, verdict);

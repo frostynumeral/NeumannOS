@@ -22,6 +22,9 @@ const SYS_EXIT: u64 = 13;
 pub const SYS_WAIT: u64 = 14;
 pub const SYS_FS_OPEN_EXISTING: u64 = 15;
 pub const SYS_CONSOLE_WRITE: u64 = 16;
+pub const SYS_FS_CLOSE: u64 = 17;
+pub const SYS_FS_READDIR: u64 = 18;
+pub const SYS_FS_MKDIR: u64 = 19;
 
 /// Most bytes the kernel moves in one `SYS_FS_*`/`SYS_CONSOLE_WRITE`
 /// call (its `MAX_FS_BUF`/`MAX_LINE_LEN`); the wrappers below loop over
@@ -44,8 +47,10 @@ pub const ERR_FORK_FAILED: i64 = -9;
 pub const ERR_NO_CHILDREN: i64 = -10;
 pub const ERR_BAD_ARG_PTR: i64 = -12;
 pub const ERR_ARGS_TOO_BIG: i64 = -13;
+pub const EEXIST: i64 = -17;
 pub const ENOTDIR: i64 = -20;
 pub const EISDIR: i64 = -21;
+pub const EINVAL: i64 = -22;
 
 /// Raw trap: call number `n`, four arguments, result in `rax`. The kernel
 /// preserves every register but `rax`. Public for programs that need to
@@ -114,6 +119,58 @@ pub fn open_existing(path: &[u8]) -> Result<i64, i64> {
     result(unsafe { syscall4(SYS_FS_OPEN_EXISTING, path.as_ptr() as u64, path.len() as u64, 0, 0) })
 }
 
+/// Give `fd` back. Every open costs a slot in `fs` until it's closed.
+pub fn close(fd: i64) -> Result<(), i64> {
+    result(unsafe { syscall4(SYS_FS_CLOSE, fd as u64, 0, 0, 0) }).map(|_| ())
+}
+
+/// Create directory `path` (its parent must exist).
+pub fn mkdir(path: &[u8]) -> Result<(), i64> {
+    result(unsafe { syscall4(SYS_FS_MKDIR, path.as_ptr() as u64, path.len() as u64, 0, 0) }).map(|_| ())
+}
+
+/// Longest entry name `readdir` reports (the kernel's `fs::DIRENT_NAME_MAX`).
+pub const DIRENT_NAME_MAX: usize = 118;
+
+/// One directory entry: the kernel's `fs::DirEntry`, byte for byte.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DirEntry {
+    pub size: u64,
+    pub kind: u8,
+    pub name_len: u8,
+    pub name: [u8; DIRENT_NAME_MAX],
+}
+
+impl DirEntry {
+    pub const fn empty() -> DirEntry {
+        DirEntry { size: 0, kind: 0, name_len: 0, name: [0; DIRENT_NAME_MAX] }
+    }
+
+    pub fn name(&self) -> &[u8] {
+        &self.name[..(self.name_len as usize).min(DIRENT_NAME_MAX)]
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.kind == 1
+    }
+}
+
+/// The `index`-th entry of directory `path` (subdirectories first, then
+/// files): `Ok(true)` if `entry` was filled in, `Ok(false)` past the end.
+pub fn readdir(path: &[u8], index: usize, entry: &mut DirEntry) -> Result<bool, i64> {
+    result(unsafe {
+        syscall4(
+            SYS_FS_READDIR,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            index as u64,
+            entry as *mut DirEntry as u64,
+        )
+    })
+    .map(|n| n == 1)
+}
+
 /// Read up to `buf.len()` bytes; `Ok(0)` at end of file.
 pub fn read(fd: i64, buf: &mut [u8]) -> Result<usize, i64> {
     let len = buf.len().min(MAX_IO);
@@ -177,6 +234,8 @@ pub fn strerror(code: i64) -> &'static str {
     match code {
         ENOENT => "no such file or directory",
         ENOTDIR => "not a directory",
+        EEXIST => "already exists",
+        EINVAL => "invalid path (absolute, no // or trailing /)",
         EISDIR => "is a directory",
         ERR_BAD_ELF => "not an executable program",
         ERR_NO_FREE_PROC => "no free process slots",

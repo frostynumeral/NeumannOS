@@ -286,6 +286,16 @@ struct Scheduler {
     /// first read, before any task ever gets its own -- see
     /// `Proc::cr3`), loaded whenever the current task doesn't have one.
     kernel_cr3: (PhysFrame, Cr3Flags),
+    /// How many processes each slot has held: bumped every time `spawn`
+    /// or `fork_current` fills it, never reset (unlike `procs[idx]`,
+    /// which goes back to `Proc::empty()` when a process is released).
+    /// A process number alone doesn't name one process for ever -- the
+    /// dynamic ones are reused as soon as a child is reaped -- so anything
+    /// that has to remember *which* process it was dealing with keeps the
+    /// pair (`generation_of`). `crate::fs` does, for descriptor ownership:
+    /// owning by number alone handed a dead child's open files to the
+    /// next process given its number.
+    generations: [u32; NR_PROCS],
 }
 
 impl Scheduler {
@@ -491,6 +501,7 @@ lazy_static::lazy_static! {
         prev_for_penalty: None,
         ticks: 0,
         kernel_cr3: Cr3::read(),
+        generations: [0; NR_PROCS],
     });
 }
 
@@ -551,6 +562,7 @@ pub fn spawn(
     };
 
     with_scheduler(|sched| {
+        sched.generations[idx] = sched.generations[idx].wrapping_add(1);
         sched.procs[idx] = Proc {
             proc_nr,
             name,
@@ -792,6 +804,7 @@ pub fn fork_current(
     };
 
     with_scheduler(|sched| {
+        sched.generations[idx] = sched.generations[idx].wrapping_add(1);
         sched.procs[idx] = Proc {
             proc_nr: child_proc_nr,
             name,
@@ -1191,6 +1204,20 @@ pub fn is_valid_proc_nr(proc_nr: i32) -> bool {
     let idx = com::slot(proc_nr);
     idx < com::NR_PROC_SLOTS
         && with_scheduler(|sched| sched.procs[idx].rts_flags & rts::SLOT_FREE == 0)
+}
+
+/// The generation of the process currently in `proc_nr`'s slot (see
+/// `Scheduler::generations`), or `None` if the number names no live
+/// process. Two calls returning the same `Some` mean the same process.
+pub fn generation_of(proc_nr: i32) -> Option<u32> {
+    if proc_nr < -(com::NR_TASKS as i32) || com::slot(proc_nr) >= com::NR_PROC_SLOTS {
+        return None;
+    }
+    let idx = com::slot(proc_nr);
+    // One lock for both reads, so the answer describes one moment.
+    with_scheduler(|sched| {
+        (sched.procs[idx].rts_flags & rts::SLOT_FREE == 0).then_some(sched.generations[idx])
+    })
 }
 
 /// For `crate::calls::sys_vircopy` to translate a virtual address in some

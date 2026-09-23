@@ -39,3 +39,13 @@ opt-level = "s"
 debug = false
 strip = true
 codegen-units = 1
+
+[[bin]]
+name = "ls"
+test = false
+bench = false
+
+[[bin]]
+name = "mkdir"
+test = false
+bench = false

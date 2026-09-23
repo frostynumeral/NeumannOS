@@ -123,6 +123,14 @@ pub const SYS_FS_OPEN_EXISTING: u64 = 15;
 /// with the caller's process number. What a shell and the programs it
 /// runs print through.
 pub const SYS_CONSOLE_WRITE: u64 = 16;
+/// Close a file descriptor (`rdi`), giving its slot in `fs` back.
+pub const SYS_FS_CLOSE: u64 = 17;
+/// The `rdx`-th entry of the directory at `rdi`/`rsi` (path pointer and
+/// length), written to `rcx` as a 128-byte `fs::DirEntry`. `1` if an
+/// entry was written, `0` past the last one, or a negative error.
+pub const SYS_FS_READDIR: u64 = 18;
+/// Create the directory at `rdi`/`rsi`.
+pub const SYS_FS_MKDIR: u64 = 19;
 
 /// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
 /// a sanity bound on an untrusted `len` from ring 3 -- matches the size
@@ -483,6 +491,42 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                 Ok(path) => fs::open_existing(path) as u64,
                 Err(_) => ERR_BAD_UTF8,
             }
+        }
+        SYS_FS_CLOSE => fs::close(arg1 as i64) as u64,
+        SYS_FS_READDIR | SYS_FS_MKDIR => {
+            if arg2 as usize > MAX_FS_BUF {
+                return ERR_BAD_LENGTH;
+            }
+            let mut path_buf = [0u8; MAX_FS_BUF];
+            let len = arg2 as usize;
+            if let Err(err) = copy_from_caller(caller, arg1, &mut path_buf[..len]) {
+                return err;
+            }
+            let Ok(path) = core::str::from_utf8(&path_buf[..len]) else {
+                return ERR_BAD_UTF8;
+            };
+            if call_num == SYS_FS_MKDIR {
+                return fs::mkdir(path) as u64;
+            }
+            // Checked before asking `fs`, and the entry comes back through
+            // a kernel-stack record (see the module doc comment on why a
+            // ring-3 pointer is never handed to `fs` itself).
+            let size = core::mem::size_of::<fs::DirEntry>();
+            if let Err(err) = check_writable(caller, arg4, size) {
+                return err;
+            }
+            let mut entry = fs::DirEntry::EMPTY;
+            let result = fs::readdir(path, arg3 as usize, &mut entry);
+            if result == 1 {
+                // Safety: `DirEntry` is `repr(C)` plain data.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(&entry as *const fs::DirEntry as *const u8, size)
+                };
+                if let Err(err) = copy_to_caller(caller, arg4, bytes) {
+                    return err;
+                }
+            }
+            result as u64
         }
         SYS_CONSOLE_WRITE => {
             if arg2 > MAX_LINE_LEN {

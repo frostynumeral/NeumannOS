@@ -47,11 +47,13 @@ pub static ECHO_ELF: &[u8] = include_bytes!("../user/echo.elf");
 /// here by its `install.sh`), and where `crate::main`'s `seed_bin`
 /// installs each one in `fs`. Unlike the assembly programs above, these
 /// are meant to be *used*: `sh` runs the others by path, out of `/bin`.
-pub static RUST_PROGRAMS: [(&str, &[u8]); 4] = [
+pub static RUST_PROGRAMS: [(&str, &[u8]); 6] = [
     ("/bin/sh", include_bytes!("../user/bin/sh")),
     ("/bin/echo", include_bytes!("../user/bin/echo")),
     ("/bin/cat", include_bytes!("../user/bin/cat")),
     ("/bin/ptrtest", include_bytes!("../user/bin/ptrtest")),
+    ("/bin/ls", include_bytes!("../user/bin/ls")),
+    ("/bin/mkdir", include_bytes!("../user/bin/mkdir")),
 ];
 
 /// `sh` itself, which also starts at boot (`com::SH_PROC_NR`), the way
@@ -1019,9 +1021,11 @@ pub fn read_file(path: &str) -> Result<Vec<u8>, i64> {
         // error handler to catch it if we do (an over-large `Vec` growth
         // aborts).
         if image.len() + n as usize > MAX_IMAGE_BYTES {
+            fs::close(fd);
             return Err(EFBIG);
         }
         image.extend_from_slice(&chunk[..n as usize]);
     }
+    fs::close(fd);
     Ok(image)
 }
