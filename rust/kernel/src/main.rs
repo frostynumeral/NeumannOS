@@ -137,6 +137,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // real page fault -- gives the writer a private copy. See
     // `cow_self_test`.
     cow_self_test();
+    // Self-test: the heap region `brk` grows into is private to every
+    // address space, and pages map and unmap without leaking.
+    heap_self_test();
     // Self-test: this is the actual proof of isolation, not just that
     // things still work. The demo pages were never mapped into *this*
     // (the kernel's own) page table -- only into `ring3_address_space` --
@@ -394,6 +397,39 @@ fn cow_self_test() {
     serial_println!("[cow] copy-on-write self-test passed; frames back to {}", after);
 }
 
+/// `proc::brk`'s building blocks, on a real ELF address space: the whole
+/// possible heap (`proc::HEAP_BASE`, `proc::HEAP_MAX`) is in PML4 slots
+/// the kernel's own address space leaves empty (so growing it can never
+/// edit the kernel's page tables), `memory::map_zeroed` hands out pages
+/// that read as zero and take writes, and `memory::unmap_release` gives
+/// them back -- the frame count balancing once the address space goes too.
+fn heap_self_test() {
+    use x86_64::registers::control::Cr3;
+    let kernel_pml4 = Cr3::read().0;
+    let base = VirtAddr::new(proc::HEAP_BASE);
+    assert!(
+        memory::pml4_slots_unused(kernel_pml4, base, base + (proc::HEAP_MAX - 1)),
+        "the heap region overlaps a PML4 slot the kernel uses"
+    );
+    let (before, _) = memory::frame_stats();
+    let image = elf::load_image(kernel_pml4, elf::HELLO_ELF).expect("HELLO_ELF should load");
+    assert!(memory::map_zeroed(image.pml4, base, 4), "map_zeroed failed");
+    let mut probe = [0xffu8; 8];
+    let last = base + 3 * 4096 + 4088;
+    memory::copy_between_address_spaces(image.pml4, last, kernel_pml4, VirtAddr::new(probe.as_mut_ptr() as u64), 8)
+        .expect("the new heap page isn't mapped");
+    assert_eq!(probe, [0; 8], "a fresh heap page wasn't zeroed");
+    let word = 0x1234_5678_9abc_def0u64.to_le_bytes();
+    memory::copy_between_address_spaces(kernel_pml4, VirtAddr::new(word.as_ptr() as u64), image.pml4, last, 8)
+        .expect("the new heap page isn't writable");
+    memory::unmap_release(image.pml4, base, 4);
+    assert!(memory::translate_page(image.pml4, base).is_none(), "unmap_release left a page mapped");
+    unsafe { memory::free_address_space(image.pml4, kernel_pml4) };
+    let (after, _) = memory::frame_stats();
+    assert_eq!(after, before, "heap map/unmap leaked {} frames", after as isize - before as isize);
+    serial_println!("[heap] self-test: region private, pages zeroed and writable, unmap balances ({} frames)", after);
+}
+
 /// Spawn the kernel tasks. `IDLE` and `CLOCK` are real kernel tasks, same
 /// as in the boot image; `pm`/`memory`/`driver` don't exist as real
 /// servers yet (see `rust/README.md`), so their process table slots run
@@ -501,6 +537,7 @@ fn idle_task() -> ! {
     fs_dir_check();
     ptr_safety_check();
     threads_check();
+    heap_check();
     proc_slot_pool_check();
     wait_without_children_check();
     runtime_reclaim_check();
@@ -1096,7 +1133,7 @@ fn fs_dir_check() {
 }
 
 /// Runs `/bin/ptrtest` (`rust/user/src/bin/ptrtest.rs`) and requires its
-/// verdict to be `ok`: nineteen system calls given deliberately bad
+/// verdict to be `ok`: twenty-one system calls given deliberately bad
 /// pointers -- the kernel heap (mapped in every address space), unmapped
 /// memory, the program's own read-only text as a write target -- each of
 /// which must come back as an error code. Before `crate::syscall` copied
@@ -1116,7 +1153,7 @@ fn ptr_safety_check() {
     let n = read_when_available("/ptrtest.out", &mut buf);
     let verdict = &buf[..n.max(0) as usize];
     serial_println!(
-        "[idle] /bin/ptrtest verdict: {:?} (19 syscalls handed bad pointers or process numbers, each must be refused)",
+        "[idle] /bin/ptrtest verdict: {:?} (21 syscalls handed bad pointers, process numbers or breaks, each must be refused)",
         core::str::from_utf8(verdict).unwrap_or("<invalid utf8>")
     );
     assert_eq!(verdict, b"ok", "a system call accepted a bad pointer -- see ptrtest's FAIL lines above");
@@ -1156,6 +1193,33 @@ fn threads_check() {
         after
     );
     assert!(after <= before, "the threads team leaked {} frames", after - before);
+}
+
+/// Runs `/bin/heaptest` (`rust/user/src/bin/heaptest.rs`) and requires its
+/// verdict to be `ok`: `Vec`/`String`/`Box` through `neumann_rt`'s
+/// allocator over `SYS_BRK`, the break moving within its range, a forked
+/// child's heap writes staying in the child, and three threads sharing
+/// the heap -- and, once it has exited, every frame its heap took back.
+fn heap_check() {
+    let before = memory::frame_stats().0;
+    let proc_nr = proc::alloc_proc_nr().expect("no free process slot for heaptest");
+    elf::spawn_from_fs("/bin/heaptest", proc_nr, "heaptest", 6, 16).expect("couldn't start /bin/heaptest");
+    let mut buf = [0u8; 8];
+    let n = read_when_available("/heaptest.out", &mut buf);
+    let verdict = &buf[..n.max(0) as usize];
+    serial_println!(
+        "[idle] /bin/heaptest verdict: {:?} (a 1.6 MB Vec, String, Box, a forked child, 3 threads, all on SYS_BRK)",
+        core::str::from_utf8(verdict).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(verdict, b"ok", "the heap test failed -- see its output above");
+    let deadline = proc::uptime_ticks() + 120;
+    while proc::is_valid_proc_nr(proc_nr) {
+        assert!(proc::uptime_ticks() < deadline, "heaptest never finished exiting");
+        proc::yield_now();
+    }
+    let after = memory::frame_stats().0;
+    serial_println!("[idle] heaptest's heap went back with it ({} frames in use before, {} after)", before, after);
+    assert!(after <= before, "heaptest leaked {} frames", after - before);
 }
 
 /// Exercises the two ends of the dynamic process-number pool

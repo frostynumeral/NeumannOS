@@ -239,7 +239,17 @@ pub struct Proc {
     /// Set by `sem_release` when it hands a unit of this semaphore
     /// straight to this waiter, until the waiter runs and takes it.
     sem_granted: Option<usize>,
+    /// The team's program break -- the end of its heap (`brk`). Only the
+    /// leader's is meaningful; the heap is the team's.
+    brk: u64,
 }
+
+/// Where every program's heap starts (`brk`): PML4 slot 112, clear of the
+/// kernel, the Rust programs (slot 96), the assembly ones (the 0x5555...,
+/// 0x6666... and 0x7777... slots) and the kernel heap (slot 136).
+pub const HEAP_BASE: u64 = 0x3800_0000_0000;
+/// Largest a heap may grow: 16 MiB.
+pub const HEAP_MAX: u64 = 16 * 1024 * 1024;
 
 fn never_spawned() -> ! {
     panic!("attempted to run a process table slot that was never spawned")
@@ -280,6 +290,7 @@ impl Proc {
             join_target: com::NONE,
             sem_wait: None,
             sem_granted: None,
+            brk: HEAP_BASE,
         }
     }
 
@@ -833,6 +844,7 @@ pub fn spawn(
         frame as u64
     };
 
+    let brk = HEAP_BASE;
     with_scheduler(|sched| {
         sched.generations[idx] = sched.generations[idx].wrapping_add(1);
         sched.procs[idx] = Proc {
@@ -863,6 +875,7 @@ pub fn spawn(
             join_target: com::NONE,
             sem_wait: None,
             sem_granted: None,
+            brk,
         };
         sched.enqueue(idx);
     });
@@ -916,7 +929,12 @@ pub fn release_proc_nr(proc_nr: i32) {
 /// out which pages it has to copy, in place of the per-caller hardcoded
 /// list `crate::syscall`'s `SYS_FORK` handler used to carry.
 pub fn mem_map_of(proc_nr: i32) -> MemMap {
-    with_scheduler(|sched| sched.procs[com::slot(proc_nr)].mem_map)
+    // The team's: a thread's own copy doesn't follow the heap growing.
+    with_scheduler(|sched| {
+        let team = sched.procs[com::slot(proc_nr)].team;
+        let owner = if team == com::NONE { com::slot(proc_nr) } else { com::slot(team) };
+        sched.procs[owner].mem_map
+    })
 }
 
 /// The scheduling parameters `proc_nr` is running with:
@@ -1100,6 +1118,13 @@ fn install_trapped(
     };
 
     with_scheduler(|sched| {
+        // A forked child inherits its parent's heap (the pages came with
+        // the address space); a thread's own field is never read.
+        let brk = if parent_proc_nr == com::NONE {
+            HEAP_BASE
+        } else {
+            sched.procs[com::slot(sched.procs[com::slot(parent_proc_nr)].team)].brk
+        };
         sched.generations[idx] = sched.generations[idx].wrapping_add(1);
         sched.procs[idx] = Proc {
             proc_nr: child_proc_nr,
@@ -1129,6 +1154,7 @@ fn install_trapped(
             join_target: com::NONE,
             sem_wait: None,
             sem_granted: None,
+            brk,
         };
         sched.enqueue(idx);
     });
@@ -1666,6 +1692,69 @@ pub fn thread_join(tid: i32) -> Result<i32, JoinError> {
     }
 }
 
+/// `brk()`: move the calling team's program break to `new_end`, mapping
+/// fresh zeroed pages as it grows and giving pages back as it shrinks;
+/// `0` just asks where it is. Returns the break afterwards, or `Err` if
+/// the request is outside `HEAP_BASE..=HEAP_BASE + HEAP_MAX` or memory
+/// ran out (the break is then unchanged). The heap is the team's: any
+/// thread may move it, and it lives in the team's memory map, so `fork`
+/// shares it copy-on-write like any other page. MINIX has the same call
+/// (`servers/pm/break.c`'s `do_brk`), growing a data segment rather than
+/// mapping pages.
+pub fn brk(new_end: u64) -> Result<u64, ()> {
+    let (leader, current, pml4) = with_scheduler(|sched| {
+        let me = sched.current;
+        let team = sched.procs[me].team;
+        let leader = if team == com::NONE { me } else { com::slot(team) };
+        (leader, sched.procs[leader].brk, sched.procs[me].cr3)
+    });
+    if new_end == 0 {
+        return Ok(current);
+    }
+    let pml4 = pml4.ok_or(())?;
+    if new_end < HEAP_BASE || new_end > HEAP_BASE + HEAP_MAX {
+        return Err(());
+    }
+    let pages = |end: u64| ((end - HEAP_BASE) + 4095) / 4096;
+    let (old_pages, new_pages) = (pages(current), pages(new_end));
+    let base = VirtAddr::new(HEAP_BASE);
+    // Room in the memory map is checked before anything is mapped: pages
+    // mapped but missing from the map would be skipped by a later fork,
+    // leaving the child faulting on its own heap.
+    let has_room = with_scheduler(|sched| sched.procs[leader].mem_map.can_set_segment(base));
+    if !has_room {
+        return Err(());
+    }
+    if new_pages > old_pages {
+        let from = base + old_pages * 4096;
+        if !crate::memory::map_zeroed(pml4, from, (new_pages - old_pages) as usize) {
+            return Err(());
+        }
+    } else if new_pages < old_pages {
+        let from = base + new_pages * 4096;
+        crate::memory::unmap_release(pml4, from, (old_pages - new_pages) as usize);
+    }
+    with_scheduler(|sched| {
+        sched.procs[leader].brk = new_end;
+        // Can't fail: `can_set_segment` said so above, and nothing
+        // between (this call runs with interrupts off) changed the map.
+        sched.procs[leader].mem_map.set_segment(base, new_pages as usize)
+    });
+    Ok(new_end)
+}
+
+/// Give `child` the same program break as `parent`'s team -- for
+/// `crate::calls::sys_fork`, whose child is built with `spawn` (which
+/// starts every process with an empty heap) but whose address space
+/// carries a copy of the parent's heap pages and heap segment.
+pub fn inherit_brk(child: i32, parent: i32) {
+    with_scheduler(|sched| {
+        let team = sched.procs[com::slot(parent)].team;
+        let brk = sched.procs[com::slot(team)].brk;
+        sched.procs[com::slot(child)].brk = brk;
+    });
+}
+
 /// Create a semaphore with `count` units, owned by the caller's team.
 /// `None` if the table is full.
 pub fn sem_create(count: i32) -> Option<usize> {
@@ -1842,6 +1931,8 @@ pub fn set_address_space(proc_nr: i32, address_space: AddressSpace) {
         // would have a later `fork` of this process copy pages that no
         // longer exist.
         sched.procs[idx].mem_map = address_space.map;
+        // A new image starts with an empty heap.
+        sched.procs[idx].brk = HEAP_BASE;
         (previous, (sched.current == idx).then_some(sched.kernel_cr3.1), sched.kernel_cr3.0)
     });
     if let Some(flags) = load_now {

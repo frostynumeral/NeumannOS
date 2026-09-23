@@ -357,7 +357,7 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   CPU didn't already save, calls `dispatch` with the caller's original
   `rax`/`rdi`/`rsi`/`rdx`/`rcx`, writes the `u64` result back into the
   saved `rax` slot, restores everything else unchanged, and `iretq`s.
-  `dispatch` implements twenty-six calls (the newest -- `SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`, `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR`, and the thread and semaphore calls 20-26 -- are described under "Ring-3 programs in Rust" and "Threads, teams and semaphores" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  `dispatch` implements twenty-seven calls (the newest -- `SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`, `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR`, the thread and semaphore calls 20-26, and `SYS_BRK` (27) -- are described under "Ring-3 programs in Rust" and "Threads, teams and semaphores" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
@@ -635,8 +635,8 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   again about what `validate` guarantees costs a ring-3 caller its
   `exec` instead of costing the machine its kernel. And
   `elf::validator_self_test` (run from `kernel_main`) feeds the loader
-  eleven hostile images -- a segment on the kernel heap, one on the
-  kernel image, two segments sharing a page, one over the stack page,
+  twelve hostile images -- a segment on the kernel heap, one on the
+  kernel image, one where the heap grows, two segments sharing a page, one over the stack page,
   4 GiB of BSS from a 120-byte file, one past the canonical boundary, a
   truncated program header table, an image with no `PT_LOAD` at all, a
   shell script, a 32-bit ELF, and a file too short to hold a header --
@@ -1009,9 +1009,9 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Twenty-six calls exist** (`SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`,
+- **Twenty-seven calls exist** (`SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`,
   `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR`, and the thread and
-  semaphore calls `SYS_THREAD_SPAWN`..`SYS_SEM_RELEASE` are the newest --
+  semaphore calls `SYS_THREAD_SPAWN`..`SYS_SEM_RELEASE` and `SYS_BRK` are the newest --
   see the `rust/user/` and threads sections above), and all but the unrecognized-call-number
   fallback reach real server/kernel-call logic, including `SYS_FORK`
   from any ring-3 caller now (see the `src/syscall.rs`/`src/proc.rs`
@@ -1057,7 +1057,7 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   `SYS_WRITE_LINE`, or write it through `SYS_FS_READ`; `SYS_VIRCOPY`
   could name a kernel task as its source (reading kernel memory) or the
   heap as its destination. `/bin/ptrtest` (run at boot by
-  `crate::main`'s `ptr_safety_check`) holds nineteen such calls to
+  `crate::main`'s `ptr_safety_check`) holds twenty-one such calls to
   refusing. What's still coarse: the copies go through one bounded
   kernel-stack buffer per call (256 bytes), and a write checked before a
   call blocks could in principle find the page gone afterwards (nothing
@@ -1323,6 +1323,57 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   in the child and unmapped in the parent, and `shell`'s own marker page
   is the reverse -- so "exec reached the right process" is checked, not
   assumed.
+
+### The user heap: `SYS_BRK` and a global allocator
+
+Programs have a heap now. `SYS_BRK` (`proc::brk`, MINIX's own `brk`
+from `servers/pm/break.c`, done with pages rather than a growing data
+segment) moves a team's program break within
+`proc::HEAP_BASE..=HEAP_BASE + HEAP_MAX` (PML4 slot 112, clear of
+everything else; 16 MiB), mapping fresh zeroed, writable, non-executable
+pages as it grows (`memory::map_zeroed`, all or nothing) and giving them
+back as it shrinks (`memory::unmap_release`, which drops a
+copy-on-write share rather than freeing a frame someone else still
+maps). The heap is a segment of the team's memory map (`MemMap::
+set_segment`; `MAX_SEGMENTS` grew to 18 for it), so `fork` shares it
+copy-on-write like everything else and a forked child inherits the
+break; `exec` starts a fresh image with an empty heap; any thread may
+move it, since it's the team's (`mem_map_of` now answers with the
+team leader's map).
+
+`neumann_rt::heap` is a `#[global_allocator]` over it: a linked-list
+heap (`linked_list_allocator`, behind a spin lock the team's threads
+share) that grows the break by at least 64 KiB whenever an allocation
+doesn't fit, and never shrinks it. So ring-3 programs can use `alloc`'s
+`Vec`, `String` and `Box`. `/bin/heaptest` checks a 1.6 MB `Vec`, a
+`String` and a `Box`, the break moving within range, a forked child's
+heap writes staying in the child, and three threads allocating at once;
+`crate::main`'s `heap_check` requires its `ok` and every frame back once
+it exits, and `heap_self_test` checks at boot that the whole heap range
+is private and that pages map zeroed and unmap without leaking.
+`ptrtest` adds `brk` below the heap and past its limit to its refusals.
+
+Building it turned up a linker-script gap: with no `.data`, `.bss`
+started mid-page right after `.rodata`, in a page the loader had already
+given the read-only segment, and the loader (correctly) rejected the
+image; `link.ld` page-aligns `.bss` now. And the page-fault handler logs
+only the first 16 copy-on-write faults: a forked child rewriting a
+megabyte-sized heap takes hundreds, and at serial speed their log lines
+cost seconds.
+
+A review of it found three things, fixed: `neumann_rt::sys::fork` now
+holds the heap's lock across the call (`pthread_atfork`-style), since a
+fork while another thread held it gave the child a copy of a *locked*
+heap nobody would ever unlock; `brk` checks the memory map has room for
+the heap segment *before* mapping pages, rather than asserting after;
+and the ELF loader rejects a segment in the heap's range
+(`ElfError::SegmentInHeap`, a twelfth `validator_self_test` case), which
+would otherwise have left the program unable to grow its heap.
+
+Known gaps: no `mmap` (one contiguous heap per team, no separate
+anonymous or file mappings), no guard page between heap and anything
+above it (nothing is there), the allocator never returns memory to
+the kernel, and its lock spins rather than blocking.
 
 ### Threads, teams and semaphores
 
@@ -1713,9 +1764,11 @@ Roughly in the order the original kernel needs them:
 12. **A libc-equivalent** for whatever runs in user mode, mirroring `lib/`
     -- started: `rust/user/`'s `neumann_rt` (entry point and `argv`/`envp`,
     a wrapper per system call, formatted console output, a panic
-    handler), and the first programs written on it, an interactive shell
-    among them (see "Ring-3 programs in Rust" above). Missing: a heap,
-    and everything a heap would enable.
+    handler, threads and semaphores, and a global allocator over
+    `SYS_BRK`), and the programs written on it, an interactive shell
+    among them (see "Ring-3 programs in Rust" and "The user heap" above).
+    Missing: most of what a libc has beyond that -- `mmap`, formatted
+    input, a real `errno`, file-descriptor-level I/O abstractions.
 13. ~~**Real graphics output**~~ — started (`src/vga.rs`): VGA mode 13h
     (320x200, 256-color), a real palette (VGA DAC ports) and a real
     linear framebuffer, `fill_rect`/`fill_rounded_rect` drawing
@@ -1760,7 +1813,7 @@ Roughly in the order the original kernel needs them:
     gate saves every general-purpose register, reads the caller's `rax`
     (call number) and `rdi`/`rsi`/`rdx`/`rcx` (up to four arguments, since
     grown from three -- see the `src/syscall.rs` bullet above),
-    dispatches to one of twenty-six calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    dispatches to one of twenty-seven calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
     -- a real cross-ring pointer argument, read directly since entering a
     trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
     the first of `crate::calls`' own kernel calls reachable from ring 3,
@@ -1807,7 +1860,7 @@ Roughly in the order the original kernel needs them:
     child's canary write (proving its memory is a real, independent copy)
     and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
     `IDLE`. See "known simplifications in the syscall ABI" above for what's
-    not a real syscall surface yet (twenty-six calls, one code per *kind* of
+    not a real syscall surface yet (twenty-seven calls, one code per *kind* of
     dispatch-level mistake rather than a real per-cause `errno` set).
     `SYS_FORK` is no longer restricted to one known caller with one
     reserved child slot: the pages to copy come out of the caller's own

@@ -103,6 +103,8 @@ pub fn sys_fork(
     match fork_child_address_space(src_proc) {
         Some(space) => {
             proc::spawn(child_proc_nr, name, entry, priority, quantum, preemptible, Some(space));
+            // The copied address space includes the parent's heap.
+            proc::inherit_brk(child_proc_nr, src_proc);
             true
         }
         None => false,

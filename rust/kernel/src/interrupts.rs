@@ -147,12 +147,23 @@ extern "x86-interrupt" fn page_fault_handler(
         if let Ok(addr) = x86_64::registers::control::Cr2::read() {
             let (pml4, _) = x86_64::registers::control::Cr3::read();
             if let Some(how) = crate::memory::resolve_cow_fault(pml4, addr) {
-                crate::serial_println!(
-                    "[cow] write fault at {:#x} from ring {} -> {:?}",
-                    addr.as_u64(),
-                    frame.code_segment.rpl() as u8,
-                    how
-                );
+                // Logged for the first few only: a program writing a
+                // large forked heap takes one per page, and at serial
+                // speed hundreds of lines cost seconds.
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static LOGGED: AtomicU32 = AtomicU32::new(0);
+                const LOG_LIMIT: u32 = 16;
+                let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+                if n < LOG_LIMIT {
+                    crate::serial_println!(
+                        "[cow] write fault at {:#x} from ring {} -> {:?}",
+                        addr.as_u64(),
+                        frame.code_segment.rpl() as u8,
+                        how
+                    );
+                } else if n == LOG_LIMIT {
+                    crate::serial_println!("[cow] (further copy-on-write faults are resolved without a log line)");
+                }
                 return;
             }
         }

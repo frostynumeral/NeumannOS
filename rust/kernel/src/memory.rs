@@ -494,12 +494,12 @@ pub struct Segment {
     pub pages: usize,
 }
 
-/// How many segments one `MemMap` holds. Has to be at least one more
+/// How many segments one `MemMap` holds. Has to be at least two more
 /// than the number of `PT_LOAD` segments `crate::elf` will load (it adds
-/// a stack segment of its own on top); `crate::elf` asserts exactly that
-/// at compile time, so an image that passes `elf::validate` can never
-/// overflow a map.
-pub const MAX_SEGMENTS: usize = 17;
+/// a stack segment of its own on top, and `crate::proc::brk` a heap);
+/// `crate::elf` asserts exactly that at compile time, so an image that
+/// passes `elf::validate` can never overflow a map.
+pub const MAX_SEGMENTS: usize = 18;
 
 /// Which pages a process's address space holds that are *its own* --
 /// everything `fork()` has to duplicate and `exec()` throws away, as
@@ -542,6 +542,25 @@ impl MemMap {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Whether `set_segment(base, ..)` would succeed.
+    pub fn can_set_segment(&self, base: VirtAddr) -> bool {
+        self.len < MAX_SEGMENTS || self.segments[..self.len].iter().any(|s| s.base == base)
+    }
+
+    /// Set the segment starting at `base` to `pages` pages, adding it if
+    /// there isn't one -- how the heap segment grows and shrinks
+    /// (`crate::proc::brk`). `false` if it would have to be added and the
+    /// map is full.
+    pub fn set_segment(&mut self, base: VirtAddr, pages: usize) -> bool {
+        match self.segments[..self.len].iter_mut().find(|s| s.base == base) {
+            Some(seg) => {
+                seg.pages = pages;
+                true
+            }
+            None => self.push(base, pages),
+        }
     }
 
     pub fn segments(&self) -> &[Segment] {
@@ -715,6 +734,75 @@ fn share_pages_into(
         share_frame(frame);
     }
     Ok(())
+}
+
+/// Map `count` fresh, zeroed, user-writable, non-executable pages at
+/// `start` in the address space rooted at `pml4` -- the heap growing
+/// (`crate::proc::brk`). All or nothing: if a frame or page table can't
+/// be had part-way, what was mapped is unmapped again and `false` comes
+/// back. The range must lie in PML4 slots the kernel leaves empty
+/// (checked here, not assumed).
+pub fn map_zeroed(pml4: PhysFrame, start: VirtAddr, count: usize) -> bool {
+    if count == 0 {
+        return true;
+    }
+    let end = start + (count as u64 * PAGE_SIZE - 1);
+    if !pml4_slots_unused(kernel_pml4(), start, end) {
+        return false;
+    }
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::WRITABLE
+        | PageTableFlags::USER_ACCESSIBLE
+        | PageTableFlags::NO_EXECUTE;
+    let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    // Safety: a live address space; single CPU, and callers run with
+    // interrupts off (a system call), so nothing else edits it meanwhile.
+    let mut table = unsafe { page_table_for(pml4) };
+    for i in 0..count {
+        let page = Page::<Size4KiB>::containing_address(start + i as u64 * PAGE_SIZE);
+        let mapped = GlobalFrameAllocator.allocate_frame().is_some_and(|frame| {
+            // Safety: `page` is unmapped (the heap only grows into pages
+            // past its current end) and `frame` is fresh.
+            let ok = unsafe {
+                table
+                    .map_to_with_table_flags(page, frame, flags, table_flags, &mut GlobalFrameAllocator)
+                    .map(|f| f.ignore())
+                    .is_ok()
+            };
+            if !ok {
+                unsafe { deallocate_frame(frame) };
+            }
+            ok
+        });
+        if !mapped {
+            unmap_release(pml4, start, i);
+            return false;
+        }
+    }
+    true
+}
+
+/// Unmap `count` pages at `start` in the address space rooted at `pml4`
+/// and drop this address space's hold on each frame (`release_frame`: a
+/// page still shared copy-on-write with a forked relative stays theirs).
+/// The heap shrinking, and `map_zeroed`'s undo. Pages that aren't mapped
+/// are skipped. Page-table frames that end up empty are kept -- they're
+/// freed with the address space.
+pub fn unmap_release(pml4: PhysFrame, start: VirtAddr, count: usize) {
+    // Safety: see `map_zeroed`.
+    let mut table = unsafe { page_table_for(pml4) };
+    let active = Cr3::read().0 == pml4;
+    for i in 0..count {
+        let page = Page::<Size4KiB>::containing_address(start + i as u64 * PAGE_SIZE);
+        if let Ok((frame, flush)) = table.unmap(page) {
+            flush.ignore();
+            if active {
+                tlb::flush(page.start_address());
+            }
+            // Safety: just unmapped from this address space.
+            unsafe { release_frame(frame) };
+        }
+    }
 }
 
 /// Give back every frame that belongs to the address space rooted at

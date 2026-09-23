@@ -32,7 +32,7 @@ const SH_PROC_NR: u64 = 12;
 fn main(_args: Args) -> i32 {
     let fd = sys::open(b"/ptrtest.tmp").unwrap_or(-1);
     let mut status_word = 0i32;
-    let cases: [(&str, i64, i64); 19] = unsafe {
+    let cases: [(&str, i64, i64); 21] = unsafe {
         [
             ("SYS_WRITE_LINE from the kernel heap", syscall4(sys::SYS_WRITE_LINE, KERNEL_HEAP, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
             ("SYS_WRITE_LINE from unmapped memory", syscall4(sys::SYS_WRITE_LINE, UNMAPPED, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
@@ -47,6 +47,10 @@ fn main(_args: Args) -> i32 {
             ("SYS_WAIT writing its status into read-only text", syscall4(sys::SYS_WAIT, OWN_TEXT, 0, 0, 0), sys::ERR_BAD_ARG_PTR),
             ("SYS_FS_READDIR writing its entry into read-only text", syscall4(sys::SYS_FS_READDIR, b"/".as_ptr() as u64, 1, 0, OWN_TEXT), sys::ERR_BAD_ARG_PTR),
             ("SYS_FS_MKDIR of a path on the kernel heap", syscall4(sys::SYS_FS_MKDIR, KERNEL_HEAP, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
+            // The break can't be moved outside the heap's own range --
+            // below it would unmap the program, above it past the limit.
+            ("SYS_BRK below the heap", syscall4(sys::SYS_BRK, 0x3000_0000_0000, 0, 0, 0), sys::ERR_BRK_FAILED),
+            ("SYS_BRK past the heap's limit", syscall4(sys::SYS_BRK, 0x3800_0000_0000 + (32 << 20), 0, 0, 0), sys::ERR_BRK_FAILED),
             ("SYS_EXEC of a path on the kernel heap", syscall4(sys::SYS_EXEC, KERNEL_HEAP, 8, 0, 0), sys::ERR_BAD_ARG_PTR),
             // src_proc -4 is IDLE, a kernel task: its address space is the kernel's.
             ("SYS_VIRCOPY out of the kernel heap", syscall4(sys::SYS_VIRCOPY, (-4i64) as u64, KERNEL_HEAP, &mut status_word as *mut i32 as u64, 4), ERR_VIRCOPY_FAILED),

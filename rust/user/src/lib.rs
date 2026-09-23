@@ -20,14 +20,16 @@
 //! - A panic handler that reports the panic and exits with status 101,
 //!   Rust's own convention for "panicked".
 //!
-//! There is deliberately no allocator: nothing here needs a heap yet, and
-//! a program that did would need a `brk`/`mmap`-style system call this
-//! port doesn't have.
+//! - A global allocator (`heap`) over `SYS_BRK`, so programs can use
+//!   `alloc`'s `Vec`, `String`, `Box` and friends.
 
 #![no_std]
 
+extern crate alloc;
+
 use core::fmt;
 
+pub mod heap;
 pub mod sys;
 pub mod thread;
 

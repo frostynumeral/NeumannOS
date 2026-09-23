@@ -47,7 +47,7 @@ pub static ECHO_ELF: &[u8] = include_bytes!("../user/echo.elf");
 /// here by its `install.sh`), and where `crate::main`'s `seed_bin`
 /// installs each one in `fs`. Unlike the assembly programs above, these
 /// are meant to be *used*: `sh` runs the others by path, out of `/bin`.
-pub static RUST_PROGRAMS: [(&str, &[u8]); 7] = [
+pub static RUST_PROGRAMS: [(&str, &[u8]); 8] = [
     ("/bin/sh", include_bytes!("../user/bin/sh")),
     ("/bin/echo", include_bytes!("../user/bin/echo")),
     ("/bin/cat", include_bytes!("../user/bin/cat")),
@@ -55,6 +55,7 @@ pub static RUST_PROGRAMS: [(&str, &[u8]); 7] = [
     ("/bin/ls", include_bytes!("../user/bin/ls")),
     ("/bin/mkdir", include_bytes!("../user/bin/mkdir")),
     ("/bin/threads", include_bytes!("../user/bin/threads")),
+    ("/bin/heaptest", include_bytes!("../user/bin/heaptest")),
 ];
 
 /// `sh` itself, which also starts at boot (`com::SH_PROC_NR`), the way
@@ -258,7 +259,7 @@ pub struct LoadedImage {
 /// parent. Checked here, at compile time, rather than as a runtime
 /// error `load_image` would have to report and a self-test would have to
 /// cover.
-const _: () = assert!(MAX_LOAD_SEGMENTS + 1 <= memory::MAX_SEGMENTS);
+const _: () = assert!(MAX_LOAD_SEGMENTS + 2 <= memory::MAX_SEGMENTS);
 
 /// Why an image was rejected. Every variant is a check `load` used to
 /// make with `assert!` (or not at all): fine when the only images in the
@@ -299,6 +300,9 @@ pub enum ElfError {
     /// (`STACK_ADDR`), which would leave the image's own contents and its
     /// stack fighting over the same frame.
     SegmentOverlapsStack,
+    /// A segment lands in the range the program's heap grows into
+    /// (`crate::proc::HEAP_BASE`, `HEAP_MAX`).
+    SegmentInHeap,
     /// Two `PT_LOAD` segments want pages that overlap. Not just a broken
     /// program: the second `map_to` of the same page fails, and this
     /// loader has no way to merge them.
@@ -558,6 +562,12 @@ fn validate(image: &[u8], header: &Elf64Header, base_pml4: PhysFrame) -> Result<
             VirtAddr::new(mem_end - 1),
         ) {
             return Err(ElfError::SegmentInSharedSlot);
+        }
+        // Nor where the heap grows (`crate::proc::brk`): the program's
+        // own break would run into its own segment.
+        let heap_end = crate::proc::HEAP_BASE + crate::proc::HEAP_MAX;
+        if ph.p_vaddr < heap_end && mem_end > crate::proc::HEAP_BASE {
+            return Err(ElfError::SegmentInHeap);
         }
 
         let first_page = ph.p_vaddr / PAGE_SIZE;
@@ -875,7 +885,12 @@ pub fn validator_self_test() {
     let mut wrong_class = synthetic_image(user_slot, &[(user_slot, PAGE_SIZE)]);
     wrong_class[4] = 1; // ELFCLASS32
 
-    let cases: [(&str, Vec<u8>, ElfError); 11] = [
+    let cases: [(&str, Vec<u8>, ElfError); 12] = [
+        (
+            "a segment where the heap grows",
+            synthetic_image(user_slot, &[(crate::proc::HEAP_BASE + 0x10_0000, PAGE_SIZE)]),
+            ElfError::SegmentInHeap,
+        ),
         (
             "a segment on top of the kernel heap",
             synthetic_image(user_slot, &[(crate::allocator::HEAP_START as u64, PAGE_SIZE)]),

@@ -28,7 +28,10 @@ SECTIONS
         *(.data .data.* .ldata .ldata.*)
     }
 
-    .bss : {
+    /* Aligned too: with no .data, .bss would otherwise start mid-page
+     * right after .rodata, in a page the loader has already given the
+     * read-only segment -- and it rejects two segments sharing a page. */
+    .bss : ALIGN(4096) {
         *(.bss .bss.* .lbss .lbss.*)
         *(COMMON)
     }

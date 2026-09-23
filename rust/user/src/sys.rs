@@ -32,6 +32,7 @@ pub const SYS_SEM_CREATE: u64 = 23;
 pub const SYS_SEM_DELETE: u64 = 24;
 pub const SYS_SEM_ACQUIRE: u64 = 25;
 pub const SYS_SEM_RELEASE: u64 = 26;
+pub const SYS_BRK: u64 = 27;
 
 /// Most bytes the kernel moves in one `SYS_FS_*`/`SYS_CONSOLE_WRITE`
 /// call (its `MAX_FS_BUF`/`MAX_LINE_LEN`); the wrappers below loop over
@@ -58,6 +59,7 @@ pub const ERR_MULTITHREADED: i64 = -14;
 pub const ERR_NOT_A_THREAD: i64 = -15;
 pub const ERR_BAD_SEM: i64 = -16;
 pub const ERR_NO_FREE_SEM: i64 = -18;
+pub const ERR_BRK_FAILED: i64 = -19;
 pub const EEXIST: i64 = -17;
 pub const ENOTDIR: i64 = -20;
 pub const EISDIR: i64 = -21;
@@ -208,7 +210,16 @@ pub fn read_line(buf: &mut [u8]) -> usize {
 
 /// `fork()`: `Ok(0)` in the child, `Ok(child's process number)` in the
 /// parent.
+///
+/// The heap's lock is held across the call, the way `pthread_atfork`
+/// handlers do it: the child's copy of memory is taken while no other
+/// thread can be in the middle of an allocation. Without that, a thread
+/// preempted holding the lock would leave the child a copy of a *locked*
+/// heap with nobody to unlock it, and its first allocation would spin
+/// forever. The guard is dropped in both parent and child afterwards,
+/// each unlocking its own copy.
 pub fn fork() -> Result<i64, i64> {
+    let _heap = crate::heap::lock_for_fork();
     result(unsafe { syscall4(SYS_FORK, 0, 0, 0, 0) })
 }
 
@@ -264,6 +275,13 @@ pub fn thread_join(tid: i64) -> Result<i32, i64> {
     Ok(status)
 }
 
+/// Move the program break (the end of the heap) to `end`; `brk(0)` asks
+/// where it is. The break afterwards. Use the global allocator (`Vec`,
+/// `Box`, ...) rather than this directly: it owns the heap.
+pub fn brk(end: u64) -> Result<u64, i64> {
+    result(unsafe { syscall4(SYS_BRK, end, 0, 0, 0) }).map(|b| b as u64)
+}
+
 pub fn sem_create(count: i32) -> Result<i64, i64> {
     result(unsafe { syscall4(SYS_SEM_CREATE, count as u32 as u64, 0, 0, 0) })
 }
@@ -296,6 +314,7 @@ pub fn strerror(code: i64) -> &'static str {
         ERR_NOT_A_THREAD => "no such thread",
         ERR_BAD_SEM => "no such semaphore",
         ERR_NO_FREE_SEM => "out of semaphores",
+        ERR_BRK_FAILED => "out of memory",
         _ => "error",
     }
 }

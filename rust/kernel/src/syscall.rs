@@ -149,6 +149,9 @@ pub const SYS_SEM_DELETE: u64 = 24;
 pub const SYS_SEM_ACQUIRE: u64 = 25;
 /// Give a unit of semaphore `rdi` back.
 pub const SYS_SEM_RELEASE: u64 = 26;
+/// Move the program break to `rdi` (`0`: just report it); returns the
+/// break afterwards. What a heap allocator grows its heap with.
+pub const SYS_BRK: u64 = 27;
 
 /// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
 /// a sanity bound on an untrusted `len` from ring 3 -- matches the size
@@ -242,6 +245,9 @@ pub const ERR_MULTITHREADED: u64 = (-14i64) as u64;
 pub const ERR_NOT_A_THREAD: u64 = (-15i64) as u64;
 /// A semaphore call naming no semaphore (or one deleted while waiting).
 pub const ERR_BAD_SEM: u64 = (-16i64) as u64;
+/// `SYS_BRK` outside the heap's range, or out of memory; the break is
+/// unchanged.
+pub const ERR_BRK_FAILED: u64 = (-19i64) as u64;
 /// `SYS_SEM_CREATE` with the semaphore table full. (-18, not -17: that's
 /// `fs`'s `EEXIST`, and the two ranges share `rax`.)
 pub const ERR_NO_FREE_SEM: u64 = (-18i64) as u64;
@@ -578,6 +584,10 @@ fn dispatch_call(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, fram
                 Err(proc::JoinError::NotAThread) => ERR_NOT_A_THREAD,
             }
         }
+        SYS_BRK => match proc::brk(arg1) {
+            Ok(end) => end,
+            Err(()) => ERR_BRK_FAILED,
+        },
         SYS_SEM_CREATE => match proc::sem_create(arg1 as i32) {
             Some(id) => id as u64,
             None => ERR_NO_FREE_SEM,
