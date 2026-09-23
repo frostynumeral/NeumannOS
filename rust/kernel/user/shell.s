@@ -76,6 +76,18 @@
 # makes the zombie path *likely*, not load-bearing. Each wait's
 # (proc_nr, status) pair goes to its own file for exec_verify to check.
 #
+# The child's exec passes a real argument and environment vector, the
+# way a shell turns a typed command line into one: argv is
+# {"/bin/echo", "hello", "from", "argv"} and envp is {"GREETING=neumann"},
+# both C-style NULL-terminated arrays of NUL-terminated strings, in rdx
+# and rcx (crate::syscall's SYS_EXEC copies them out of this image before
+# discarding it, and crate::elf lays them out on the new image's stack).
+# /bin/echo prints its arguments back and writes them, and its first
+# environment string, to files crate::main's exec_verify checks. The
+# failed exec of /not_a_program passes rdx = rcx = 0 -- no vectors -- and
+# has to say so explicitly: whatever those registers held from the
+# previous syscall would otherwise be read as a pointer.
+#
 # The child's exec call sits in a bounded retry loop rather than being a
 # straight-line call, and that is deliberate. /bin/echo has to be in
 # `fs` before it can be exec'd, and it gets there at runtime (crate::main's
@@ -138,6 +150,8 @@ _start:
     # out of the .data of the program that called exec.
     lea not_elf_path(%rip), %rdi
     mov $not_elf_path_len, %esi
+    xor %edx, %edx      # argv = NULL
+    xor %ecx, %ecx      # envp = NULL
     mov $12, %eax       # SYS_EXEC (crate::syscall::SYS_EXEC)
     int $0x80
     mov %rax, exec_error(%rip)
@@ -266,12 +280,16 @@ write_pair:
     # --- child path: replace this inherited image with /bin/echo ---
     mov $ATTEMPTS, %r12d
 3:
-    # SYS_EXEC (rdi=path ptr, rsi=path len). On success this never
-    # returns *here*: the same iretq that would have resumed the next
-    # instruction below instead lands at the new image's own entry point,
-    # on the new image's own stack. Only a failure comes back.
+    # SYS_EXEC (rdi=path ptr, rsi=path len, rdx=argv, rcx=envp). On
+    # success this never returns *here*: the same iretq that would have
+    # resumed the next instruction below instead lands at the new image's
+    # own entry point, on the new image's own stack. Only a failure comes
+    # back. rdx/rcx are reloaded every attempt: SYS_SET_ALARM below
+    # doesn't touch them, but nothing should depend on that.
     lea prog(%rip), %rdi
     mov $prog_len, %esi
+    lea echo_argv(%rip), %rdx
+    lea echo_envp(%rip), %rcx
     mov $12, %eax       # SYS_EXEC (crate::syscall::SYS_EXEC)
     int $0x80
 
@@ -345,3 +363,21 @@ wait_status:
 prog:
     .ascii "/bin/echo"
 prog_len = . - prog
+# The vectors /bin/echo is exec'd with. Absolute addresses (.quad) are
+# fine: this is a static, non-PIE link, and they're only ever read
+# through the kernel's copy-in, which takes user addresses.
+    .align 8
+echo_argv:
+    .quad echo_arg0, echo_arg1, echo_arg2, echo_arg3, 0
+echo_envp:
+    .quad echo_env0, 0
+echo_arg0:
+    .asciz "/bin/echo"
+echo_arg1:
+    .asciz "hello"
+echo_arg2:
+    .asciz "from"
+echo_arg3:
+    .asciz "argv"
+echo_env0:
+    .asciz "GREETING=neumann"

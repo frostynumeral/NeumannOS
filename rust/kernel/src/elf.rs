@@ -101,6 +101,18 @@ pub const SHELL_MARKER_ADDR: u64 = 0x_5555_5558_0000;
 /// all.
 pub const ECHO_COUNTER_ADDR: u64 = 0x_6666_6667_0000;
 
+/// Where `user/echo.s`'s `entry_rsp` lives (`ECHO_COUNTER_ADDR + 8`, read
+/// off the built `echo.elf` with `nm`): the `rsp` the exec'd image found
+/// on its first instruction, which is the address of the `argc` word
+/// `write_initial_stack` put there. `crate::main`'s `exec_verify` reads
+/// it, then walks the start-up block at that address in the child's own
+/// memory.
+pub const ECHO_ENTRY_RSP_ADDR: u64 = 0x_6666_6667_0008;
+
+/// Where `user/echo.s`'s `argc_seen` lives (`ECHO_COUNTER_ADDR + 16`):
+/// the `argc` the exec'd image itself read off its stack.
+pub const ECHO_ARGC_ADDR: u64 = 0x_6666_6667_0010;
+
 /// One past the last canonical lower-half address. A segment above this
 /// is rejected outright -- but note this is only a *canonicality* bound,
 /// not a user/kernel boundary. This port has no such boundary: the
@@ -185,7 +197,11 @@ static ELF_TASK_PARAMS: Mutex<[(u64, u64); com::NR_PROC_SLOTS]> =
 pub struct LoadedImage {
     pub pml4: PhysFrame,
     pub entry: u64,
-    pub stack_top: u64,
+    /// The image's initial `rsp`: not the top of its stack page any more,
+    /// but the address of `argc` in the System V start-up block
+    /// `write_initial_stack` builds there (see `StartArgs`). Always
+    /// 16-byte aligned, as the ABI requires of `rsp` on entry to `_start`.
+    pub stack_pointer: u64,
     /// Which pages this image's segments and stack occupy, for the
     /// process table to carry (`crate::proc::AddressSpace`) so that a
     /// later `fork` of whoever runs it knows what to copy. Built here
@@ -255,12 +271,139 @@ pub enum ElfError {
     /// so this bound is what stops a tiny file from draining the frame
     /// allocator.
     ImageTooLarge,
+    /// `argv`/`envp` (strings, their terminating NULs and the pointer
+    /// vectors pointing at them) wouldn't fit in `MAX_START_ARGS_BYTES`.
+    /// Checked before anything is allocated, like every other rejection
+    /// here. POSIX's name for it is `E2BIG`.
+    ArgsTooLarge,
     /// Mapping a page failed even though validation passed -- the frame
     /// allocator is empty, or the page turned out to be mapped already.
     /// Should be unreachable after `validate`; it exists so that being
     /// wrong about that returns an error to the caller instead of
     /// panicking the kernel.
     MappingFailed,
+}
+
+/// What a freshly started image finds on its stack: the argument and
+/// environment vectors a real `execve` hands a program's `_start`. Each
+/// string is given *without* its terminating NUL -- `write_initial_stack`
+/// adds one -- and must not contain one either, since a C-style reader
+/// would stop there (`crate::syscall`'s copy-in can't produce one: it
+/// stops *at* the NUL).
+///
+/// `EMPTY` is what the images this port starts at boot get: `argc == 0`
+/// and empty vectors, still laid out in full, so a program's `_start`
+/// can read `argc` unconditionally whoever started it.
+#[derive(Clone, Copy)]
+pub struct StartArgs<'a> {
+    pub argv: &'a [&'a [u8]],
+    pub envp: &'a [&'a [u8]],
+}
+
+impl StartArgs<'_> {
+    pub const EMPTY: StartArgs<'static> = StartArgs { argv: &[], envp: &[] };
+
+    /// Bytes the start-up block occupies at the top of the stack page,
+    /// before alignment padding: the strings (plus NULs), then `argc`,
+    /// `argv[]` and `envp[]` (each NULL-terminated), then an auxiliary
+    /// vector holding only its `AT_NULL` terminator (two words). `None`
+    /// on overflow, which a caller treats the same as too large.
+    fn block_size(&self) -> Option<usize> {
+        let strings = self
+            .argv
+            .iter()
+            .chain(self.envp.iter())
+            .try_fold(0usize, |acc, s| acc.checked_add(s.len())?.checked_add(1))?;
+        let words = 1usize
+            .checked_add(self.argv.len())?
+            .checked_add(1)?
+            .checked_add(self.envp.len())?
+            .checked_add(1)?
+            .checked_add(2)?;
+        strings.checked_add(words.checked_mul(8)?)
+    }
+}
+
+/// Most of the one stack page (`STACK_ADDR`) the start-up block may
+/// take. Half: whatever the arguments don't use is all the stack the
+/// program has, and a program handed a page of arguments and no stack
+/// would fault on its first `call`. Real systems call this `ARG_MAX`
+/// (MINIX 3.1's is `ARG_MAX` in `include/limits.h`, 16 KiB, bounded the
+/// same way by `servers/pm/exec.c`'s fixed-size `mbuf`).
+pub const MAX_START_ARGS_BYTES: usize = (PAGE_SIZE as usize) / 2;
+
+/// Lay out `args` at the top of the stack page whose kernel-visible
+/// (physical-memory-window) address is `page`, as the System V x86-64
+/// ABI's process start-up convention has it, and return the new image's
+/// initial `rsp` -- the counterpart of what `servers/pm/exec.c`'s
+/// `do_exec` builds in `mbuf` and `patch_ptr`s before copying it to the
+/// top of the new stack. From `rsp` upward:
+///
+/// ```text
+///   argc
+///   argv[0] .. argv[argc-1], NULL
+///   envp[0] .. envp[envc-1], NULL
+///   AT_NULL, 0                 (an empty auxiliary vector)
+///   (padding)
+///   argv strings, envp strings, each NUL-terminated
+/// ```
+///
+/// Every pointer is a *user* address (inside the page at `STACK_ADDR`),
+/// computed rather than copied, because the page is being written
+/// through a kernel mapping that the program will never see.
+/// `rsp % 16 == 0`, the ABI's requirement at `_start`.
+///
+/// The caller has already checked `args.block_size()` against
+/// `MAX_START_ARGS_BYTES`, so everything here fits.
+fn write_initial_stack(page: *mut u8, args: &StartArgs) -> u64 {
+    // Offsets from the page's start; the user address of offset `o` is
+    // `STACK_ADDR + o`. The strings occupy the top of the page in the
+    // order they're listed (argv, then envp), so the start of each one is
+    // known from the lengths of those before it, and the vectors can be
+    // filled in the same pass that copies the strings -- no scratch
+    // storage for pointers, on a kernel stack that has little to spare.
+    let strings: usize = args.argv.iter().chain(args.envp.iter()).map(|s| s.len() + 1).sum();
+    let words = 1 + (args.argv.len() + 1) + (args.envp.len() + 1) + 2;
+    let strings_start = PAGE_SIZE as usize - strings;
+    let rsp_offset = (strings_start - words * 8) & !0xf;
+
+    // Safety (both closures): every offset written lies inside the page,
+    // since the whole block fits (see the doc comment).
+    let put_word = |i: usize, value: u64| unsafe {
+        (page.add(rsp_offset + i * 8) as *mut u64).write_unaligned(value)
+    };
+    let mut next_string = strings_start;
+    let mut put_string = |s: &[u8]| -> u64 {
+        let at = next_string;
+        unsafe {
+            core::ptr::copy_nonoverlapping(s.as_ptr(), page.add(at), s.len());
+            // The frame was zeroed on hand-out, but the layout shouldn't
+            // lean on that.
+            *page.add(at + s.len()) = 0;
+        }
+        next_string += s.len() + 1;
+        STACK_ADDR + at as u64
+    };
+
+    let mut i = 0;
+    put_word(i, args.argv.len() as u64); // argc
+    i += 1;
+    for s in args.argv.iter() {
+        put_word(i, put_string(s));
+        i += 1;
+    }
+    put_word(i, 0); // argv[argc] == NULL
+    i += 1;
+    for s in args.envp.iter() {
+        put_word(i, put_string(s));
+        i += 1;
+    }
+    put_word(i, 0); // envp terminator
+    i += 1;
+    put_word(i, 0); // auxv: AT_NULL ...
+    put_word(i + 1, 0); // ... and its (unused) value
+
+    STACK_ADDR + rsp_offset as u64
 }
 
 /// Read the fixed-size ELF header out of `image`.
@@ -416,8 +559,25 @@ fn validate(image: &[u8], header: &Elf64Header, base_pml4: PhysFrame) -> Result<
 /// `memory::new_address_space_from`'s doc comment for why copying that
 /// one would quietly hand the new image its predecessor's pages.
 pub fn load_image(base_pml4: PhysFrame, image: &[u8]) -> Result<LoadedImage, ElfError> {
+    load_image_with_args(base_pml4, image, &StartArgs::EMPTY)
+}
+
+/// `load_image`, additionally handing the new image an argument and
+/// environment vector (`StartArgs`) on its stack -- what `exec` needs,
+/// and the only thing that distinguishes it from loading a program at
+/// boot. `args` is checked alongside the image itself, before anything
+/// is allocated, so an oversized vector costs nothing but the error.
+pub fn load_image_with_args(
+    base_pml4: PhysFrame,
+    image: &[u8],
+    args: &StartArgs,
+) -> Result<LoadedImage, ElfError> {
     let physical_memory_offset = memory::physical_memory_offset();
     let header = header_of(image)?;
+    match args.block_size() {
+        Some(size) if size <= MAX_START_ARGS_BYTES => {}
+        _ => return Err(ElfError::ArgsTooLarge),
+    }
     validate(image, &header, base_pml4)?;
 
     let (pml4_frame, mut mapper) =
@@ -459,6 +619,9 @@ pub fn load_image(base_pml4: PhysFrame, image: &[u8]) -> Result<LoadedImage, Elf
             .map_err(|_| ElfError::MappingFailed)?
             .ignore();
     }
+    let stack_page_ptr: *mut u8 =
+        (physical_memory_offset + stack_frame.start_address().as_u64()).as_mut_ptr();
+    let stack_pointer = write_initial_stack(stack_page_ptr, args);
 
     if !map.push(VirtAddr::new(STACK_ADDR), 1) {
         return Err(ElfError::TooManySegments);
@@ -467,7 +630,7 @@ pub fn load_image(base_pml4: PhysFrame, image: &[u8]) -> Result<LoadedImage, Elf
     Ok(LoadedImage {
         pml4: pml4_frame,
         entry: header.e_entry,
-        stack_top: STACK_ADDR + PAGE_SIZE,
+        stack_pointer,
         map,
     })
 }
@@ -495,7 +658,7 @@ pub fn load(image: &[u8], proc_nr: i32) -> proc::AddressSpace {
 
 /// Remember where `task_entry` should start `proc_nr` once it's spawned.
 fn record_params(proc_nr: i32, loaded: &LoadedImage) {
-    ELF_TASK_PARAMS.lock()[com::slot(proc_nr)] = (loaded.entry, loaded.stack_top);
+    ELF_TASK_PARAMS.lock()[com::slot(proc_nr)] = (loaded.entry, loaded.stack_pointer);
 }
 
 /// Largest program `read_file` will pull out of `fs`. `MAX_IMAGE_PAGES`
@@ -710,6 +873,22 @@ pub fn validator_self_test() {
         }
     }
     serial_println!("[elf] validator self-test: all {} hostile images rejected", cases.len());
+
+    // An otherwise perfectly good image with more argument bytes than
+    // the stack page will give up: refused as a whole, before any of it
+    // is mapped. (`crate::syscall`'s copy-in stops most such vectors
+    // earlier, but this is the check that holds whoever the caller is.)
+    let good = synthetic_image(user_slot, &[(user_slot, PAGE_SIZE)]);
+    let big = [0x41u8; 256];
+    let many: [&[u8]; 8] = [&big; 8]; // 8 * 257 bytes of strings alone
+    let args = StartArgs { argv: &many, envp: &[] };
+    match load_image_with_args(base, &good, &args) {
+        Err(ElfError::ArgsTooLarge) => {
+            serial_println!("[elf] rejected an argv larger than MAX_START_ARGS_BYTES: ArgsTooLarge");
+        }
+        Err(other) => panic!("oversized argv: expected ArgsTooLarge, got {:?}", other),
+        Ok(_) => panic!("oversized argv was ACCEPTED -- it would have left the program no stack"),
+    }
 }
 
 /// A `crate::proc` task body: jump to ring 3 at the real entry point

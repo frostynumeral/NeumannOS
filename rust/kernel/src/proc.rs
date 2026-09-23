@@ -717,7 +717,7 @@ impl TrapFrame {
     /// `crate::syscall::entry` lands in the new image instead of
     /// returning to the old one -- the Rust counterpart of
     /// `kernel/system/do_exec.c` assigning `rp->p_reg.pc`/`sp`.
-    pub fn exec_into(&self, entry: u64, stack_top: u64) -> TrapFrame {
+    pub fn exec_into(&self, entry: u64, stack_pointer: u64) -> TrapFrame {
         TrapFrame {
             r15: 0,
             r14: 0,
@@ -737,7 +737,7 @@ impl TrapFrame {
             rip: entry,
             cs: self.cs,
             rflags: Self::USER_RFLAGS,
-            rsp: stack_top,
+            rsp: stack_pointer,
             ss: self.ss,
         }
     }

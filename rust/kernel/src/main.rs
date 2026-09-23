@@ -690,6 +690,8 @@ fn exec_verify() {
         );
     }
 
+    argv_verify(child);
+
     let mut stale_buf = [0u8; 4];
     let stale = calls::sys_vircopy(
         child,
@@ -735,6 +737,117 @@ fn read_wait_result(path: &str) -> (i32, i32) {
     let child = u64::from_le_bytes(buf[..8].try_into().unwrap()) as i32;
     let status = i32::from_le_bytes(buf[8..12].try_into().unwrap());
     (child, status)
+}
+
+/// `exec_verify`'s argument-passing half: `shell` exec'd `/bin/echo`
+/// with `argv = {"/bin/echo", "hello", "from", "argv"}` and
+/// `envp = {"GREETING=neumann"}` (`user/shell.s`), and this checks the
+/// new image received exactly that, from three independent angles:
+///
+/// 1. What the program *did* with them: `/echo_output.txt` is its
+///    arguments joined with spaces and `/echo_env.txt` its first
+///    environment string, both written by `user/echo.s` itself.
+/// 2. What was actually *on its stack*: read straight out of `child`'s
+///    memory with `sys_vircopy`, starting at the `rsp` it recorded on
+///    entry -- `argc`, then each `argv[i]` pointer followed to its string,
+///    then `argv`'s NULL, the `envp` entry, `envp`'s NULL and the empty
+///    auxiliary vector. This is the check that pins down the layout; the
+///    first one would pass for any layout `echo.s` happened to agree with.
+///    It also requires `rsp % 16 == 0`, which the ABI promises `_start`.
+/// 3. That the copy-in refuses what it should: `/argv_errors.bin` holds
+///    the results of four execs `echo.s` made with bad vectors -- `argv`
+///    on the kernel heap, an element on the kernel heap, too many entries,
+///    too many bytes -- each of which had to fail and leave it running.
+fn argv_verify(child: i32) {
+    let mut out = [0u8; 64];
+    let n = read_when_available("/echo_output.txt", &mut out);
+    let output = &out[..n.max(0) as usize];
+    serial_println!(
+        "[idle] read back {:?} from /echo_output.txt (/bin/echo's own rendering of its argv)",
+        core::str::from_utf8(output).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(output, b"hello from argv", "/bin/echo didn't echo the argv shell exec'd it with");
+
+    let mut env = [0u8; 64];
+    let n = read_when_available("/echo_env.txt", &mut env);
+    let env = &env[..n.max(0) as usize];
+    serial_println!(
+        "[idle] read back {:?} from /echo_env.txt (/bin/echo's envp[0])",
+        core::str::from_utf8(env).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(env, b"GREETING=neumann", "/bin/echo didn't receive the envp shell exec'd it with");
+
+    let read_u64 = |addr: u64| -> u64 {
+        let mut buf = [0u8; 8];
+        calls::sys_vircopy(
+            child,
+            x86_64::VirtAddr::new(addr),
+            com::IDLE,
+            x86_64::VirtAddr::new(buf.as_mut_ptr() as u64),
+            8,
+        )
+        .expect("sys_vircopy failed reading /bin/echo's start-up block");
+        u64::from_le_bytes(buf)
+    };
+    let read_str = |addr: u64, buf: &mut [u8]| -> usize {
+        calls::sys_vircopy(
+            child,
+            x86_64::VirtAddr::new(addr),
+            com::IDLE,
+            x86_64::VirtAddr::new(buf.as_mut_ptr() as u64),
+            buf.len(),
+        )
+        .expect("sys_vircopy failed reading an argv string");
+        buf.iter().position(|&b| b == 0).expect("argv string not NUL-terminated where expected")
+    };
+
+    let rsp = read_u64(elf::ECHO_ENTRY_RSP_ADDR);
+    let argc_seen = read_u64(elf::ECHO_ARGC_ADDR);
+    serial_println!(
+        "[idle] /bin/echo started with rsp {:#x} and read argc {} there (expected 4)",
+        rsp,
+        argc_seen
+    );
+    assert_eq!(rsp % 16, 0, "exec'd image's initial rsp isn't 16-byte aligned");
+    assert!(
+        (elf::STACK_ADDR..elf::STACK_ADDR + 4096).contains(&rsp),
+        "exec'd image's initial rsp isn't in its stack page"
+    );
+    assert_eq!(argc_seen, 4, "/bin/echo read the wrong argc off its stack");
+    assert_eq!(read_u64(rsp), 4, "argc on the child's stack is wrong");
+
+    let expected_argv: [&[u8]; 4] = [b"/bin/echo", b"hello", b"from", b"argv"];
+    for (i, want) in expected_argv.iter().enumerate() {
+        let ptr = read_u64(rsp + 8 + 8 * i as u64);
+        // Exact length plus its NUL: long enough to catch a missing
+        // terminator, short enough to stay inside the stack page.
+        let mut buf = [0xffu8; 16];
+        let len = read_str(ptr, &mut buf[..want.len() + 1]);
+        assert_eq!(&buf[..len], *want, "argv[{}] on the child's stack is wrong", i);
+    }
+    let envp = rsp + 8 + 8 * (expected_argv.len() as u64 + 1);
+    assert_eq!(read_u64(envp - 8), 0, "argv isn't NULL-terminated on the child's stack");
+    let mut buf = [0xffu8; 17];
+    let len = read_str(read_u64(envp), &mut buf);
+    assert_eq!(&buf[..len], b"GREETING=neumann", "envp[0] on the child's stack is wrong");
+    assert_eq!(read_u64(envp + 8), 0, "envp isn't NULL-terminated on the child's stack");
+    assert_eq!(read_u64(envp + 16), 0, "the auxiliary vector doesn't start with AT_NULL");
+    serial_println!("[idle] /bin/echo's stack holds argc, argv[4] + NULL, envp[1] + NULL, AT_NULL -- the System V start-up layout");
+
+    let mut errs = [0u8; 32];
+    let n = read_when_available("/argv_errors.bin", &mut errs);
+    assert_eq!(n, 32, "wrong length read back from /argv_errors.bin");
+    let expected = [
+        ("argv on the kernel heap", syscall::ERR_BAD_ARG_PTR),
+        ("argv[0] on the kernel heap", syscall::ERR_BAD_ARG_PTR),
+        ("70 arguments", syscall::ERR_ARGS_TOO_BIG),
+        ("30 arguments of 100 bytes", syscall::ERR_ARGS_TOO_BIG),
+    ];
+    for (i, (what, want)) in expected.iter().enumerate() {
+        let got = u64::from_le_bytes(errs[i * 8..i * 8 + 8].try_into().unwrap());
+        serial_println!("[idle] ring-3 exec with {}: {:#x} (expected {:#x})", what, got, want);
+        assert_eq!(got, *want, "ring-3 exec with {} wasn't refused correctly", what);
+    }
 }
 
 /// Exercises the two ends of the dynamic process-number pool

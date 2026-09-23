@@ -94,7 +94,8 @@
 //! MINIX's IPC-bitmask-gated kernel calls (see "known simplifications in
 //! the kernel calls").
 
-use crate::{calls, com, elf, fs, ipc, keyboard, proc, serial_println};
+use crate::{calls, com, elf, fs, ipc, keyboard, memory, proc, serial_println};
+use alloc::vec::Vec;
 use x86_64::VirtAddr;
 
 pub const SYS_GET_UPTIME: u64 = 1;
@@ -184,6 +185,119 @@ pub const ERR_NO_CHILDREN: u64 = (-10i64) as u64;
 /// here are the ones the system is made of. Kernel-side code that really
 /// wants these calls the `crate::proc` functions directly.
 pub const ERR_NOT_RING3: u64 = (-11i64) as u64;
+/// `SYS_EXEC`'s `argv`/`envp` named memory that isn't the caller's own:
+/// an unmapped address, or one in a PML4 slot the kernel's address space
+/// uses -- the kernel heap, image or physical-memory window, which every
+/// address space can *reach* but no ring-3 program owns. Refusing the
+/// latter is not pedantry: the strings end up on the new image's stack,
+/// so accepting a kernel pointer would be a way to read kernel memory
+/// back out of ring 3. POSIX's `EFAULT`.
+pub const ERR_BAD_ARG_PTR: u64 = (-12i64) as u64;
+/// `SYS_EXEC`'s `argv`/`envp` were larger than this port will copy: more
+/// than `MAX_EXEC_VECTOR` entries in either vector, or more than
+/// `elf::MAX_START_ARGS_BYTES` once laid out. POSIX's `E2BIG`.
+pub const ERR_ARGS_TOO_BIG: u64 = (-13i64) as u64;
+
+/// Most entries `SYS_EXEC` reads out of either `argv` or `envp` before
+/// giving up with `ERR_ARGS_TOO_BIG`. Only a bound on how long the
+/// copy-in loop runs on an untrusted, possibly unterminated vector; the
+/// loader's own byte limit (`elf::MAX_START_ARGS_BYTES`) is the real one,
+/// and is always the tighter of the two for vectors of non-empty strings.
+const MAX_EXEC_VECTOR: usize = 64;
+
+/// Copy `buf.len()` bytes out of `caller`'s memory at `addr`, refusing
+/// anything that isn't memory the caller privately owns.
+///
+/// Deliberately *not* a direct dereference, unlike the other pointer
+/// arguments in this file: those are bounded, single-range reads a
+/// malformed pointer at worst faults on, but `SYS_EXEC` follows a chain
+/// of pointers the caller controls (the vector, then each string), and
+/// the bytes it gathers are handed straight back to ring 3 on the new
+/// stack. So it walks the caller's page tables instead
+/// (`memory::copy_between_address_spaces`, which reports an unmapped page
+/// rather than faulting on it), and first requires the whole range to
+/// sit in PML4 slots the kernel's own address space leaves empty -- the
+/// same "private to this address space" test the ELF loader uses
+/// (`memory::pml4_slots_unused`), and in this port the only meaningful
+/// definition of a user address.
+fn copy_from_caller(caller: i32, addr: u64, buf: &mut [u8]) -> Result<(), u64> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let end = addr.checked_add(buf.len() as u64 - 1).ok_or(ERR_BAD_ARG_PTR)?;
+    let (Ok(start_va), Ok(end_va)) = (VirtAddr::try_new(addr), VirtAddr::try_new(end)) else {
+        return Err(ERR_BAD_ARG_PTR);
+    };
+    let kernel = proc::kernel_cr3();
+    if !memory::pml4_slots_unused(kernel, start_va, end_va) {
+        return Err(ERR_BAD_ARG_PTR);
+    }
+    let (caller_cr3, _) = proc::cr3_of(caller);
+    // `buf` is kernel memory (this task's kernel stack or the heap), so
+    // it is reachable through the kernel's own tables.
+    memory::copy_between_address_spaces(
+        caller_cr3,
+        start_va,
+        kernel,
+        VirtAddr::new(buf.as_mut_ptr() as u64),
+        buf.len(),
+    )
+    .map_err(|_| ERR_BAD_ARG_PTR)
+}
+
+/// Read one NULL-terminated vector of NUL-terminated strings (`argv` or
+/// `envp`, C's `char *const []`) out of `caller`'s memory at `vec`, into
+/// kernel-owned buffers. `vec == 0` is an empty vector, which is what
+/// every `SYS_EXEC` caller that has nothing to pass says. `budget` is the
+/// bytes left for strings across both vectors, spent as they're read so
+/// an enormous string is refused while being read rather than after.
+///
+/// Strings are read a page-bounded chunk at a time: a string that ends
+/// just short of an unmapped page is legitimate, and reading a fixed
+/// chunk past its NUL would wrongly reject it.
+fn copy_in_vector(caller: i32, vec: u64, budget: &mut usize) -> Result<Vec<Vec<u8>>, u64> {
+    let mut out = Vec::new();
+    if vec == 0 {
+        return Ok(out);
+    }
+    loop {
+        if out.len() == MAX_EXEC_VECTOR {
+            return Err(ERR_ARGS_TOO_BIG);
+        }
+        let slot = vec.checked_add(out.len() as u64 * 8).ok_or(ERR_BAD_ARG_PTR)?;
+        let mut word = [0u8; 8];
+        copy_from_caller(caller, slot, &mut word)?;
+        let mut ptr = u64::from_le_bytes(word);
+        if ptr == 0 {
+            return Ok(out);
+        }
+
+        let mut s = Vec::new();
+        loop {
+            const CHUNK: u64 = 64;
+            let to_page_end = 4096 - (ptr % 4096);
+            let mut chunk = [0u8; CHUNK as usize];
+            let n = CHUNK.min(to_page_end) as usize;
+            copy_from_caller(caller, ptr, &mut chunk[..n])?;
+            let (bytes, done) = match chunk[..n].iter().position(|&b| b == 0) {
+                Some(nul) => (&chunk[..nul], true),
+                None => (&chunk[..n], false),
+            };
+            // `+ 1` for the NUL the loader will put back.
+            let cost = bytes.len() + if done { 1 } else { 0 };
+            if cost > *budget {
+                return Err(ERR_ARGS_TOO_BIG);
+            }
+            *budget -= cost;
+            s.extend_from_slice(bytes);
+            if done {
+                break;
+            }
+            ptr += n as u64;
+        }
+        out.push(s);
+    }
+}
 
 /// The actual dispatch, called by `entry` (via `core::arch::naked_asm!`'s
 /// `sym` operand) with the caller's original `rax` (as `call_num`),
@@ -471,6 +585,35 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             if arg2 as usize > MAX_FS_BUF {
                 return ERR_BAD_LENGTH;
             }
+
+            // `argv` (`arg3`, `rdx`) and `envp` (`arg4`, `rcx`) first,
+            // while the caller's memory is still the caller's: once
+            // `calls::sys_exec` swaps address spaces there is nothing left
+            // to copy them from. Read into the kernel heap, which every
+            // address space maps identically, so they outlive the image
+            // they came from the same way `path_buf` below does. A bad
+            // vector fails the whole call *before* the file is even
+            // looked up -- an exec that fails leaves the caller as it
+            // was, whichever part of it was wrong.
+            let mut budget = elf::MAX_START_ARGS_BYTES;
+            let argv = match copy_in_vector(caller, arg3, &mut budget) {
+                Ok(v) => v,
+                Err(err) => {
+                    serial_println!("[syscall] proc {}: SYS_EXEC: bad argv ({:#x})", caller, err);
+                    return err;
+                }
+            };
+            let envp = match copy_in_vector(caller, arg4, &mut budget) {
+                Ok(v) => v,
+                Err(err) => {
+                    serial_println!("[syscall] proc {}: SYS_EXEC: bad envp ({:#x})", caller, err);
+                    return err;
+                }
+            };
+            let argv_refs: Vec<&[u8]> = argv.iter().map(|s| s.as_slice()).collect();
+            let envp_refs: Vec<&[u8]> = envp.iter().map(|s| s.as_slice()).collect();
+            let args = elf::StartArgs { argv: &argv_refs, envp: &envp_refs };
+
             // Safety: same reasoning as SYS_FS_OPEN -- `CR3` is still the
             // caller's own here. Note this read has to happen *before*
             // `calls::sys_exec` switches address spaces, after which the
@@ -510,8 +653,12 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
                     return err as u64;
                 }
             };
-            let loaded = match calls::sys_exec(caller, &image) {
+            let loaded = match calls::sys_exec(caller, &image, &args) {
                 Ok(loaded) => loaded,
+                Err(elf::ElfError::ArgsTooLarge) => {
+                    serial_println!("[syscall] proc {}: SYS_EXEC({:?}) -> argv/envp too large", caller, path);
+                    return ERR_ARGS_TOO_BIG;
+                }
                 Err(err) => {
                     serial_println!("[syscall] proc {}: SYS_EXEC({:?}) -> bad image: {:?}", caller, path, err);
                     return ERR_BAD_ELF;
@@ -533,11 +680,13 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             // this borrow lives and dies inside one uninterrupted stretch
             // of this task's own execution.
             let frame = unsafe { &mut *(frame_ptr as *mut proc::TrapFrame) };
-            *frame = frame.exec_into(loaded.entry, loaded.stack_top);
+            *frame = frame.exec_into(loaded.entry, loaded.stack_pointer);
             serial_println!(
-                "[syscall] proc {}: SYS_EXEC({:?}) -> replaced its own image, entering at {:#x} on a fresh stack",
+                "[syscall] proc {}: SYS_EXEC({:?}, argc {}, envc {}) -> replaced its own image, entering at {:#x} on a fresh stack",
                 caller,
                 path,
+                argv.len(),
+                envp.len(),
                 loaded.entry
             );
             0

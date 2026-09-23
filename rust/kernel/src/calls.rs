@@ -176,14 +176,23 @@ pub fn sys_fork_from_frame(
 /// mappings of the program it replaced. Nothing frees those old mappings
 /// -- see `proc::set_address_space` for that caveat.
 ///
-/// Notably absent compared to real `exec`: `argv`/`envp` (this port's
-/// loader jumps straight to `_start` with nothing but a stack --
-/// `crate::elf`), any notion of file permissions or a set-uid bit, and
-/// closing file descriptors marked close-on-exec (`fs` has no such flag,
-/// and descriptors here survive the call, as they would for a plain
-/// POSIX `exec` without it).
-pub fn sys_exec(proc_nr: i32, image: &[u8]) -> Result<elf::LoadedImage, elf::ElfError> {
-    let loaded = elf::load_image(proc::kernel_cr3(), image)?;
+/// `args` is the new image's `argv`/`envp`, already copied out of the
+/// caller's memory (`crate::syscall`'s `SYS_EXEC` does that, since the
+/// caller's pointers stop meaning anything the moment this swaps address
+/// spaces) and laid out on the new stack by the loader
+/// (`elf::StartArgs`) -- the part `do_exec` does by copying the caller's
+/// prepared stack image into `mbuf` and relocating its pointers.
+///
+/// Notably absent compared to real `exec`: any notion of file
+/// permissions or a set-uid bit, and closing file descriptors marked
+/// close-on-exec (`fs` has no such flag, and descriptors here survive the
+/// call, as they would for a plain POSIX `exec` without it).
+pub fn sys_exec(
+    proc_nr: i32,
+    image: &[u8],
+    args: &elf::StartArgs,
+) -> Result<elf::LoadedImage, elf::ElfError> {
+    let loaded = elf::load_image_with_args(proc::kernel_cr3(), image, args)?;
     proc::set_address_space(proc_nr, proc::AddressSpace { pml4: loaded.pml4, map: loaded.map });
     Ok(loaded)
 }

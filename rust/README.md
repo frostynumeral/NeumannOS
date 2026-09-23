@@ -401,7 +401,17 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   space is swapped; loads the image out of `fs` by path
   (`elf::read_file`, blocking on real IPC round trips the whole time,
   still on the old address space, so a missing file changes nothing);
-  then `calls::sys_exec` and `TrapFrame::exec_into`. Forwards `fs`'s own
+  then `calls::sys_exec` and `TrapFrame::exec_into`. Takes a real
+  `argv` and `envp` too (`rdx`/`rcx`, C-style NULL-terminated arrays of
+  NUL-terminated strings, `0` for an empty one), copied out of the
+  caller *first* -- before the file is even looked up -- by walking the
+  caller's page tables rather than dereferencing (`copy_from_caller`),
+  and only from PML4 slots the kernel's own address space leaves empty:
+  the strings end up back in ring 3 on the new stack, so a pointer into
+  the kernel heap would otherwise be a way to read kernel memory out.
+  That's `ERR_BAD_ARG_PTR` (`EFAULT`); more than `MAX_EXEC_VECTOR`
+  entries or `elf::MAX_START_ARGS_BYTES` of layout is `ERR_ARGS_TOO_BIG`
+  (`E2BIG`). Forwards `fs`'s own
   error codes unchanged when the path is the problem, `ERR_BAD_ELF` when
   the file is, and refuses outright -- `ERR_EXEC_NOT_RING3` -- if the
   caller's saved `CS` says it wasn't in ring 3, since exec'ing a kernel
@@ -510,7 +520,14 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   address-space swap: `elf::load_image` into a brand-new address space
   derived from the *kernel's* PML4 (so the new image starts with an empty
   user address space, not its predecessor's mappings), then
-  `proc::set_address_space`. Writing the new entry point and stack into
+  `proc::set_address_space`. `elf::load_image_with_args` also lays the
+  caller's `argv`/`envp` out on the new stack page in the System V
+  x86-64 start-up form (`write_initial_stack`: `argc` at `rsp`, then
+  `argv[]`/NULL, `envp[]`/NULL, an empty auxiliary vector, strings
+  above; `rsp` 16-byte aligned) -- the part `do_exec` does by copying
+  the caller's prepared stack into `mbuf` and relocating its pointers
+  (`patch_ptr`). Images started at boot get the same block with
+  `argc == 0`. Writing the new entry point and stack into
   the caller's live trap frame stays in `crate::syscall`, which is the
   only code holding that frame -- the same split `do_exec.c` has by being
   the only code holding `rp->p_reg`. Nothing is mutated until the image
@@ -1071,12 +1088,15 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   `user/hello.s`'s header comment), not a build-script step -- there's no
   cross toolchain wired into `cargo build` yet to assemble a fresh user
   program automatically (see the libc-equivalent roadmap item).
-- **No dynamic linking, no `argv`/`envp`/auxv, no `PT_INTERP`.** `load`
-  only understands `PT_LOAD` segments; a real `execve` also sets up the
-  initial stack contents a libc's `_start` expects (argument/environment
-  vectors, the auxiliary vector) and can invoke a dynamic linker named by
-  a `PT_INTERP` segment. `user/hello.s` is freestanding and asks for
-  none of that, so this hasn't mattered yet.
+- **No dynamic linking, an empty auxv, no `PT_INTERP`.** `load` only
+  understands `PT_LOAD` segments. The initial stack a libc's `_start`
+  expects is there now (`argc`/`argv`/`envp` in the System V layout, see
+  `write_initial_stack`), but its auxiliary vector is only the `AT_NULL`
+  terminator -- no `AT_PHDR`/`AT_ENTRY`/`AT_PAGESZ`/`AT_RANDOM`, which a
+  real libc reads -- and there's no dynamic linker to name in a
+  `PT_INTERP` segment. Only exec'd images get arguments at all; images
+  started at boot or by `rs` (`spawn_from_fs`) get `argc == 0`, not even
+  their own name as `argv[0]`.
 - **One fixed stack address, one page of it.** Every image gets its
   stack at a hardcoded `STACK_ADDR`, one 4 KiB page, the same way
   `usermode.rs`'s demo uses fixed constants. Harmless while each image
@@ -1101,12 +1121,18 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in `exec()`
 
-- **No `argv`/`envp`.** `sys_exec` takes a path and nothing else. A real
-  `execve` copies the argument and environment vectors out of the old
-  address space (the one it's about to destroy) and reconstructs them on
-  the new image's stack before jumping to it -- the single fiddliest part
-  of a real exec, and entirely absent here, because this port's programs
-  are freestanding assembly that reads neither.
+- **`argv`/`envp` are real, but small.** `SYS_EXEC` copies both vectors
+  out of the address space it's about to destroy and reconstructs them
+  on the new image's stack, as a real `execve` does (`user/shell.s`
+  execs `/bin/echo` with four arguments and one environment string, and
+  `user/echo.s` genuinely echoes them; `crate::main`'s `argv_verify`
+  reads the start-up block back out of the child's stack and checks the
+  layout word by word). What's small is the budget: everything has to
+  fit in half of the one stack page (`elf::MAX_START_ARGS_BYTES`, 2 KiB,
+  where MINIX's own `ARG_MAX` is 16 KiB), and at most
+  `MAX_EXEC_VECTOR` (64) entries per vector. The copy-in reads strings
+  64 bytes at a time through a page-table walk -- correct and bounded,
+  not fast.
 - **The replaced image *is* freed now** (`memory::free_address_space`,
   called from `proc::set_address_space` once the new `CR3` is loaded),
   so `exec` no longer costs an address space per call. What is still
@@ -1372,9 +1398,9 @@ Roughly in the order the original kernel needs them:
     confirm the loaded code genuinely executed and wrote through to
     physical memory, not just that it made the syscalls it logged. See
     "known simplifications in the ELF
-    loader" below for what's missing (no dynamic linking, no `argv`/
-    `envp`, the binary is checked in pre-built rather than assembled by
-    this build).
+    loader" below for what's missing (no dynamic linking, only an
+    empty auxiliary vector, the binary is checked in pre-built rather
+    than assembled by this build).
 11. **The servers themselves**: `pm` (process manager), `fs` (file system),
     `rs` (reincarnation server), `tty`, `memory`, in roughly that dependency
     order, matching `servers/` and `drivers/` in the C tree -- replacing the
@@ -1426,9 +1452,10 @@ Roughly in the order the original kernel needs them:
     already blocked waiting, the other collected out of a zombie slot it
     had been sitting in since it terminated. That is the whole
     fork/exec/exit/wait cycle a real program launch is made of, running
-    in ring 3. Still
-    missing: `argv`/`envp` (see "known simplifications in `exec()`"
-    above), copy-on-write (see "known simplifications in the kernel
+    in ring 3 -- and the exec carries a real `argv`/`envp` across, laid
+    out on the new stack the way the System V ABI has it, which
+    `/bin/echo` then actually echoes. Still
+    missing: copy-on-write (see "known simplifications in the kernel
     calls"), and `fs`
     growing `readdir` and a real backing store (see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
