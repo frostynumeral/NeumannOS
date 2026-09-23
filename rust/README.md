@@ -270,34 +270,45 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   general call rather than a special case per caller -- see the
   `src/syscall.rs` bullet.
   `fork_address_space` is what reads it: it builds a fresh address space
-  derived from the *kernel's* PML4 and gives the child an independently
-  allocated, byte-for-byte copy of every page in the map, carrying each
-  page's original permission flags across. `pml4_slots_unused` gates
-  every page, the same rule `exec` is held to, and a failure anywhere
-  (no frame left, a map naming a page its own page tables don't have)
-  tears the half-built address space back down and reports `None`, so a
-  failed `fork` costs nothing.
-  That copy-everything shape replaced a cleverer one, and the
-  replacement was a correctness fix rather than a simplification. The
-  earlier version built the child out of the *parent's* page tables:
-  duplicating table levels along the path to each page it was told to
-  copy, and leaving every other leaf entry pointing at the parent's own
-  frames -- read-only pages like a program's text deliberately left
-  shared, which is both cheaper and closer to what a real `fork` does.
-  Two things were wrong with it, neither observable in the one
-  fork this port used to perform. A shared page means two address spaces
-  referring to one frame with nothing counting references, so the first
-  `free_address_space` of *either* side -- an `exec`, a crash,
-  `proc::kill` -- would hand the other process's live page back to the
-  allocator; the fork/exec pair `user/shell.s` now performs walks
-  straight into that (the child frees the image it inherited the instant
-  it execs, 11 frames of it). And duplicating table levels per page
-  leaked one table frame per level whenever two copied pages shared a
-  path, which is every image whose text and data sit in the same 2 MiB
-  region -- again, not the one two-page fork that existed. Sharing
-  read-only pages is worth having back once frames are
-  reference-counted, and is the first step toward copy-on-write; until
-  then, a full copy is the version that is actually sound.
+  derived from the *kernel's* PML4 and maps every page in the map into
+  it at the *parent's own frame* -- no page is copied at fork time.
+  Read-only pages (a program's text) are simply shared; writable ones
+  become copy-on-write on both sides: the `WRITABLE` bit comes off, the
+  software-defined `COW` bit (`BIT_9`, one of the three the architecture
+  leaves to the OS) goes on, and when the parent is the active address
+  space (every ring-3 `SYS_FORK`, which runs inside the parent's own
+  trap) its TLB entries for those pages are flushed, since a stale,
+  still-writable translation would let it write straight into a frame
+  its child now shares. A fork costs the child's page tables and nothing
+  else. `pml4_slots_unused` gates every page, the same rule `exec` is
+  held to, and a failure anywhere tears the half-built address space
+  back down and reports `None`.
+  What makes sharing sound is a frame reference count: `SHARERS`, a
+  sparse map from frame to how many *extra* address spaces map it (a
+  frame with no entry has exactly one mapping -- every frame nobody has
+  forked). `free_address_space` drops a reference per leaf
+  (`release_frame`) and only returns a frame to the allocator with its
+  last one. The first write to a `COW` page -- a ring-3 store, or a
+  kernel write through a user pointer, which faults too because `init`
+  turns on `CR0.WP` -- lands in `interrupts::page_fault_handler`, which
+  calls `resolve_cow_fault` and re-runs the instruction: a frame still
+  shared gets copied into a private one (`CowResolution::Copied`); a
+  frame whose other sharers have all let go (exited, exec'd, or copied
+  already) just gets its write permission back, no copy
+  (`CowResolution::Reclaimed`), which is what usually happens to
+  `shell` after its child execs. `copy_between_address_spaces` breaks
+  `COW` on its destination first, since it writes through the
+  physical-memory window and a read-only mapping wouldn't stop it.
+  `crate::main`'s `cow_self_test` checks all of this at boot on a real
+  ELF address space -- including a genuine ring-0 write fault taken with
+  `CR3` switched into the child -- and the full boot exercises every
+  path for real (see the `[cow]` log lines).
+  Sharing was tried once before, without reference counts, and was
+  unsound: the first `free_address_space` of either side handed the
+  other process's live page back to the allocator, and duplicating
+  table levels per page leaked a table frame per level. Copying every
+  page replaced it as a correctness fix; `SHARERS` is what made sharing
+  safe to bring back.
   The physical frame allocator is now a
   global, lock-protected resource (`GlobalFrameAllocator`,
   `init_frame_allocator`) rather than a value threaded through
@@ -1015,13 +1026,13 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   rather than "this isn't the one task we know about". Child process
   numbers are allocated at runtime too (`proc::alloc_proc_nr`,
   `com::FIRST_DYNAMIC_PROC_NR`), so there is no single reserved child
-  slot for a second fork to overwrite. What's still missing is the part
-  that makes a real `fork` cheap: every page in the map is *copied*,
-  because sharing the read-only ones needs frame reference counts this
-  port doesn't have (see the `src/memory.rs` bullet for why the earlier,
-  sharing version was unsound rather than merely clever), and
-  copy-on-write for the writable ones needs the same plus a `#PF`
-  handler that resolves faults instead of reporting them. There's also
+  slot for a second fork to overwrite. `fork` is copy-on-write now (see
+  the `src/memory.rs` bullet), with two rough edges: a kernel-mode COW
+  fault that finds no free frame to copy into (inside `SYS_FS_READ`,
+  say) halts the machine, like any ring-0 fault, rather than failing
+  that one syscall with `EFAULT`; and `SHARERS` is a heap `BTreeMap`
+  behind a lock taken with interrupts off, fine on one CPU and one of
+  the first things SMP would have to redo. There's also
   a real process *lifecycle* beyond fork/exit/wait: there is no process
   group, session, or controlling terminal; no signals, so no way to ask
   another process to stop (only `kill`, which the kernel does to a
@@ -1376,8 +1387,9 @@ Roughly in the order the original kernel needs them:
    fixed-entry-point shape (verified by the child's canary write and its
    own independent `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
    `IDLE`). See "known simplifications" above for what's not implemented
-   yet (`sys_umap`, more of `kernel/system/do_*.c`, and `fork`'s missing
-   other half, copy-on-write). `exit`/`wait` are real now too
+   yet (`sys_umap`, more of `kernel/system/do_*.c`). `fork` is
+   copy-on-write now: the child shares every page, and a write fault
+   copies it on demand (`memory::resolve_cow_fault`). `exit`/`wait` are real now too
    (`proc::exit_now`/`wait_for_child`, `crate::syscall`'s
    `SYS_EXIT`/`SYS_WAIT`, ported in spirit from
    `servers/pm/forkexit.c`), which is what finally makes a dynamic
@@ -1455,8 +1467,7 @@ Roughly in the order the original kernel needs them:
     in ring 3 -- and the exec carries a real `argv`/`envp` across, laid
     out on the new stack the way the System V ABI has it, which
     `/bin/echo` then actually echoes. Still
-    missing: copy-on-write (see "known simplifications in the kernel
-    calls"), and `fs`
+    missing: `fs`
     growing `readdir` and a real backing store (see "known simplifications in
     `fs`" above) rather than a flat, in-memory, single-address-space
     file/directory table. Ring-3 callers can now reach `fs` for real

@@ -66,9 +66,10 @@ pub const SYN_ALARM: i32 = com::SYN_ALARM;
 /// `sys_fork()`: create a new task (`child_proc_nr`) whose address space
 /// starts as an independent copy of `src_proc`'s -- not just a structural
 /// clone that still aliases the parent's existing pages
-/// (`memory::new_address_space` alone), but a real, deep copy of every
-/// page the parent owns, so a write to one side is invisible to the
-/// other. Ported in spirit from `kernel/proc.c`'s `do_fork()` (called via
+/// (`memory::new_address_space` alone), but a copy-on-write one: every
+/// page the parent owns is shared until either side writes it, at which
+/// point the writer gets its own copy, so a write to one side is still
+/// invisible to the other. Ported in spirit from `kernel/proc.c`'s `do_fork()` (called via
 /// `PM_PROC_NR`'s `SYS_FORK`), which duplicates the parent's memory map
 /// for the real thing; bundles what real MINIX splits across a kernel call
 /// (duplicate the memory) and a separate scheduling step (make it
@@ -125,7 +126,7 @@ fn fork_child_address_space(src_proc: i32) -> Option<proc::AddressSpace> {
     Some(proc::AddressSpace { pml4, map })
 }
 
-/// `sys_fork`'s real-fork-semantics sibling: same deep-copy-then-schedule
+/// `sys_fork`'s real-fork-semantics sibling: same copy-then-schedule
 /// shape, but hands `frame` (a snapshot of the caller's own trap, taken by
 /// `crate::syscall`'s `SYS_FORK` handler with `rax` already zeroed) to
 /// `proc::fork_current` instead of a fixed entry point, so the new task

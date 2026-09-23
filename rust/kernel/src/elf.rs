@@ -47,9 +47,8 @@ pub static ECHO_ELF: &[u8] = include_bytes!("../user/echo.elf");
 /// `crate::usermode`'s own demo addresses (a different address space
 /// entirely, so no real collision risk -- just kept distinct for
 /// clarity) and of `HELLO_ELF`'s own linked addresses (see `user/hello.s`).
-/// `pub` so `crate::syscall`'s `SYS_FORK` handler can list it as one of
-/// `tty`'s private pages to deep-copy into a forked child (`fork` must
-/// give the child its own stack, not one aliased with the parent's).
+/// `pub` for the self-tests and verification code that look at an
+/// image's stack (`crate::main`'s `argv_verify`, `elf::validator_self_test`).
 pub const STACK_ADDR: u64 = 0x_7777_7777_0000;
 const PAGE_SIZE: u64 = 4096;
 
@@ -63,6 +62,11 @@ const PAGE_SIZE: u64 = 4096;
 /// `tty`'s `SYS_FORK` copying it is what makes the forked child's own
 /// canary write observable.
 pub const COUNTER_ADDR: u64 = 0x_5555_5556_0000;
+
+/// Where `user/hello.s`'s `.text` (its `_start`) lives: a read-only,
+/// executable page, which `crate::main`'s `cow_self_test` uses as the
+/// page a fork shares *without* marking it copy-on-write.
+pub const HELLO_TEXT_ADDR: u64 = 0x_5555_5555_0000;
 
 /// Where `user/hello.s`'s `vircopy_buf` lives -- the destination `tty`'s
 /// own ring-3 `SYS_VIRCOPY` call (`crate::syscall`) writes into, and

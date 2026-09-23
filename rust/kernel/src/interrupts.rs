@@ -128,10 +128,33 @@ extern "x86-interrupt" fn general_protection_fault_handler(
     recover_or_halt(&frame, "general protection fault");
 }
 
+/// A page fault is usually fatal to whoever took it -- but a write to a
+/// copy-on-write page (`crate::memory::COW`) is not a fault in the
+/// program at all: it's `fork` having deferred a copy until now. Those
+/// are resolved (`memory::resolve_cow_fault`) and the faulting
+/// instruction simply runs again, whether it was ring-3 code writing its
+/// own `.data` or the kernel writing through a user pointer (`CR0.WP`
+/// makes the latter fault too; see `memory::init`). Everything else takes
+/// the usual kill-or-halt path.
 extern "x86-interrupt" fn page_fault_handler(
     frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    let write_to_present = PageFaultErrorCode::PROTECTION_VIOLATION | PageFaultErrorCode::CAUSED_BY_WRITE;
+    if error_code.contains(write_to_present) {
+        if let Ok(addr) = x86_64::registers::control::Cr2::read() {
+            let (pml4, _) = x86_64::registers::control::Cr3::read();
+            if let Some(how) = crate::memory::resolve_cow_fault(pml4, addr) {
+                crate::serial_println!(
+                    "[cow] write fault at {:#x} from ring {} -> {:?}",
+                    addr.as_u64(),
+                    frame.code_segment.rpl() as u8,
+                    how
+                );
+                return;
+            }
+        }
+    }
     crate::serial_println!(
         "EXCEPTION: PAGE FAULT accessing {:?} ({:?})\n{:#?}",
         x86_64::registers::control::Cr2::read(),

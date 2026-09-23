@@ -120,6 +120,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // whole address space can be torn down without leaking. See
     // `frame_reclaim_self_test`.
     frame_reclaim_self_test();
+    // Self-test: fork shares pages rather than copying them, and the
+    // first write to a shared page -- including a *kernel* write, via a
+    // real page fault -- gives the writer a private copy. See
+    // `cow_self_test`.
+    cow_self_test();
     // Self-test: this is the actual proof of isolation, not just that
     // things still work. The demo pages were never mapped into *this*
     // (the kernel's own) page table -- only into `ring3_address_space` --
@@ -209,6 +214,145 @@ fn frame_reclaim_self_test() {
         free_listed
     );
     assert_eq!(after, before, "building and freeing an address space leaked {} frames", after - before);
+}
+
+/// Copy-on-write `fork`, checked end to end on a real ELF address space
+/// (`HELLO_ELF`, `tty`'s image) before anything depends on it:
+///
+/// 1. `memory::fork_address_space` copies *no* pages: every page of the
+///    child translates to the parent's own frame, so the fork costs only
+///    the child's page-table frames.
+///    The shared `.data` page is read-only and `COW` on both sides.
+/// 2. A real ring-0 write fault resolves it: with `CR3` switched to the
+///    child, a plain store to that `.data` page traps (only because
+///    `CR0.WP` is on), `interrupts::page_fault_handler` gives the child a
+///    private copy, and the store completes. Afterwards the two sides map
+///    different frames, the child sees its write and the parent doesn't.
+///    Without `CR0.WP` the store would have gone straight into the shared
+///    frame, and the parent-side check here is what would catch that.
+/// 3. The parent's page, still marked `COW` but no longer shared with
+///    anyone, gets its write permission back *without* a copy when
+///    `copy_between_address_spaces` writes into it (the other COW-breaking
+///    path, since that copy writes through the physical-memory window
+///    rather than through the page's mapping).
+/// 4. Freeing the child leaves the parent's still-shared `.text` frame
+///    alone (it's the parent's live code), and freeing both returns the
+///    allocator to exactly where it started.
+fn cow_self_test() {
+    use x86_64::structures::paging::PageTableFlags;
+    use x86_64::registers::control::Cr3;
+
+    let kernel_pml4 = Cr3::read().0;
+    let (baseline, _) = memory::frame_stats();
+    let parent = elf::load_image(kernel_pml4, elf::HELLO_ELF).expect("HELLO_ELF should load");
+    let data = VirtAddr::new(elf::COUNTER_ADDR);
+    let text = VirtAddr::new(elf::HELLO_TEXT_ADDR);
+
+    let write_u32 = |pml4, addr: VirtAddr, value: u32| {
+        let bytes = value.to_le_bytes();
+        memory::copy_between_address_spaces(
+            kernel_pml4,
+            VirtAddr::new(bytes.as_ptr() as u64),
+            pml4,
+            addr,
+            4,
+        )
+        .expect("self-test write failed");
+    };
+    let read_u32 = |pml4, addr: VirtAddr| {
+        let mut bytes = [0u8; 4];
+        memory::copy_between_address_spaces(
+            pml4,
+            addr,
+            kernel_pml4,
+            VirtAddr::new(bytes.as_mut_ptr() as u64),
+            4,
+        )
+        .expect("self-test read failed");
+        u32::from_le_bytes(bytes)
+    };
+    write_u32(parent.pml4, data, 0x1111_1111);
+
+    // 1. Shared, not copied.
+    let (before_fork, _) = memory::frame_stats();
+    let child = memory::fork_address_space(parent.pml4, kernel_pml4, &parent.map)
+        .expect("fork_address_space failed in the self-test");
+    let fork_cost = memory::frame_stats().0 - before_fork;
+    let (p_data, p_flags) = memory::translate_page(parent.pml4, data).unwrap();
+    let (c_data, c_flags) = memory::translate_page(child, data).unwrap();
+    let (p_text, _) = memory::translate_page(parent.pml4, text).unwrap();
+    let (c_text, _) = memory::translate_page(child, text).unwrap();
+    serial_println!(
+        "[cow] fork of a {}-page image cost {} frame(s) (page tables only); .data frame {:#x} / {:#x}, .text frame {:#x} / {:#x} (parent / child)",
+        parent.map.total_pages(),
+        fork_cost,
+        p_data.start_address().as_u64(),
+        c_data.start_address().as_u64(),
+        p_text.start_address().as_u64(),
+        c_text.start_address().as_u64()
+    );
+    assert_eq!(p_data, c_data, "fork copied a writable page instead of sharing it");
+    assert_eq!(p_text, c_text, "fork copied a read-only page instead of sharing it");
+    // Every page, not just the two sampled above: none may have been
+    // copied. (The frame count alone can't show that -- page tables for
+    // three separate regions cost more frames than this tiny image has
+    // pages.)
+    for page in parent.map.pages() {
+        let addr = page.start_address();
+        assert_eq!(
+            memory::translate_page(parent.pml4, addr).map(|(f, _)| f),
+            memory::translate_page(child, addr).map(|(f, _)| f),
+            "fork copied the page at {:#x} instead of sharing it",
+            addr.as_u64()
+        );
+    }
+    for flags in [p_flags, c_flags] {
+        assert!(flags.contains(memory::COW), "a shared writable page isn't marked COW");
+        assert!(!flags.contains(PageTableFlags::WRITABLE), "a shared writable page is still writable");
+    }
+
+    // 2. A real ring-0 write fault, in the child. Interrupts off: nothing
+    // else may run while `CR3` is an address space no task owns.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        let (saved, flags) = Cr3::read();
+        Cr3::write(child, flags);
+        core::ptr::write_volatile(data.as_mut_ptr::<u32>(), 0x2222_2222);
+        Cr3::write(saved, flags);
+    });
+    let (c_data_after, c_flags_after) = memory::translate_page(child, data).unwrap();
+    assert_ne!(c_data_after, p_data, "the write fault didn't give the child its own copy");
+    assert!(c_flags_after.contains(PageTableFlags::WRITABLE) && !c_flags_after.contains(memory::COW));
+    assert_eq!(read_u32(child, data), 0x2222_2222, "the child's write didn't land in its copy");
+    assert_eq!(
+        read_u32(parent.pml4, data),
+        0x1111_1111,
+        "a write in the forked child reached the parent's page -- CR0.WP off, or COW not enforced"
+    );
+    assert_eq!(memory::extra_sharers(p_data), 0, "the copied frame is still counted as shared");
+
+    // 3. The parent's page: COW, but its only mapping now -- reclaimed
+    // in place, no copy.
+    write_u32(parent.pml4, data, 0x3333_3333);
+    let (p_data_after, p_flags_after) = memory::translate_page(parent.pml4, data).unwrap();
+    assert_eq!(p_data_after, p_data, "a no-longer-shared COW page was copied instead of reclaimed");
+    assert!(p_flags_after.contains(PageTableFlags::WRITABLE) && !p_flags_after.contains(memory::COW));
+    assert_eq!(read_u32(parent.pml4, data), 0x3333_3333);
+    serial_println!(
+        "[cow] ring-0 write fault gave the child its own .data ({:#x}); the parent kept {:#x} and got write access back without a copy",
+        c_data_after.start_address().as_u64(),
+        p_data.start_address().as_u64()
+    );
+
+    // 4. Teardown respects the sharing.
+    let text_word = read_u32(parent.pml4, text);
+    unsafe { memory::free_address_space(child, kernel_pml4) };
+    assert_eq!(memory::translate_page(parent.pml4, text).map(|(f, _)| f), Some(p_text));
+    assert_eq!(read_u32(parent.pml4, text), text_word, "freeing the child freed the parent's shared .text");
+    assert_eq!(memory::extra_sharers(p_text), 0);
+    unsafe { memory::free_address_space(parent.pml4, kernel_pml4) };
+    let (after, _) = memory::frame_stats();
+    assert_eq!(after, baseline, "fork + COW + teardown leaked {} frame(s)", after as isize - baseline as isize);
+    serial_println!("[cow] copy-on-write self-test passed; frames back to {}", after);
 }
 
 /// Spawn the kernel tasks. `IDLE` and `CLOCK` are real kernel tasks, same
