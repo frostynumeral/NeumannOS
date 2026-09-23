@@ -25,6 +25,13 @@ pub const SYS_CONSOLE_WRITE: u64 = 16;
 pub const SYS_FS_CLOSE: u64 = 17;
 pub const SYS_FS_READDIR: u64 = 18;
 pub const SYS_FS_MKDIR: u64 = 19;
+pub const SYS_THREAD_SPAWN: u64 = 20;
+pub const SYS_THREAD_EXIT: u64 = 21;
+pub const SYS_THREAD_JOIN: u64 = 22;
+pub const SYS_SEM_CREATE: u64 = 23;
+pub const SYS_SEM_DELETE: u64 = 24;
+pub const SYS_SEM_ACQUIRE: u64 = 25;
+pub const SYS_SEM_RELEASE: u64 = 26;
 
 /// Most bytes the kernel moves in one `SYS_FS_*`/`SYS_CONSOLE_WRITE`
 /// call (its `MAX_FS_BUF`/`MAX_LINE_LEN`); the wrappers below loop over
@@ -47,6 +54,10 @@ pub const ERR_FORK_FAILED: i64 = -9;
 pub const ERR_NO_CHILDREN: i64 = -10;
 pub const ERR_BAD_ARG_PTR: i64 = -12;
 pub const ERR_ARGS_TOO_BIG: i64 = -13;
+pub const ERR_MULTITHREADED: i64 = -14;
+pub const ERR_NOT_A_THREAD: i64 = -15;
+pub const ERR_BAD_SEM: i64 = -16;
+pub const ERR_NO_FREE_SEM: i64 = -18;
 pub const EEXIST: i64 = -17;
 pub const ENOTDIR: i64 = -20;
 pub const EISDIR: i64 = -21;
@@ -228,6 +239,44 @@ pub fn wait() -> Result<(i64, i32), i64> {
     Ok((child, status))
 }
 
+/// Start a thread at `entry` on the stack whose initial `rsp` is
+/// `stack`, with `arg` as its first argument; its id. Use
+/// `crate::thread::spawn` rather than this.
+///
+/// Safety: `entry` must be a function that never returns (it must end in
+/// `thread_exit`), and `stack` must be the top of memory nothing else uses.
+pub unsafe fn thread_spawn(entry: u64, stack: u64, arg: u64) -> Result<i64, i64> {
+    result(syscall4(SYS_THREAD_SPAWN, entry, stack, arg, 0))
+}
+
+/// End the calling thread with `status`. (From the main thread, use
+/// `exit`: the main thread's end is the program's.)
+pub fn thread_exit(status: i32) -> ! {
+    unsafe { syscall4(SYS_THREAD_EXIT, status as u32 as u64, 0, 0, 0) };
+    // Only reachable from the main thread, which can't thread-exit.
+    exit(status)
+}
+
+/// Wait for thread `tid` to exit; its status.
+pub fn thread_join(tid: i64) -> Result<i32, i64> {
+    let mut status: i32 = 0;
+    result(unsafe { syscall4(SYS_THREAD_JOIN, tid as u64, &mut status as *mut i32 as u64, 0, 0) })?;
+    Ok(status)
+}
+
+pub fn sem_create(count: i32) -> Result<i64, i64> {
+    result(unsafe { syscall4(SYS_SEM_CREATE, count as u32 as u64, 0, 0, 0) })
+}
+pub fn sem_delete(id: i64) -> Result<(), i64> {
+    result(unsafe { syscall4(SYS_SEM_DELETE, id as u64, 0, 0, 0) }).map(|_| ())
+}
+pub fn sem_acquire(id: i64) -> Result<(), i64> {
+    result(unsafe { syscall4(SYS_SEM_ACQUIRE, id as u64, 0, 0, 0) }).map(|_| ())
+}
+pub fn sem_release(id: i64) -> Result<(), i64> {
+    result(unsafe { syscall4(SYS_SEM_RELEASE, id as u64, 0, 0, 0) }).map(|_| ())
+}
+
 /// A short description of an error code, for messages like
 /// `cat: foo: no such file or directory`.
 pub fn strerror(code: i64) -> &'static str {
@@ -243,6 +292,10 @@ pub fn strerror(code: i64) -> &'static str {
         ERR_NO_CHILDREN => "no child processes",
         ERR_BAD_ARG_PTR => "bad address",
         ERR_ARGS_TOO_BIG => "argument list too long",
+        ERR_MULTITHREADED => "can't exec with other threads running",
+        ERR_NOT_A_THREAD => "no such thread",
+        ERR_BAD_SEM => "no such semaphore",
+        ERR_NO_FREE_SEM => "out of semaphores",
         _ => "error",
     }
 }

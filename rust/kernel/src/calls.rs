@@ -148,7 +148,9 @@ pub fn sys_fork_from_frame(
     frame: &proc::TrapFrame,
 ) -> Option<i32> {
     let space = fork_child_address_space(src_proc)?;
-    proc::fork_current(src_proc, child_proc_nr, name, priority, quantum, preemptible, space, frame);
+    // The child's parent is the caller's *team*: a thread that forks
+    // makes a child of its process, collected by whichever thread waits.
+    proc::fork_current(proc::team_of(src_proc), child_proc_nr, name, priority, quantum, preemptible, space, frame);
     Some(child_proc_nr)
 }
 

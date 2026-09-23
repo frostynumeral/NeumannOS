@@ -500,6 +500,7 @@ fn idle_task() -> ! {
     exec_verify();
     fs_dir_check();
     ptr_safety_check();
+    threads_check();
     proc_slot_pool_check();
     wait_without_children_check();
     runtime_reclaim_check();
@@ -1119,6 +1120,42 @@ fn ptr_safety_check() {
         core::str::from_utf8(verdict).unwrap_or("<invalid utf8>")
     );
     assert_eq!(verdict, b"ok", "a system call accepted a bad pointer -- see ptrtest's FAIL lines above");
+}
+
+/// Runs `/bin/threads` (`rust/user/src/bin/threads.rs`) and requires its
+/// verdict to be `ok`: four real kernel threads in one team, a shared
+/// counter incremented under a semaphore that has to come out exact
+/// despite a critical section built to be preempted in, each join
+/// returning that thread's own status, and joining a non-thread refused.
+/// Afterwards the program exits with a fifth thread still spinning, and
+/// the whole team -- that thread included -- has to be gone, its slots
+/// back in the pool and its address space freed exactly once: checked
+/// here by requiring every dynamic slot the run used to be free again.
+fn threads_check() {
+    let before = memory::frame_stats().0;
+    let proc_nr = proc::alloc_proc_nr().expect("no free process slot for threads");
+    elf::spawn_from_fs("/bin/threads", proc_nr, "threads", 6, 16).expect("couldn't start /bin/threads");
+    let mut buf = [0u8; 8];
+    let n = read_when_available("/threads.out", &mut buf);
+    let verdict = &buf[..n.max(0) as usize];
+    serial_println!(
+        "[idle] /bin/threads verdict: {:?} (4 threads, a semaphore-guarded counter, joins)",
+        core::str::from_utf8(verdict).unwrap_or("<invalid utf8>")
+    );
+    assert_eq!(verdict, b"ok", "the threads test failed -- see its output above");
+    // The team (main thread plus the one left spinning) has to be gone.
+    let deadline = proc::uptime_ticks() + 120;
+    while proc::is_valid_proc_nr(proc_nr) {
+        assert!(proc::uptime_ticks() < deadline, "the threads team never finished exiting");
+        proc::yield_now();
+    }
+    let after = memory::frame_stats().0;
+    serial_println!(
+        "[idle] the threads team exited with a thread still running; its address space went back ({} frames in use before, {} after)",
+        before,
+        after
+    );
+    assert!(after <= before, "the threads team leaked {} frames", after - before);
 }
 
 /// Exercises the two ends of the dynamic process-number pool

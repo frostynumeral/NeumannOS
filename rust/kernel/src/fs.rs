@@ -70,7 +70,8 @@ struct OpenFile {
     /// silently redirecting the first process's writes (`console_task`'s
     /// long-lived `/console.log`, say) into someone else's file.
     ///
-    /// A process number *and* its generation (`proc::generation_of`):
+    /// A team leader's process number *and* its generation
+    /// (`proc::team_identity` -- a thread's descriptors are its team's):
     /// dynamic numbers are reused, and by number alone a reaped child's
     /// still-open files went to the next process given that number. The
     /// generation also retires a dead owner's descriptors -- `alloc_fd`
@@ -260,7 +261,8 @@ impl InMemoryFs {
                 let create = req.args[2] == 0;
                 let result = match self.open_path(name, create) {
                     Ok(file_index) => {
-                        let owner = (req.source, proc::generation_of(req.source).unwrap_or(0));
+                        // The *team*: every thread of a process shares its descriptors.
+                        let owner = proc::team_identity(req.source).unwrap_or((req.source, 0));
                         let fd = self.alloc_fd(OpenFile { file_index, position: 0, owner });
                         fd as i64
                     }
@@ -409,7 +411,7 @@ fn open_with(name: &str, create: bool) -> i64 {
 /// Whether `slot` holds a descriptor `source` opened. Anyone else's is
 /// `EBADF`, exactly as if it weren't open.
 fn owned_by(slot: &Option<OpenFile>, source: i32) -> bool {
-    matches!(slot, Some(f) if f.owner.0 == source && proc::generation_of(source) == Some(f.owner.1))
+    matches!(slot, Some(f) if proc::team_identity(source) == Some(f.owner))
 }
 
 /// Longest entry name `readdir` reports; longer ones are cut short.

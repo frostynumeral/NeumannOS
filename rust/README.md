@@ -357,7 +357,7 @@ the Rust ecosystem (rustc itself, `serde`, `tokio`, ...) uses.
   CPU didn't already save, calls `dispatch` with the caller's original
   `rax`/`rdi`/`rsi`/`rdx`/`rcx`, writes the `u64` result back into the
   saved `rax` slot, restores everything else unchanged, and `iretq`s.
-  `dispatch` implements nineteen calls (the newest -- `SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`, `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR` -- are described under "Ring-3 programs in Rust" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
+  `dispatch` implements twenty-six calls (the newest -- `SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`, `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR`, and the thread and semaphore calls 20-26 -- are described under "Ring-3 programs in Rust" and "Threads, teams and semaphores" below): `SYS_GET_UPTIME` (returns `proc::uptime_ticks()`),
   `SYS_WRITE_LINE` (reads a caller-supplied `(ptr, len)` string and prints
   it -- a genuine cross-ring pointer argument, safe to dereference
   directly because entering a trap gate never switches `CR3`, so
@@ -1009,9 +1009,10 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
 
 ### Known simplifications in the syscall ABI
 
-- **Nineteen calls exist** (`SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`,
-  `SYS_FS_CLOSE`, `SYS_FS_READDIR` and `SYS_FS_MKDIR` are the newest --
-  see the `rust/user/` section above), and all but the unrecognized-call-number
+- **Twenty-six calls exist** (`SYS_FS_OPEN_EXISTING`, `SYS_CONSOLE_WRITE`,
+  `SYS_FS_CLOSE`, `SYS_FS_READDIR`, `SYS_FS_MKDIR`, and the thread and
+  semaphore calls `SYS_THREAD_SPAWN`..`SYS_SEM_RELEASE` are the newest --
+  see the `rust/user/` and threads sections above), and all but the unrecognized-call-number
   fallback reach real server/kernel-call logic, including `SYS_FORK`
   from any ring-3 caller now (see the `src/syscall.rs`/`src/proc.rs`
   bullets above). Real enough to
@@ -1322,6 +1323,81 @@ finding (a `PAGE_SIZE` constant duplicating an existing named constant in
   in the child and unmapped in the parent, and `shell`'s own marker page
   is the reverse -- so "exec reached the right process" is checked, not
   assumed.
+
+### Threads, teams and semaphores
+
+MINIX 3.1 has one thread per process. This port now has real kernel
+threads, BeOS-style: a *team* (BeOS's word for a process -- the unit
+owning an address space, descriptors and semaphores) runs one or more
+threads, each its own process-table slot with its own kernel stack and
+registers, scheduled and preempted independently, all sharing the
+team's page tables (`Proc::team` names the leader; a thread's slot
+carries the leader's `cr3`).
+
+- `SYS_THREAD_SPAWN` (`proc::spawn_thread`) starts one at an entry point
+  on a stack the caller provides (checked to be the caller's own,
+  writable memory -- an entry point or stack in a kernel slot would have
+  `iretq` hand ring 3 the kernel's pages), with one argument.
+  `SYS_THREAD_EXIT` ends only the calling thread, leaving a status for
+  `SYS_THREAD_JOIN` (`proc::thread_join`, BeOS's `wait_for_thread`) --
+  handed straight to a thread already joining, or held in a zombie slot
+  until one does.
+- `exit()` from any thread, or a fault in any thread, ends the whole
+  team (`Scheduler::end_team`): the leader's status goes to its parent
+  as before, every other thread simply stops, and `rs` hears about the
+  team. The subtle part is a member blocked in IPC with a server -- queued
+  to send, or waiting for a reply that will still come. Freeing it would
+  have that reply land in a freed or reused slot (and a server sending
+  to a slot that isn't receiving blocks forever), so such a member is
+  marked `doomed` instead and ends itself on its way back out of the
+  call (`proc::die_if_doomed`, from `crate::syscall`'s `dispatch`). That
+  includes a member that *looks* runnable because the server already
+  replied before it got back to `receive` (the reply sits queued on its
+  `caller_q`) -- a review caught that window. While any member lingers,
+  the leader is parked `DRAINING` rather than terminated: it keeps its
+  status, its process number and so the team's identity until the last
+  member is gone, and only then does its parent (or `rs`) hear about it.
+  Terminating it at once let a lingering thread outlive a reaped leader
+  and pass for a thread of the *next* process given that number. The
+  address space is freed by the last member out (`release_address_space`
+  checks nothing else still runs in it). `threads linger` shows it: the
+  program exits with a thread blocked reading a line, and the shell's
+  `wait` returns only once a line has been typed and that thread has
+  finished its call.
+- The team is the unit everywhere a process was: `fs` descriptors are
+  owned by the team (`proc::team_identity`), a thread's `fork` makes a
+  child of the team, and `wait` from any thread collects the team's
+  children. `exec` with other threads running is refused
+  (`ERR_MULTITHREADED`) rather than tearing them out of whatever they're
+  blocked in.
+- Semaphores (`SYS_SEM_CREATE`/`DELETE`/`ACQUIRE`/`RELEASE`,
+  `proc::sem_*`) are counting semaphores in a 32-entry kernel table,
+  BeOS's basic synchronization primitive: `acquire` takes a unit or
+  blocks (`rts::SEM_WAIT`), `release` hands one straight to the
+  longest-waiting acquirer or back into the count (and a waiter that
+  dies before running to take its unit hands it on, `forfeit_grant`,
+  rather than leave the semaphore one short), and deleting one --
+  explicitly, or by its team ending -- wakes every waiter with an error.
+- `neumann_rt::thread` wraps it: `spawn(stack, f, arg)` (the function
+  and argument ride in a start block at the top of the thread's own
+  stack, since there's no heap), `Thread::join`, and `Semaphore`.
+  `/bin/threads` runs four threads incrementing one counter in a
+  critical section built to be preempted in; `crate::main`'s
+  `threads_check` requires the exact total, each join's own status, a
+  refused join of a non-thread, and -- after the program exits with a
+  fifth thread still spinning -- the whole team gone with its frames
+  back. From the shell, `threads race` runs it without the semaphore
+  and reports the lost updates (67 of 4000 in one run), `threads crash`
+  has a thread fault and the shell see the team killed (`[exit -1]`),
+  and `threads exec` shows the exec refusal.
+
+Known gaps: no thread priorities of its own, no thread names or
+`get_thread_info`, no semaphore timeouts or `acquire_sem_etc` counts,
+no ports (BeOS's message queues) -- IPC is still MINIX's rendezvous;
+the dynamic slot pool (`com::NR_DYNAMIC_PROCS`, now 16) is shared
+between processes and threads; and a doomed member blocked on a line
+of keyboard input lingers until a line is typed -- holding its team's
+`exit` status back from the parent until then, and taking that line.
 
 ### The on-screen text console
 
@@ -1684,7 +1760,7 @@ Roughly in the order the original kernel needs them:
     gate saves every general-purpose register, reads the caller's `rax`
     (call number) and `rdi`/`rsi`/`rdx`/`rcx` (up to four arguments, since
     grown from three -- see the `src/syscall.rs` bullet above),
-    dispatches to one of nineteen calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
+    dispatches to one of twenty-six calls (`SYS_GET_UPTIME`; `SYS_WRITE_LINE`
     -- a real cross-ring pointer argument, read directly since entering a
     trap gate never switches `CR3`; `SYS_SET_ALARM`/`SYS_WAIT_ALARM` --
     the first of `crate::calls`' own kernel calls reachable from ring 3,
@@ -1731,7 +1807,7 @@ Roughly in the order the original kernel needs them:
     child's canary write (proving its memory is a real, independent copy)
     and its own `SYS_FS_OPEN`/`SYS_FS_WRITE`, both checked back from
     `IDLE`. See "known simplifications in the syscall ABI" above for what's
-    not a real syscall surface yet (nineteen calls, one code per *kind* of
+    not a real syscall surface yet (twenty-six calls, one code per *kind* of
     dispatch-level mistake rather than a real per-cause `errno` set).
     `SYS_FORK` is no longer restricted to one known caller with one
     reserved child slot: the pages to copy come out of the caller's own

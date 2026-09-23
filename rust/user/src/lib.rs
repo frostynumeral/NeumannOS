@@ -29,6 +29,7 @@
 use core::fmt;
 
 pub mod sys;
+pub mod thread;
 
 /// The program's arguments and environment, exactly as `exec` laid them
 /// out on the stack. Every string is borrowed straight from there, which

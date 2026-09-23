@@ -49,3 +49,8 @@ bench = false
 name = "mkdir"
 test = false
 bench = false
+
+[[bin]]
+name = "threads"
+test = false
+bench = false

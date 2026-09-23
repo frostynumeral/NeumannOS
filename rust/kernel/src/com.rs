@@ -83,13 +83,14 @@ pub const SH_PROC_NR: i32 = 12;
 /// one known task; a small pool plus `alloc_proc_nr` is what makes it a
 /// real call any process can make, as many times as there are slots.
 pub const FIRST_DYNAMIC_PROC_NR: i32 = SH_PROC_NR + 1;
-/// Six is headroom rather than a measurement: `user/shell.s` has at
+/// Sixteen (it was six, before threads: every thread is a slot too) is
+/// headroom rather than a measurement: `user/shell.s` has at
 /// most two children alive at once, `tty` one, and a console-launched
 /// service one, so four would do -- but two of `shell`'s children exit
 /// and are reaped (`crate::proc::wait_for_child`), and sizing the pool
 /// to the exact peak would make the difference between "reaped" and
 /// "still allocated" the difference between working and not.
-pub const NR_DYNAMIC_PROCS: usize = 6;
+pub const NR_DYNAMIC_PROCS: usize = 16;
 
 /// A name for each dynamically allocated slot. `crate::proc::Proc::name`
 /// is a `&'static str` -- fine for a fixed system image, where every
@@ -106,6 +107,16 @@ pub const fn dynamic_proc_name(proc_nr: i32) -> &'static str {
         3 => "forked child 4",
         4 => "forked child 5",
         5 => "forked child 6",
+        6 => "forked child 7",
+        7 => "forked child 8",
+        8 => "forked child 9",
+        9 => "forked child 10",
+        10 => "forked child 11",
+        11 => "forked child 12",
+        12 => "forked child 13",
+        13 => "forked child 14",
+        14 => "forked child 15",
+        15 => "forked child 16",
         _ => "forked child",
     }
 }

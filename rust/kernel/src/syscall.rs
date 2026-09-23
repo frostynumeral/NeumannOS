@@ -131,6 +131,24 @@ pub const SYS_FS_CLOSE: u64 = 17;
 pub const SYS_FS_READDIR: u64 = 18;
 /// Create the directory at `rdi`/`rsi`.
 pub const SYS_FS_MKDIR: u64 = 19;
+/// Start a thread in the caller's team at `rdi` (entry point) on the
+/// stack whose initial `rsp` is `rsi`, with `rdx` in its `rdi`. Returns
+/// the new thread's id (a process number).
+pub const SYS_THREAD_SPAWN: u64 = 20;
+/// End the calling thread with status `rdi` (not the team: that's
+/// `SYS_EXIT`). A team's leader can't.
+pub const SYS_THREAD_EXIT: u64 = 21;
+/// Wait for thread `rdi` of the caller's team to exit; its status is
+/// written to `rsi` if non-zero. Returns `0`.
+pub const SYS_THREAD_JOIN: u64 = 22;
+/// Create a semaphore with `rdi` units; returns its id.
+pub const SYS_SEM_CREATE: u64 = 23;
+/// Delete semaphore `rdi` (the owning team only), failing its waiters.
+pub const SYS_SEM_DELETE: u64 = 24;
+/// Take a unit of semaphore `rdi`, blocking until one is free.
+pub const SYS_SEM_ACQUIRE: u64 = 25;
+/// Give a unit of semaphore `rdi` back.
+pub const SYS_SEM_RELEASE: u64 = 26;
 
 /// Longest `SYS_VIRCOPY` copy this port will perform in one call, purely
 /// a sanity bound on an untrusted `len` from ring 3 -- matches the size
@@ -215,6 +233,18 @@ pub const ERR_BAD_ARG_PTR: u64 = (-12i64) as u64;
 /// than `MAX_EXEC_VECTOR` entries in either vector, or more than
 /// `elf::MAX_START_ARGS_BYTES` once laid out. POSIX's `E2BIG`.
 pub const ERR_ARGS_TOO_BIG: u64 = (-13i64) as u64;
+/// `SYS_EXEC` from a team with more than one thread. A real `execve`
+/// ends every other thread first; this port refuses instead, rather
+/// than tear threads out from under calls they may be blocked in.
+pub const ERR_MULTITHREADED: u64 = (-14i64) as u64;
+/// A thread call naming something that isn't a thread of the caller's
+/// team -- or `SYS_THREAD_EXIT` from a team's leader.
+pub const ERR_NOT_A_THREAD: u64 = (-15i64) as u64;
+/// A semaphore call naming no semaphore (or one deleted while waiting).
+pub const ERR_BAD_SEM: u64 = (-16i64) as u64;
+/// `SYS_SEM_CREATE` with the semaphore table full. (-18, not -17: that's
+/// `fs`'s `EEXIST`, and the two ranges share `rax`.)
+pub const ERR_NO_FREE_SEM: u64 = (-18i64) as u64;
 
 /// Most entries `SYS_EXEC` reads out of either `argv` or `envp` before
 /// giving up with `ERR_ARGS_TOO_BIG`. Only a bound on how long the
@@ -386,6 +416,16 @@ fn copy_in_vector(caller: i32, vec: u64, budget: &mut usize) -> Result<Vec<Vec<u
 /// and the `SYS_FORK` match arm below). `entry`'s doc comment has the full
 /// register-to-argument mapping.
 extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, frame_ptr: u64) -> u64 {
+    let result = dispatch_call(call_num, arg1, arg2, arg3, arg4, frame_ptr);
+    // The first moment a slot blocked in IPC when its team ended runs
+    // again is right here, on its way back to ring 3: end it now
+    // (`proc::die_if_doomed`) rather than let it return into a team that
+    // no longer exists.
+    proc::die_if_doomed();
+    result
+}
+
+fn dispatch_call(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, frame_ptr: u64) -> u64 {
     let caller = proc::current_proc_nr();
     match call_num {
         SYS_GET_UPTIME => {
@@ -493,6 +533,58 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             }
         }
         SYS_FS_CLOSE => fs::close(arg1 as i64) as u64,
+        SYS_THREAD_SPAWN => {
+            // Safety: see `SYS_FORK`'s use of `frame_ptr` below.
+            let caller_frame = unsafe { *(frame_ptr as *const proc::TrapFrame) };
+            if caller_frame.cs & 3 != 3 {
+                return ERR_NOT_RING3;
+            }
+            // Both addresses have to be the caller's own memory: an entry
+            // point or stack in a kernel slot would have `iretq` hand the
+            // kernel's pages to ring 3 (or fault in ring 0 on a
+            // non-canonical one, which halts the machine). The stack also
+            // has to be writable -- its first push is the thread's.
+            let (entry, stack) = (arg1, arg2);
+            let in_user = |addr: u64| {
+                VirtAddr::try_new(addr)
+                    .is_ok_and(|va| memory::pml4_slots_unused(proc::kernel_cr3(), va, va))
+            };
+            if !in_user(entry) || stack < 16 || check_writable(caller, stack - 16, 16).is_err() {
+                return ERR_BAD_ARG_PTR;
+            }
+            let Some(child) = proc::alloc_proc_nr() else { return ERR_NO_FREE_PROC };
+            let mut frame = caller_frame.exec_into(entry, stack);
+            frame.rdi = arg3;
+            proc::spawn_thread(caller, child, &frame);
+            serial_println!("[syscall] proc {}: SYS_THREAD_SPAWN -> thread {}", caller, child);
+            child as u64
+        }
+        SYS_THREAD_EXIT => match proc::thread_exit(arg1 as i32) {
+            Err(()) => ERR_NOT_A_THREAD,
+        },
+        SYS_THREAD_JOIN => {
+            if arg2 != 0 {
+                if let Err(err) = check_writable(caller, arg2, 4) {
+                    return err;
+                }
+            }
+            match proc::thread_join(arg1 as i32) {
+                Ok(status) => {
+                    if arg2 != 0 {
+                        let _ = copy_to_caller(caller, arg2, &status.to_le_bytes());
+                    }
+                    0
+                }
+                Err(proc::JoinError::NotAThread) => ERR_NOT_A_THREAD,
+            }
+        }
+        SYS_SEM_CREATE => match proc::sem_create(arg1 as i32) {
+            Some(id) => id as u64,
+            None => ERR_NO_FREE_SEM,
+        },
+        SYS_SEM_DELETE => proc::sem_delete(arg1 as usize).map_or(ERR_BAD_SEM, |()| 0),
+        SYS_SEM_ACQUIRE => proc::sem_acquire(arg1 as usize).map_or(ERR_BAD_SEM, |()| 0),
+        SYS_SEM_RELEASE => proc::sem_release(arg1 as usize).map_or(ERR_BAD_SEM, |()| 0),
         SYS_FS_READDIR | SYS_FS_MKDIR => {
             if arg2 as usize > MAX_FS_BUF {
                 return ERR_BAD_LENGTH;
@@ -832,6 +924,9 @@ extern "C" fn dispatch(call_num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64
             if caller_cs & 3 != 3 {
                 serial_println!("[syscall] proc {}: SYS_EXEC from ring {}, refusing", caller, caller_cs & 3);
                 return ERR_EXEC_NOT_RING3;
+            }
+            if proc::team_size(caller) > 1 {
+                return ERR_MULTITHREADED;
             }
 
             // Reading the program out of `fs` blocks on real IPC round

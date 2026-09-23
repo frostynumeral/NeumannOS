@@ -54,6 +54,7 @@ use crate::com;
 use crate::gdt;
 use crate::ipc::Message;
 use crate::memory::MemMap;
+use alloc::vec::Vec;
 
 pub const NR_SCHED_QUEUES: usize = 16;
 pub const TASK_Q: u8 = 0;
@@ -70,9 +71,9 @@ const BOOTSTRAP: usize = NR_PROCS - 1;
 /// Bits for `Proc::rts_flags`, mirroring `SLOT_FREE`/`SENDING`/`RECEIVING`
 /// in `kernel/proc.h`. A process is runnable iff `rts_flags == 0`.
 pub mod rts {
-    pub const SLOT_FREE: u8 = 0x01;
-    pub const SENDING: u8 = 0x04;
-    pub const RECEIVING: u8 = 0x08;
+    pub const SLOT_FREE: u16 = 0x01;
+    pub const SENDING: u16 = 0x04;
+    pub const RECEIVING: u16 = 0x08;
     /// Set by `crate::proc::kill` (a fault in a ring-3 task -- see
     /// `crate::interrupts`) and never cleared: this slot is permanently
     /// off every ready queue until a fresh `spawn()` overwrites it
@@ -81,26 +82,38 @@ pub mod rts {
     /// once `RS`/`PM` finish tearing it down; this port has no teardown
     /// step (no memory to free -- see `crate::rs`), so `DEAD` just marks
     /// "never schedule this slot again" until it's respawned.
-    pub const DEAD: u8 = 0x10;
+    pub const DEAD: u16 = 0x10;
     /// Exited (or was killed) and still holds an uncollected exit
     /// status: a zombie, `mp_flags & ZOMBIE` in `servers/pm/mproc.h`.
     /// The slot -- and so the process number -- stays allocated until a
     /// parent collects the status (`crate::proc::wait_for_child`), which
     /// is the whole reason zombies exist: the status has to outlive the
     /// process it describes.
-    pub const ZOMBIE: u8 = 0x40;
+    pub const ZOMBIE: u16 = 0x40;
     /// Blocked in `crate::proc::wait_for_child` until one of this
     /// process's children terminates. `mp_flags & WAITING` in
     /// `servers/pm/mproc.h`; a distinct state from `RECEIVING` because
     /// what wakes it is a child exiting, not a message arriving.
-    pub const WAITING: u8 = 0x80;
+    pub const WAITING: u16 = 0x80;
     /// Claimed by `crate::proc::alloc_proc_nr` but not yet filled in by
     /// the `spawn`/`fork_current` that asked for it: not free (so a
     /// second allocation skips it) and not runnable (so the scheduler
     /// never picks a slot that holds nothing). No MINIX counterpart --
     /// there, `PM` owns process-slot allocation and the kernel only ever
     /// sees a slot that is already a real process.
-    pub const RESERVED: u8 = 0x20;
+    pub const RESERVED: u16 = 0x20;
+    /// Blocked in `crate::proc::thread_join` until the thread it names
+    /// (`Proc::join_target`) exits.
+    pub const JOINING: u16 = 0x100;
+    /// Blocked in `crate::proc::sem_acquire` until a unit of the
+    /// semaphore in `Proc::sem_wait` is released to it.
+    pub const SEM_WAIT: u16 = 0x200;
+    /// A team's leader that has ended while other members are still
+    /// finishing calls they were blocked in (`Proc::doomed`): parked,
+    /// holding its status (and so its process number, and its team's
+    /// identity) until the last of them is gone, when it terminates for
+    /// real and its parent (and `RS`) hear about it.
+    pub const DRAINING: u16 = 0x400;
 }
 
 /// Everything a process's own address space consists of: the top-level
@@ -119,7 +132,7 @@ pub struct AddressSpace {
 pub struct Proc {
     pub proc_nr: i32,
     pub name: &'static str,
-    rts_flags: u8,
+    rts_flags: u16,
     priority: u8,
     max_priority: u8,
     ticks_left: i32,
@@ -202,6 +215,30 @@ pub struct Proc {
     /// Analogous to `kernel/clock.c`'s per-process alarm timer, minus the
     /// sorted-queue optimization (see `clock_tick`'s doc comment).
     alarm: Option<u64>,
+    /// The process number of this slot's *team* leader -- itself, for
+    /// every ordinary process; the process that created it, for a thread
+    /// (`spawn_thread`). BeOS's word for a process is "team": the unit
+    /// that owns an address space, descriptors and semaphores, with one
+    /// or more threads running in it. Every thread of a team is its own
+    /// slot here (own kernel stack, own registers, scheduled on its own)
+    /// sharing the leader's `cr3`.
+    team: i32,
+    /// Set when this slot's team was told to terminate while it was
+    /// blocked in IPC with a server that will still reply to it (see
+    /// `Scheduler::must_linger`). It can't be freed then -- the reply
+    /// would land in a freed or reused slot, and a server sending to a
+    /// slot that never receives blocks forever -- so it runs until that
+    /// call returns, and `die_if_doomed` ends it on the way back out.
+    /// `(status, crashed)`: what the team ended with.
+    doomed: Option<(i32, bool)>,
+    /// With `rts::JOINING`: the thread this one is waiting for.
+    join_target: i32,
+    /// With `rts::SEM_WAIT`: which semaphore, and this waiter's place in
+    /// line (lower goes first).
+    sem_wait: Option<(usize, u64)>,
+    /// Set by `sem_release` when it hands a unit of this semaphore
+    /// straight to this waiter, until the waiter runs and takes it.
+    sem_granted: Option<usize>,
 }
 
 fn never_spawned() -> ! {
@@ -238,6 +275,11 @@ impl Proc {
             exit_status: None,
             wait_result: None,
             alarm: None,
+            team: com::NONE,
+            doomed: None,
+            join_target: com::NONE,
+            sem_wait: None,
+            sem_granted: None,
         }
     }
 
@@ -296,6 +338,29 @@ struct Scheduler {
     /// owning by number alone handed a dead child's open files to the
     /// next process given its number.
     generations: [u32; NR_PROCS],
+    /// The semaphore table (`sem_create` and friends).
+    sems: [Sem; NR_SEMS],
+    /// Next `sem_wait` ticket: waiters are served in arrival order.
+    sem_seq: u64,
+}
+
+/// How many semaphores exist system-wide.
+pub const NR_SEMS: usize = 32;
+
+/// A counting semaphore, BeOS's basic synchronization primitive
+/// (`create_sem`/`acquire_sem`/`release_sem`/`delete_sem` in the Be
+/// kernel kit): `count` units are available, `acquire` takes one or
+/// blocks until one is released. Owned by the team that created it,
+/// which is what deletes it -- explicitly, or by terminating.
+#[derive(Clone, Copy)]
+struct Sem {
+    in_use: bool,
+    count: i32,
+    owner_team: i32,
+}
+
+impl Sem {
+    const FREE: Sem = Sem { in_use: false, count: 0, owner_team: com::NONE };
 }
 
 impl Scheduler {
@@ -438,21 +503,27 @@ impl Scheduler {
         // Detached here, under the lock, so nothing can observe a
         // terminated slot still pointing at memory that is about to be
         // handed back.
-        let address_space = self.procs[idx].cr3.take();
-        self.procs[idx].mem_map = MemMap::EMPTY;
+        let address_space = self.release_address_space(idx);
 
         let proc_nr = self.procs[idx].proc_nr;
         let live_parent = Some(self.procs[idx].parent)
             .filter(|&parent| parent != com::NONE)
             .map(com::slot)
             .filter(|&parent| self.procs[parent].rts_flags & rts::SLOT_FREE == 0);
+        // Whichever thread of the parent's team is blocked in `wait`: a
+        // child belongs to the team, not to the one thread that forked it.
+        let waiter = live_parent.and_then(|parent| {
+            let team = self.procs[parent].team;
+            (0..NR_PROCS).find(|&i| self.is_member(i, team) && self.procs[i].rts_flags & rts::WAITING != 0)
+        });
 
         match live_parent {
-            Some(parent) if self.procs[parent].rts_flags & rts::WAITING != 0 => {
-                self.procs[parent].wait_result = Some((proc_nr, status));
-                self.procs[parent].rts_flags &= !rts::WAITING;
-                if self.procs[parent].rts_flags == 0 {
-                    self.enqueue(parent);
+            Some(_) if waiter.is_some() => {
+                let waiter = waiter.unwrap();
+                self.procs[waiter].wait_result = Some((proc_nr, status));
+                self.procs[waiter].rts_flags &= !rts::WAITING;
+                if self.procs[waiter].rts_flags == 0 {
+                    self.enqueue(waiter);
                 }
                 self.free_slot(idx);
             }
@@ -463,6 +534,205 @@ impl Scheduler {
             None => self.free_slot(idx),
         }
         address_space
+    }
+
+    /// Detach `idx`'s address space and memory map, returning the page
+    /// table to free -- or `None` if some other live slot still runs in
+    /// it (another thread of the same team), in which case the last one
+    /// out frees it instead.
+    fn release_address_space(&mut self, idx: usize) -> Option<PhysFrame> {
+        let pml4 = self.procs[idx].cr3.take()?;
+        self.procs[idx].mem_map = MemMap::EMPTY;
+        let shared = (0..NR_PROCS).any(|i| {
+            i != idx && self.procs[i].rts_flags & rts::SLOT_FREE == 0 && self.procs[i].cr3 == Some(pml4)
+        });
+        (!shared).then_some(pml4)
+    }
+
+    /// Whether slot `i` holds a live (not free, not merely reserved)
+    /// member of `team`.
+    fn is_member(&self, i: usize, team: i32) -> bool {
+        let flags = self.procs[i].rts_flags;
+        flags & rts::SLOT_FREE == 0 && flags != rts::RESERVED && self.procs[i].team == team && team != com::NONE
+    }
+
+    /// Whether `idx` is blocked where freeing it would be unsafe: queued
+    /// to send (it sits in the destination's `caller_q`), or waiting for
+    /// a reply from a particular server, which will still arrive -- into
+    /// a freed or reused slot, or, since a send to a slot that isn't
+    /// receiving blocks, not at all, hanging the server. Every other
+    /// blocked state (`WAITING`, `JOINING`, `SEM_WAIT`, an alarm wait on
+    /// `CLOCK`, `SYS_BLOCK_FOREVER`'s receive from anyone) is this
+    /// module's own bookkeeping and can be dropped on the spot.
+    ///
+    /// Plus one state that looks runnable: a server that has *already*
+    /// replied, before the caller got back to `receive` (`send_receive`
+    /// sends, the higher-priority server runs and replies at once, and
+    /// blocks queued on the caller's `caller_q`). Freeing the caller then
+    /// would wipe that queue and leave the server sending to a dead number
+    /// forever.
+    fn must_linger(&self, idx: usize) -> bool {
+        let p = &self.procs[idx];
+        p.rts_flags & rts::SENDING != 0
+            || (p.rts_flags & rts::RECEIVING != 0 && p.get_from != com::ANY && p.get_from != com::CLOCK)
+            || p.caller_q.is_some()
+    }
+
+    /// Whether `team` has a live member other than its leader.
+    fn has_other_members(&self, team: i32) -> bool {
+        let leader = com::slot(team);
+        (0..NR_PROCS).any(|i| i != leader && self.is_member(i, team))
+    }
+
+    /// Hand a unit `sem_release` granted to `idx` -- which is going away
+    /// before it ran to take it -- on to the next waiter, or back to the
+    /// count; otherwise the semaphore would be one short for good.
+    fn forfeit_grant(&mut self, idx: usize) {
+        if let Some(id) = self.procs[idx].sem_granted.take() {
+            if self.sems[id].in_use {
+                self.release_unit(id);
+            }
+        }
+    }
+
+    /// `sem_release`'s core: give one unit of `id` to the longest waiter,
+    /// or back to the count.
+    fn release_unit(&mut self, id: usize) {
+        let next = (0..NR_PROCS)
+            .filter_map(|i| self.procs[i].sem_wait.filter(|&(sem, _)| sem == id).map(|(_, t)| (t, i)))
+            .min();
+        match next {
+            Some((_, waiter)) => {
+                self.procs[waiter].sem_wait = None;
+                self.procs[waiter].sem_granted = Some(id);
+                self.procs[waiter].rts_flags &= !rts::SEM_WAIT;
+                if self.procs[waiter].rts_flags == 0 {
+                    self.enqueue(waiter);
+                }
+            }
+            None => self.sems[id].count = self.sems[id].count.saturating_add(1),
+        }
+    }
+
+    /// The leader's end: terminate it (status to its parent, `RS` told if
+    /// it crashed) -- unless members are still finishing calls, in which
+    /// case it's parked `DRAINING` with its status, keeping its number
+    /// and the team's identity reserved until `finish_thread` sees the
+    /// last of them go. Without that, a lingering thread could outlive a
+    /// reaped leader and be taken for a thread of the *next* process
+    /// given that number.
+    fn finish_leader(&mut self, leader: usize, status: i32, crashed: bool) -> Option<PhysFrame> {
+        let team = self.procs[leader].proc_nr;
+        self.forfeit_grant(leader);
+        // Out of any semaphore's line, too: the leader may be waiting on
+        // *another* team's semaphore (which `end_team` doesn't delete),
+        // and a zombie or draining slot left in line would be handed a
+        // unit it can never take. (Threads don't need this: `discard`
+        // frees the slot, which clears it.)
+        self.procs[leader].sem_wait = None;
+        self.procs[leader].rts_flags &= !rts::SEM_WAIT;
+        if self.has_other_members(team) {
+            if self.procs[leader].rts_flags == 0 {
+                self.dequeue(leader);
+            }
+            if self.current == leader {
+                self.pick_proc();
+            }
+            self.procs[leader].rts_flags |= rts::DRAINING;
+            self.procs[leader].doomed = Some((status, crashed));
+            return None;
+        }
+        let space = self.terminate(leader, status, crashed);
+        if crashed {
+            self.try_deliver_notification(com::slot(com::RS_PROC_NR), com::KERNEL, com::proc_died(team));
+        }
+        space
+    }
+
+    /// A non-leader member's end, with no status to keep: discard it, and
+    /// if that was the last member a `DRAINING` leader was waiting for,
+    /// finish the leader too.
+    fn finish_thread(&mut self, idx: usize) -> Option<PhysFrame> {
+        let team = self.procs[idx].team;
+        self.forfeit_grant(idx);
+        let mut space = self.discard(idx);
+        let leader = com::slot(team);
+        if self.is_member(leader, team)
+            && self.procs[leader].rts_flags & rts::DRAINING != 0
+            && !self.has_other_members(team)
+        {
+            let (status, crashed) = self.procs[leader].doomed.take().unwrap_or((STATUS_KILLED, true));
+            self.procs[leader].rts_flags &= !rts::DRAINING;
+            if let Some(s) = self.finish_leader(leader, status, crashed) {
+                space = Some(s);
+            }
+        }
+        space
+    }
+
+    /// Remove a thread (never a leader) outright: no status, nothing to
+    /// collect. Returns the address space if it was the last one in it.
+    fn discard(&mut self, idx: usize) -> Option<PhysFrame> {
+        if self.procs[idx].rts_flags == 0 {
+            self.dequeue(idx);
+        }
+        if self.current == idx {
+            self.pick_proc();
+        }
+        let space = self.release_address_space(idx);
+        self.free_slot(idx);
+        space
+    }
+
+    /// End every member of `team`, the leader last, the way `exit()` or a
+    /// fatal fault ends a whole process however many threads it has: the
+    /// leader's status goes to its parent as usual (`terminate`), and
+    /// every other thread simply stops. A member blocked in IPC with a
+    /// server (`must_linger`) is marked `doomed` instead and finishes
+    /// dying when that call returns (`die_if_doomed`); the address space
+    /// outlives it, so the last member out frees it. The team's
+    /// semaphores go too, waking any waiter from another team.
+    ///
+    /// Returns the address space to free, if nothing still runs in it.
+    fn end_team(&mut self, team: i32, status: i32, crashed: bool) -> Option<PhysFrame> {
+        let leader = com::slot(team);
+        let mut freed = None;
+        for i in 0..NR_PROCS {
+            if i == leader || !self.is_member(i, team) || self.procs[i].doomed.is_some() {
+                continue;
+            }
+            if self.must_linger(i) {
+                self.procs[i].doomed = Some((status, crashed));
+            } else if let Some(space) = self.finish_thread(i) {
+                freed = Some(space);
+            }
+        }
+        for id in 0..NR_SEMS {
+            if self.sems[id].in_use && self.sems[id].owner_team == team {
+                self.delete_sem(id);
+            }
+        }
+        if self.is_member(leader, team) && self.procs[leader].doomed.is_none() {
+            if self.must_linger(leader) {
+                self.procs[leader].doomed = Some((status, crashed));
+            } else if let Some(space) = self.finish_leader(leader, status, crashed) {
+                freed = Some(space);
+            }
+        }
+        freed
+    }
+
+    fn delete_sem(&mut self, id: usize) {
+        self.sems[id] = Sem::FREE;
+        for i in 0..NR_PROCS {
+            if self.procs[i].sem_wait.is_some_and(|(sem, _)| sem == id) {
+                self.procs[i].sem_wait = None;
+                self.procs[i].rts_flags &= !rts::SEM_WAIT;
+                if self.procs[i].rts_flags == 0 {
+                    self.enqueue(i);
+                }
+            }
+        }
     }
 
     /// Deliver a notification (`m_type`, appearing to come from
@@ -502,6 +772,8 @@ lazy_static::lazy_static! {
         ticks: 0,
         kernel_cr3: Cr3::read(),
         generations: [0; NR_PROCS],
+        sems: [Sem::FREE; NR_SEMS],
+        sem_seq: 0,
     });
 }
 
@@ -586,6 +858,11 @@ pub fn spawn(
             exit_status: None,
             wait_result: None,
             alarm: None,
+            team: proc_nr,
+            doomed: None,
+            join_target: com::NONE,
+            sem_wait: None,
+            sem_granted: None,
         };
         sched.enqueue(idx);
     });
@@ -786,6 +1063,25 @@ pub fn fork_current(
     address_space: AddressSpace,
     frame: &TrapFrame,
 ) {
+    install_trapped(parent_proc_nr, child_proc_nr, child_proc_nr, name, priority, quantum, preemptible, address_space, frame);
+}
+
+/// The part `fork_current` and `spawn_thread` share: fill `child_proc_nr`'s
+/// slot with a task whose first run resumes `frame` in ring 3. `team` is
+/// the child itself for a forked process, and the creating team's
+/// leader for a thread.
+#[allow(clippy::too_many_arguments)]
+fn install_trapped(
+    parent_proc_nr: i32,
+    child_proc_nr: i32,
+    team: i32,
+    name: &'static str,
+    priority: u8,
+    quantum: i32,
+    preemptible: bool,
+    address_space: AddressSpace,
+    frame: &TrapFrame,
+) {
     let idx = com::slot(child_proc_nr);
     let rsp = unsafe {
         let base = (stack_top(idx) as usize & !0xf) as *mut u64;
@@ -828,6 +1124,11 @@ pub fn fork_current(
             exit_status: None,
             wait_result: None,
             alarm: None,
+            team,
+            doomed: None,
+            join_target: com::NONE,
+            sem_wait: None,
+            sem_granted: None,
         };
         sched.enqueue(idx);
     });
@@ -1030,12 +1331,41 @@ pub fn exit_now(status: i32) -> ! {
         let idx = sched.current;
         let proc_nr = sched.procs[idx].proc_nr;
         let name = sched.procs[idx].name;
-        (proc_nr, name, sched.terminate(idx, status, false), sched.kernel_cr3)
+        // The whole team: `exit()` from any thread ends the process.
+        let team = sched.procs[idx].team;
+        (proc_nr, name, sched.end_team(team, status, false), sched.kernel_cr3)
     });
     crate::serial_println!("[proc] {} (proc_nr {}) exited with status {}", name, proc_nr, status);
-    reclaim(address_space, true, kernel_cr3, name, proc_nr);
+    reclaim(address_space, kernel_cr3, name, proc_nr);
     reschedule();
     unreachable!("a process that has exited was scheduled again")
+}
+
+/// Finish off the calling slot if its team was told to terminate while it
+/// was blocked in IPC (`Proc::doomed`). `crate::syscall`'s `dispatch`
+/// calls this on the way back out of every system call, which is the
+/// first moment such a slot runs again. Returns normally if it isn't
+/// doomed.
+pub fn die_if_doomed() {
+    let doomed = with_scheduler(|sched| sched.procs[sched.current].doomed);
+    let Some((status, crashed)) = doomed else { return };
+    disable();
+    let (proc_nr, name, address_space, kernel_cr3) = with_scheduler(|sched| {
+        let idx = sched.current;
+        sched.procs[idx].doomed = None;
+        let proc_nr = sched.procs[idx].proc_nr;
+        let name = sched.procs[idx].name;
+        let space = if sched.procs[idx].team == proc_nr {
+            sched.finish_leader(idx, status, crashed)
+        } else {
+            sched.finish_thread(idx)
+        };
+        (proc_nr, name, space, sched.kernel_cr3)
+    });
+    crate::serial_println!("[proc] {} (proc_nr {}) finished its call and ended with its team", name, proc_nr);
+    reclaim(address_space, kernel_cr3, name, proc_nr);
+    reschedule();
+    unreachable!("a doomed slot was scheduled again")
 }
 
 /// `wait()`: block until one of the calling process's children
@@ -1063,7 +1393,8 @@ pub fn wait_for_child() -> Option<(i32, i32)> {
     loop {
         let outcome = with_scheduler(|sched| {
             let idx = sched.current;
-            let me = sched.procs[idx].proc_nr;
+            // Children belong to the team, whichever of its threads forked them.
+            let me = sched.procs[idx].team;
 
             // Handed to us directly by a child that terminated while we
             // were already blocked here (`Scheduler::terminate`).
@@ -1149,18 +1480,21 @@ pub fn kill(proc_nr: i32, reason: &str) {
             return None;
         }
         let name = sched.procs[idx].name;
-        let was_current = sched.current == idx;
-        let address_space = sched.terminate(idx, STATUS_KILLED, true);
-        sched.try_deliver_notification(com::slot(com::RS_PROC_NR), com::KERNEL, com::proc_died(proc_nr));
-        Some((name, address_space, was_current, sched.kernel_cr3))
+        // A fault in any thread is fatal to its whole team, as a fatal
+        // signal is to a whole POSIX process; `RS` hears about the team.
+        let team = sched.procs[idx].team;
+        // `RS` is told once the leader actually terminates
+        // (`finish_leader`) -- not now, if members are still draining.
+        let address_space = sched.end_team(team, STATUS_KILLED, true);
+        Some((name, address_space, sched.kernel_cr3))
     });
 
-    let (name, address_space, was_current, kernel_cr3) = match dying {
+    let (name, address_space, kernel_cr3) = match dying {
         Some(dying) => dying,
         None => return,
     };
     crate::serial_println!("[proc] {} (proc_nr {}) killed: {}", name, proc_nr, reason);
-    reclaim(address_space, was_current, kernel_cr3, name, proc_nr);
+    reclaim(address_space, kernel_cr3, name, proc_nr);
 }
 
 /// Hand a terminated process's address space back, outside the
@@ -1174,15 +1508,11 @@ pub fn kill(proc_nr: i32, reason: &str) {
 /// kernel's own address space is always a safe place to stand: this
 /// code, this stack and the physical-memory window are mapped there
 /// identically.
-fn reclaim(
-    address_space: Option<PhysFrame>,
-    was_current: bool,
-    kernel_cr3: (PhysFrame, Cr3Flags),
-    name: &str,
-    proc_nr: i32,
-) {
+fn reclaim(address_space: Option<PhysFrame>, kernel_cr3: (PhysFrame, Cr3Flags), name: &str, proc_nr: i32) {
     let Some(address_space) = address_space else { return };
-    if was_current {
+    // Whoever is running may be standing in it -- the dying process
+    // itself, or one of its threads.
+    if Cr3::read().0 == address_space {
         unsafe { Cr3::write(kernel_cr3.0, kernel_cr3.1) };
     }
     // Safety: detached from the process table by `Scheduler::terminate`
@@ -1193,6 +1523,246 @@ fn reclaim(
 
 /// The `(PhysFrame, Cr3Flags)` `proc_nr`'s address space is rooted at --
 /// its own (`Proc::cr3`), or the kernel's default if it doesn't have one.
+/// The leader of `proc_nr`'s team (itself, for an ordinary process).
+pub fn team_of(proc_nr: i32) -> i32 {
+    with_scheduler(|sched| sched.procs[com::slot(proc_nr)].team)
+}
+
+/// `(team leader, leader's generation)` for `proc_nr` -- the identity
+/// `crate::fs` records as a descriptor's owner, so every thread of a
+/// team can use the team's descriptors, and a reused number can't.
+pub fn team_identity(proc_nr: i32) -> Option<(i32, u32)> {
+    if !is_valid_proc_nr(proc_nr) {
+        return None;
+    }
+    let team = team_of(proc_nr);
+    generation_of(team).map(|g| (team, g))
+}
+
+/// How many live slots `proc_nr`'s team has (threads plus the leader).
+pub fn team_size(proc_nr: i32) -> usize {
+    with_scheduler(|sched| {
+        let team = sched.procs[com::slot(proc_nr)].team;
+        // A thread that exited and hasn't been joined is a zombie, not a
+        // running thread: it doesn't stand in the way of `exec`.
+        (0..NR_PROCS)
+            .filter(|&i| sched.is_member(i, team) && sched.procs[i].rts_flags & rts::ZOMBIE == 0)
+            .count()
+    })
+}
+
+/// Start a new thread in the calling process's team: `child` (from
+/// `alloc_proc_nr`) resumes `frame` in ring 3, in the same address space
+/// as the caller. `frame` is the caller's trap frame with the new
+/// thread's `rip`/`rsp`/argument already filled in (`crate::syscall`'s
+/// `SYS_THREAD_SPAWN`). There is no C original to port: MINIX 3.1 has one
+/// thread per process. This is BeOS's `spawn_thread` -- a thread is a
+/// full kernel-scheduled entity, not a user-level coroutine.
+pub fn spawn_thread(caller: i32, child: i32, frame: &TrapFrame) {
+    let (team, priority, quantum, preemptible, space) = with_scheduler(|sched| {
+        let p = &sched.procs[com::slot(caller)];
+        let space = AddressSpace { pml4: p.cr3.expect("a ring-3 caller has an address space"), map: p.mem_map };
+        (p.team, p.max_priority, p.quantum_size, p.preemptible, space)
+    });
+    install_trapped(com::NONE, child, team, "thread", priority, quantum, preemptible, space, frame);
+}
+
+/// End the calling thread (not the whole team) with `status`, for
+/// `thread_join` to collect: handed straight to a thread already
+/// blocked joining it, or kept in a zombie slot until one does. `Err`
+/// if the caller is a team's leader -- its end is the team's
+/// (`exit_now`).
+pub fn thread_exit(status: i32) -> Result<core::convert::Infallible, ()> {
+    let leader = with_scheduler(|sched| sched.procs[sched.current].team == sched.procs[sched.current].proc_nr);
+    if leader {
+        return Err(());
+    }
+    disable();
+    let (proc_nr, name, address_space, kernel_cr3) = with_scheduler(|sched| {
+        let idx = sched.current;
+        let me = sched.procs[idx].proc_nr;
+        let team = sched.procs[idx].team;
+        // Read before the slot can be freed below.
+        let name = sched.procs[idx].name;
+        let joiners: Vec<usize> = (0..NR_PROCS)
+            .filter(|&i| {
+                sched.is_member(i, team) && sched.procs[i].rts_flags & rts::JOINING != 0 && sched.procs[i].join_target == me
+            })
+            .collect();
+        let space = if let Some((&first, rest)) = joiners.split_first() {
+            // The first joiner gets the status; any others are woken to
+            // find the thread gone (`thread_join` reports that).
+            sched.procs[first].wait_result = Some((me, status));
+            for &j in core::iter::once(&first).chain(rest) {
+                sched.procs[j].rts_flags &= !rts::JOINING;
+                if sched.procs[j].rts_flags == 0 {
+                    sched.enqueue(j);
+                }
+            }
+            sched.finish_thread(idx)
+        } else {
+            sched.dequeue(idx);
+            sched.pick_proc();
+            let space = sched.release_address_space(idx);
+            sched.procs[idx].exit_status = Some(status);
+            sched.procs[idx].rts_flags |= rts::ZOMBIE;
+            space
+        };
+        (me, name, space, sched.kernel_cr3)
+    });
+    crate::serial_println!("[proc] {} (proc_nr {}) exited with status {}", name, proc_nr, status);
+    reclaim(address_space, kernel_cr3, name, proc_nr);
+    reschedule();
+    unreachable!("an exited thread was scheduled again")
+}
+
+/// Why `thread_join` couldn't join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinError {
+    /// Not a thread of the caller's team (or the caller itself, or the
+    /// leader), or it went away -- joined by someone else first.
+    NotAThread,
+}
+
+/// Block until thread `tid` of the caller's team exits, and collect its
+/// status (BeOS's `wait_for_thread`).
+pub fn thread_join(tid: i32) -> Result<i32, JoinError> {
+    enum Outcome {
+        Done(i32),
+        Invalid,
+        Blocked,
+    }
+    loop {
+        let outcome = with_scheduler(|sched| {
+            let idx = sched.current;
+            let me = sched.procs[idx].proc_nr;
+            if let Some((child, status)) = sched.procs[idx].wait_result.take() {
+                if child == tid {
+                    return Outcome::Done(status);
+                }
+            }
+            let team = sched.procs[idx].team;
+            let valid = tid >= -(com::NR_TASKS as i32) && com::slot(tid) < com::NR_PROC_SLOTS;
+            if !valid || tid == me || tid == team || !sched.is_member(com::slot(tid), team) {
+                return Outcome::Invalid;
+            }
+            let t = com::slot(tid);
+            if let Some(status) = sched.procs[t].exit_status {
+                sched.free_slot(t);
+                return Outcome::Done(status);
+            }
+            if sched.procs[idx].rts_flags == 0 {
+                sched.dequeue(idx);
+            }
+            sched.procs[idx].rts_flags |= rts::JOINING;
+            sched.procs[idx].join_target = tid;
+            Outcome::Blocked
+        });
+        match outcome {
+            Outcome::Done(status) => return Ok(status),
+            Outcome::Invalid => return Err(JoinError::NotAThread),
+            Outcome::Blocked => reschedule(),
+        }
+    }
+}
+
+/// Create a semaphore with `count` units, owned by the caller's team.
+/// `None` if the table is full.
+pub fn sem_create(count: i32) -> Option<usize> {
+    with_scheduler(|sched| {
+        let team = sched.procs[sched.current].team;
+        let id = (0..NR_SEMS).find(|&i| !sched.sems[i].in_use)?;
+        sched.sems[id] = Sem { in_use: true, count: count.max(0), owner_team: team };
+        Some(id)
+    })
+}
+
+/// Why a semaphore operation failed: no such semaphore (or, for
+/// `sem_delete`, not the caller's team's), or it was deleted while the
+/// caller was waiting on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadSem;
+
+/// Take one unit of semaphore `id`, blocking until one is released if
+/// none is free. Waiters are served first come, first served.
+pub fn sem_acquire(id: usize) -> Result<(), BadSem> {
+    enum Outcome {
+        Got,
+        Bad,
+        Blocked,
+    }
+    loop {
+        let outcome = with_scheduler(|sched| {
+            let idx = sched.current;
+            if sched.procs[idx].sem_granted.take().is_some() {
+                return Outcome::Got;
+            }
+            if sched.procs[idx].sem_wait.is_some() {
+                // Woken with our place in line still held: spurious.
+                return Outcome::Blocked;
+            }
+            if id >= NR_SEMS || !sched.sems[id].in_use {
+                return Outcome::Bad;
+            }
+            if sched.sems[id].count > 0 {
+                sched.sems[id].count -= 1;
+                return Outcome::Got;
+            }
+            let ticket = sched.sem_seq;
+            sched.sem_seq += 1;
+            if sched.procs[idx].rts_flags == 0 {
+                sched.dequeue(idx);
+            }
+            sched.procs[idx].rts_flags |= rts::SEM_WAIT;
+            sched.procs[idx].sem_wait = Some((id, ticket));
+            Outcome::Blocked
+        });
+        match outcome {
+            Outcome::Got => return Ok(()),
+            Outcome::Bad => return Err(BadSem),
+            Outcome::Blocked => {
+                reschedule();
+                // Woken either with a unit (`sem_granted`) or because the
+                // semaphore was deleted (`sem_wait` cleared, not granted).
+                let deleted = with_scheduler(|sched| {
+                    let p = &sched.procs[sched.current];
+                    p.sem_wait.is_none() && p.sem_granted.is_none()
+                });
+                if deleted {
+                    return Err(BadSem);
+                }
+            }
+        }
+    }
+}
+
+/// Release one unit of semaphore `id`: straight to the longest-waiting
+/// acquirer if there is one, otherwise back into the count.
+pub fn sem_release(id: usize) -> Result<(), BadSem> {
+    with_scheduler(|sched| {
+        if id >= NR_SEMS || !sched.sems[id].in_use {
+            return Err(BadSem);
+        }
+        sched.release_unit(id);
+        Ok(())
+    })?;
+    reschedule(); // a woken waiter may outrank the caller
+    Ok(())
+}
+
+/// Delete semaphore `id`, waking every waiter with an error. Only the
+/// owning team may.
+pub fn sem_delete(id: usize) -> Result<(), BadSem> {
+    with_scheduler(|sched| {
+        let team = sched.procs[sched.current].team;
+        if id >= NR_SEMS || !sched.sems[id].in_use || sched.sems[id].owner_team != team {
+            return Err(BadSem);
+        }
+        sched.delete_sem(id);
+        Ok(())
+    })
+}
+
 /// Whether `proc_nr` names a process-table slot that is in use -- the
 /// check anything taking a process number from ring 3 must make first,
 /// since `com::slot` of an arbitrary number indexes the table out of
